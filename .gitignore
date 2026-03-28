@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# PyInstaller
+dist/
+build/
+build_tmp/
+*.spec
+
+# VSCode
+.vscode/
+
+# Unity
+*/Library/
+*/Temp/
+*/Obj/
+*/Build/
+*/Logs/
+*.apk
+*.aab
+/My project_Data/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# large build artifacts
+*.exe
+*.pkg
+*.resource
+
+# Node / Others
+node_modules/
