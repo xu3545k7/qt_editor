@@ -37,9 +37,18 @@ if getattr(sys, 'frozen', False):
 else:
     _base_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir))
 
-SONGS_ROOT = os.path.normpath(
+# Prefer the workspace's Nostalgia-clone Assets Resources songs folder when available.
+# Fallback to the legacy UnityProject/nos_clone path for older setups.
+_candidate_nostalgia = os.path.normpath(
+    os.path.join(_base_dir, os.pardir, 'Nostalgia-clone', 'Assets', 'Resources', 'songs')
+)
+_candidate_legacy = os.path.normpath(
     os.path.join(_base_dir, 'UnityProject', 'nos_clone', 'Assets', 'Resources', 'songs')
 )
+if os.path.isdir(_candidate_nostalgia):
+    SONGS_ROOT = _candidate_nostalgia
+else:
+    SONGS_ROOT = _candidate_legacy
 
 
 def _scan_songs_in_folder(folder: str) -> list[tuple[str, str]]:

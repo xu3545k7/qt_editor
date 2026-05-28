@@ -15,12 +15,23 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
-_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), 'settings.json')
+_SETTINGS_BASE_DIR = (
+    os.getcwd()
+    if getattr(sys, 'frozen', False)
+    else os.path.dirname(__file__)
+)
+_SETTINGS_FILE = os.path.join(_SETTINGS_BASE_DIR, 'settings.json')
 
 _DEFAULTS: dict[str, object] = {
     'language':      'zh_tw',   # 'zh_tw' | 'zh_cn' | 'en'
     'scroll_invert': False,     # bool
+    # When exporting songs, if True attempt to auto-process audio
+    # (parse offset from filename like +1000ms / -300ms and apply padding/trim).
+    'export_auto_process_audio': True,
+    # Optional trim at end in ms when processing exports
+    'export_trim_end_ms': 0,
 }
 
 

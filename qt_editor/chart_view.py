@@ -61,12 +61,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, pyqtSignal
 from PyQt5.QtGui import (
-    QColor, QFont, QPainter, QPen, QBrush, QKeyEvent,
+    QColor, QFont, QPainter, QPen, QBrush, QIcon, QKeyEvent,
     QMouseEvent, QPaintEvent, QPixmap, QResizeEvent, QWheelEvent,
 )
 from PyQt5.QtWidgets import QDialog, QInputDialog, QWidget
 
-from .models import GNote, NoteModel, TOTAL_GAME_KEYS
+from .models import GNote, NoteModel, TOTAL_GAME_KEYS, lane_range_to_external, lane_to_external
 from .time_mapper import TimeMapper
 from .property_dialog import NotePropertyDialog
 from .i18n import t
@@ -89,6 +89,24 @@ NOTE_LEFT_LONG   = QColor( 28,  95, 153)
 NOTE_OUT_R       = QColor(120,  20,  20)
 NOTE_OUT_L       = QColor( 10,  60, 110)
 NOTE_OUT_S       = QColor(140, 110,   0)
+MIDI_CHANNEL_COLORS = [
+    QColor(239, 83, 80),
+    QColor(255, 167, 38),
+    QColor(255, 238, 88),
+    QColor(102, 187, 106),
+    QColor(38, 166, 154),
+    QColor(41, 182, 246),
+    QColor(92, 107, 192),
+    QColor(126, 87, 194),
+    QColor(171, 71, 188),
+    QColor(236, 64, 122),
+    QColor(141, 110, 99),
+    QColor(120, 144, 156),
+    QColor(255, 112, 67),
+    QColor(156, 204, 101),
+    QColor(77, 182, 172),
+    QColor(79, 195, 247),
+]
 
 SEL_OUTLINE      = QColor(255, 230,   0)   # 黃色外框
 RUBBER_COLOR     = QColor(255, 255,   0)
@@ -105,6 +123,9 @@ MIN_WINDOW_UNITS   = 0.5
 MAX_WINDOW_UNITS   = 256.0
 PRE_ROLL_UNITS     = 4.0
 MIN_NOTE_HEIGHT_PX = 2
+PITCH_GRID_KEYS    = 88
+PITCH_MIDI_MIN     = 21
+PITCH_MIDI_MAX     = 108
 # 預覽模式固定高度（毫秒）
 PREVIEW_MS = 300
 # 固定像素高度（預設）— 預覽不再依時間或 BPM 縮放
@@ -215,6 +236,7 @@ class ChartView(QWidget):
 
         # ── 時間均分模式 ──────────────────────────────────────
         self.time_uniform: bool = False
+        self.pitch_mode:   bool = False
         self._time_uniform_span_ms: float = 0.0
 
         # ── 放置音符模式 ───────────────────────────────────────
@@ -259,13 +281,44 @@ class ChartView(QWidget):
 
     def toggle_time_uniform(self, enabled: bool) -> None:
         """切換時間均分模式。"""
-        self.time_uniform = enabled
-        if enabled:
+        self.set_view_mode('time' if enabled else 'measure')
+
+    @property
+    def view_mode(self) -> str:
+        if self.pitch_mode:
+            return 'pitch'
+        if self.time_uniform:
+            return 'time'
+        return 'measure'
+
+    def set_view_mode(self, mode: str) -> None:
+        mode = str(mode or 'measure').lower()
+        if mode not in {'measure', 'time', 'pitch'}:
+            mode = 'measure'
+
+        prev_time_uniform = self.time_uniform
+        self.pitch_mode = (mode == 'pitch')
+        self.time_uniform = (mode in {'time', 'pitch'})
+        if self.pitch_mode and self.alloc_active:
+            self.cancel_alloc_section()
+        if self.time_uniform and not prev_time_uniform:
             ws_ms = self.mapper.unit_to_ms(self.window_start_unit)
             we_ms = self.mapper.unit_to_ms(self.window_start_unit + self.window_size_unit)
             self._time_uniform_span_ms = max(1.0, float(we_ms - ws_ms))
             self._sync_time_uniform_window_units()
+        elif self.time_uniform:
+            self._sync_time_uniform_window_units()
         self.update()
+        self._emit_status()
+
+    def cycle_view_mode(self) -> str:
+        next_mode = {
+            'measure': 'time',
+            'time': 'pitch',
+            'pitch': 'measure',
+        }[self.view_mode]
+        self.set_view_mode(next_mode)
+        return next_mode
 
     def _sync_time_uniform_window_units(self) -> None:
         """依固定 ms span 回填當前對應的 unit 視窗寬，供邊界/狀態使用。"""
@@ -468,16 +521,74 @@ class ChartView(QWidget):
         self.update()
         self.note_edited.emit()
 
-    def shift_selected_pitch(self, delta: int) -> None:
+    def shift_selected_pitch(self, delta: int, push: bool = True, sync_keys: bool = False) -> None:
         if not self.selected or self.alloc_active:
             return
-        self.model.push_history()
+        if push:
+            self.model.push_history()
         for n in self.model.notes_tree:
             if n.idx in self.selected and n.pitch is not None:
-                n.pitch = max(0, min(127, n.pitch + delta))
+                hi = PITCH_MIDI_MAX if sync_keys else 127
+                lo = PITCH_MIDI_MIN if sync_keys else 0
+                n.pitch = max(lo, min(hi, n.pitch + delta))
+                if sync_keys:
+                    self._sync_note_keys_to_pitch(n)
         self.model.rebuild_display_cache()
         self.update()
         self.note_edited.emit()
+
+    def set_channel_selected(self, channel: int) -> None:
+        if not self.selected or self.alloc_active:
+            return
+        channel = max(0, min(15, int(channel)))
+        self.model.push_history()
+        for n in self.model.notes_tree:
+            if n.idx in self.selected:
+                n.channel = channel
+        self.model.rebuild_display_cache()
+        self.update()
+        self.note_edited.emit()
+
+    def delete_selected_tracks(self) -> None:
+        if not self.selected or self.alloc_active or not self.model.is_midi_mode():
+            return
+        tracks = {
+            int(n.track) for n in self.model.notes_tree
+            if n.idx in self.selected and n.track is not None
+        }
+        if not tracks:
+            return
+        self.model.push_history()
+        self.model.delete_midi_tracks(tracks)
+        self.selected.clear()
+        self.update()
+        self.note_edited.emit()
+        self.selection_changed.emit(0)
+
+    def delete_selected_channel(self, channel: int) -> None:
+        if not self.selected or self.alloc_active or not self.model.is_midi_mode():
+            return
+        channel = max(0, min(15, int(channel)))
+        self.model.push_history()
+        self.model.notes_tree = [
+            n for n in self.model.notes_tree
+            if not (n.idx in self.selected and n.channel is not None and int(n.channel) == channel)
+        ]
+        self.model.rebuild_display_cache()
+        self.selected.clear()
+        self.update()
+        self.note_edited.emit()
+        self.selection_changed.emit(0)
+
+    def _channel_icon(self, channel: int) -> QIcon:
+        pix = QPixmap(14, 14)
+        pix.fill(Qt.transparent)
+        qp = QPainter(pix)
+        qp.setPen(Qt.black)
+        qp.setBrush(QBrush(MIDI_CHANNEL_COLORS[int(channel) % len(MIDI_CHANNEL_COLORS)]))
+        qp.drawRect(1, 1, 12, 12)
+        qp.end()
+        return QIcon(pix)
 
     def set_length_beats_selected(self, beats: float) -> None:
         """將所有已選音符的時長設定為指定拍數（依目前 BPM 轉算 ms）。"""
@@ -553,6 +664,9 @@ class ChartView(QWidget):
             'hand':      n.hand,
             'pitch':     n.pitch,
             'track':     n.track,
+            'velocity':  n.velocity,
+            'channel':   n.channel,
+            'off_velocity': n.off_velocity,
             'gate':      n.end - n.start,
         } for n in nodes]
 
@@ -589,6 +703,9 @@ class ChartView(QWidget):
             n.hand      = d['hand']
             n.pitch     = d['pitch']
             n.track     = d['track']
+            n.velocity  = d.get('velocity')
+            n.channel   = d.get('channel')
+            n.off_velocity = d.get('off_velocity')
             new_notes.append(n)
         self.model.notes_tree.extend(new_notes)
         self.model.rebuild_display_cache()
@@ -655,6 +772,10 @@ class ChartView(QWidget):
     # ── Alloc Section ─────────────────────────────────────────────────
 
     def start_alloc_section(self) -> None:
+        if self.pitch_mode:
+            self._drag_status = '音高模式下不支援 Alloc Section'
+            self._emit_status()
+            return
         if self.alloc_active:
             return
         # `self.selected` 存的是 display cache (`self.model.notes`) 的 idx。
@@ -796,6 +917,61 @@ class ChartView(QWidget):
 
     # ------------------------------------------------------------------
 
+    def _display_key_count(self) -> int:
+        return PITCH_GRID_KEYS if self.pitch_mode else TOTAL_GAME_KEYS
+
+    def _display_key_to_px(self, key: float) -> float:
+        return key * self.width() / max(self._display_key_count(), 1)
+
+    def _px_to_display_key(self, px: float) -> float:
+        return px * self._display_key_count() / max(self.width(), 1)
+
+    def _pitch_to_slot(self, pitch: int) -> int:
+        return max(0, min(PITCH_GRID_KEYS - 1, int(round(pitch)) - PITCH_MIDI_MIN))
+
+    def _slot_to_pitch(self, slot: float) -> int:
+        return max(PITCH_MIDI_MIN, min(PITCH_MIDI_MAX, int(slot) + PITCH_MIDI_MIN))
+
+    def _display_pitch(self, n: GNote) -> int:
+        raw_pitch = getattr(n, 'pitch', None)
+        if raw_pitch is None:
+            center = (float(n.min_key) + float(n.max_key) + 1.0) * 0.5
+            frac = center / max(float(TOTAL_GAME_KEYS), 1.0)
+            return max(PITCH_MIDI_MIN, min(PITCH_MIDI_MAX, int(round(PITCH_MIDI_MIN + frac * (PITCH_GRID_KEYS - 1)))))
+        return max(PITCH_MIDI_MIN, min(PITCH_MIDI_MAX, int(round(raw_pitch))))
+
+    def _pitch_to_lane_center(self, pitch: int) -> int:
+        clamped = max(PITCH_MIDI_MIN, min(PITCH_MIDI_MAX, int(round(pitch))))
+        frac = (clamped - PITCH_MIDI_MIN) / max(PITCH_GRID_KEYS - 1, 1)
+        return int(round(frac * max(TOTAL_GAME_KEYS - 1, 0)))
+
+    def _center_to_lane_range(self, center: int, width: int) -> Tuple[int, int]:
+        width = max(1, min(TOTAL_GAME_KEYS, int(width)))
+        span = width - 1
+        min_key = int(center) - (span // 2)
+        max_key = min_key + span
+        if min_key < 0:
+            min_key = 0
+            max_key = span
+        if max_key >= TOTAL_GAME_KEYS:
+            max_key = TOTAL_GAME_KEYS - 1
+            min_key = max(0, max_key - span)
+        return min_key, max_key
+
+    def _sync_note_keys_to_pitch(self, n: GNote, width: Optional[int] = None) -> None:
+        if getattr(n, 'pitch', None) is None:
+            return
+        note_width = width if width is not None else max(1, int(n.max_key - n.min_key + 1))
+        center = self._pitch_to_lane_center(int(n.pitch))
+        n.min_key, n.max_key = self._center_to_lane_range(center, note_width)
+
+    def _note_display_x_range(self, n: GNote) -> Tuple[float, float]:
+        if self.pitch_mode:
+            pitch = self._display_pitch(n)
+            slot = self._pitch_to_slot(pitch)
+            return self._display_key_to_px(slot), self._display_key_to_px(slot + 1)
+        return self._display_key_to_px(n.min_key), self._display_key_to_px(n.max_key + 1)
+
     def _beat_in_units(self) -> float:
         """1 拍 = 幾個 unit。
         per-beat 格式（原始遊戲檔）：1 unit = 1 拍 → 回傳 1.0
@@ -836,7 +1012,7 @@ class ChartView(QWidget):
         if not pitches:
             # 無參考音高：線性映射 key 0~TOTAL_GAME_KEYS 到 pitch 1~88
             frac = max(0.0, min(1.0, key_f / max(TOTAL_GAME_KEYS, 1)))
-            return max(1, int(round(1 + frac * 87)))
+            return max(PITCH_MIDI_MIN, int(round(PITCH_MIDI_MIN + frac * (PITCH_GRID_KEYS - 1))))
         n_p = len(pitches)
         try:
             preserve_mn = min(n.min_key for n in notes)
@@ -858,12 +1034,14 @@ class ChartView(QWidget):
         end_ms       = self.mapper.unit_to_ms(snapped_unit + dur_units)
         dur_ms       = max(10.0, end_ms - snapped_ms)
 
-        key_f   = self._px_to_key(pos.x())
-        center  = max(0, min(TOTAL_GAME_KEYS - 1, int(key_f)))
-        half = self._note_input_width // 2
-        min_key = max(0, center - half)
-        max_key = min(TOTAL_GAME_KEYS - 1, min_key + self._note_input_width - 1)
-        pitch   = self._infer_pitch_from_key(key_f)
+        display_key = self._px_to_display_key(pos.x())
+        if self.pitch_mode:
+            pitch = self._slot_to_pitch(display_key)
+            center = self._pitch_to_lane_center(pitch)
+        else:
+            center = max(0, min(TOTAL_GAME_KEYS - 1, int(display_key)))
+            pitch = self._infer_pitch_from_key(display_key)
+        min_key, max_key = self._center_to_lane_range(center, self._note_input_width)
 
         self.model.push_history()
         n = GNote(None, len(self.model.notes_tree))
@@ -875,6 +1053,13 @@ class ChartView(QWidget):
         n.pitch     = pitch
         n.note_type = self._note_input_note_type
         n.hand      = self._note_input_hand
+        if self.model.is_midi_mode():
+            n.track = self.model._default_midi_track_for_hand(n.hand)
+            n.channel = self.model._default_midi_channel_for_track(n.track)
+            n.velocity = self.model._default_midi_velocity_for_track(n.track)
+            n.off_velocity = self.model._default_midi_off_velocity_for_track(n.track)
+        if self.pitch_mode:
+            self._sync_note_keys_to_pitch(n, self._note_input_width)
 
         self.model.notes_tree.append(n)
         self.model.rebuild_display_cache()
@@ -892,15 +1077,23 @@ class ChartView(QWidget):
         raw_unit     = self._py_to_unit_abs(pos.y())
         snapped_unit = self._snap_unit_to_duration(raw_unit, self._note_duration_beats)
         snapped_rel  = snapped_unit - self.window_start_unit
-        key_f        = self._px_to_key(pos.x())
-        center       = max(0, min(TOTAL_GAME_KEYS - 1, int(key_f)))
-        min_key = max(0, center - (self._note_input_width // 2))
-        max_key      = min(TOTAL_GAME_KEYS - 1, min_key + self._note_input_width - 1)
-        pitch        = self._infer_pitch_from_key(key_f)
+        display_key  = self._px_to_display_key(pos.x())
+        if self.pitch_mode:
+            pitch = self._slot_to_pitch(display_key)
+            center = self._pitch_to_lane_center(pitch)
+        else:
+            center = max(0, min(TOTAL_GAME_KEYS - 1, int(display_key)))
+            pitch = self._infer_pitch_from_key(display_key)
+        min_key, max_key = self._center_to_lane_range(center, self._note_input_width)
 
         snap_y  = int(self._unit_to_py(snapped_rel))
-        key_x   = int(self._key_to_px(min_key))
-        key_x2  = int(self._key_to_px(max_key + 1))
+        if self.pitch_mode:
+            slot = self._pitch_to_slot(pitch)
+            key_x = int(self._display_key_to_px(slot))
+            key_x2 = int(self._display_key_to_px(slot + 1))
+        else:
+            key_x = int(self._display_key_to_px(min_key))
+            key_x2 = int(self._display_key_to_px(max_key + 1))
         w = self.width()
 
         # 水平 snap 線（紅色虛線）
@@ -956,11 +1149,12 @@ class ChartView(QWidget):
         # 提示文字
         snapped_ms  = self.mapper.unit_to_ms(snapped_unit)
         pitch_str   = str(pitch) if pitch is not None else '-'
+        min_lane, max_lane = lane_range_to_external(min_key, max_key)
         qp.setPen(QColor(255, 200, 60))
         from PyQt5.QtGui import QFont
         qp.setFont(QFont('Consolas', 8))
         qp.drawText(4, self.height() - 22,
-                    f'✏ snap={int(snapped_ms)}ms  key={min_key}~{max_key}  '
+                    f'✏ snap={int(snapped_ms)}ms  key={min_lane}~{max_lane}  '
                     f'pitch={pitch_str}  dur={self._note_duration_beats:.4g}beat  '
                     f'hand={"右" if self._note_input_hand == 0 else "左"}')
 
@@ -1174,8 +1368,7 @@ class ChartView(QWidget):
         win = self.window_size_unit
         if end_u < 0 or start_u > win:
             return None
-        x1 = self._key_to_px(n.min_key)
-        x2 = self._key_to_px(n.max_key + 1)
+        x1, x2 = self._note_display_x_range(n)
         y_top    = self._unit_to_py(end_u)
         y_bottom = self._unit_to_py(start_u)
         w = max(1.0, x2 - x1)
@@ -1251,7 +1444,14 @@ class ChartView(QWidget):
         ws_ms, we_ms = self._window_ms()
         ws_u = self.window_start_unit
         we_u = ws_u + self.window_size_unit
-        extra = f'  [{self._drag_status}]' if self._drag_status else ''
+        mode_name = {
+            'measure': '小節均分',
+            'time': '時間均分',
+            'pitch': '音高',
+        }.get(self.view_mode, self.view_mode)
+        extra = f'  [模式:{mode_name}]'
+        if self._drag_status:
+            extra += f' [{self._drag_status}]'
         msg = (t('status_window',
                  int(ws_ms), int(we_ms),
                  ws_u, we_u,
@@ -1320,13 +1520,26 @@ class ChartView(QWidget):
     def _draw_grid(self, qp: QPainter) -> None:
         h = self.height()
         qp.setFont(self._font_key)
-        for i in range(TOTAL_GAME_KEYS + 1):
-            x = int(self._key_to_px(i))
-            qp.setPen(QPen(GRID_MAJOR if i % 4 == 0 else GRID_MINOR, 1))
+        display_keys = self._display_key_count()
+        for i in range(display_keys + 1):
+            x = int(self._display_key_to_px(i))
+            major = (((PITCH_MIDI_MIN + i) % 12) == 0) if self.pitch_mode else (i % 4 == 0)
+            qp.setPen(QPen(GRID_MAJOR if major else GRID_MINOR, 1))
             qp.drawLine(x, 0, x, h)
-            if i < TOTAL_GAME_KEYS:
+            if i < display_keys:
                 qp.setPen(KEY_LABEL)
-                qp.drawText(x + 2, 11, str(i))
+                if self.pitch_mode:
+                    midi_pitch = PITCH_MIDI_MIN + i
+                    show_label = (
+                        display_keys <= 24
+                        or i == 0
+                        or i == display_keys - 1
+                        or (midi_pitch % 12) == 0
+                    )
+                    if show_label:
+                        qp.drawText(x + 2, 11, str(midi_pitch))
+                else:
+                    qp.drawText(x + 2, 11, str(lane_to_external(i)))
 
     def _draw_beat_lines(self, qp: QPainter) -> None:
         w = self.width()
@@ -1426,6 +1639,18 @@ class ChartView(QWidget):
                         qp.drawLine(0, py, w, py)
 
     def _note_colors(self, n: GNote) -> Tuple[QColor, QColor]:
+        if self.model.is_midi_mode() and n.channel is not None:
+            base = QColor(MIDI_CHANNEL_COLORS[int(n.channel) % len(MIDI_CHANNEL_COLORS)])
+            if n.note_type == 2:
+                fill = base.darker(135)
+            elif n.note_type == 1:
+                fill = base.lighter(130)
+            elif n.note_type == 3:
+                fill = base.lighter(115)
+            else:
+                fill = base
+            outline = fill.darker(170)
+            return fill, outline
         nt = n.note_type
         if nt == 1:
             return NOTE_SOFT, NOTE_OUT_S
@@ -1536,8 +1761,7 @@ class ChartView(QWidget):
 
     def _preview_note_xw(self, n: GNote, scale: float):
         """回傳 (x, draw_w)：以 scale 縮放後置中於原始格寬內。"""
-        x1 = self._key_to_px(n.min_key)
-        x2 = self._key_to_px(n.max_key + 1)
+        x1, x2 = self._note_display_x_range(n)
         full_w = x2 - x1
         draw_w = full_w * scale
         x = x1 + (full_w - draw_w) * 0.5
@@ -2111,9 +2335,15 @@ class ChartView(QWidget):
                 else:
                     self.scroll_by(-self._scroll_step_units() * (4 if shift else 1))
             elif key == Qt.Key_Left and not ctrl:
-                self.shift_selected_keys(-(10 if shift else 1), push=not event.isAutoRepeat())
+                if self.pitch_mode:
+                    self.shift_selected_pitch(-(10 if shift else 1), push=not event.isAutoRepeat(), sync_keys=True)
+                else:
+                    self.shift_selected_keys(-(10 if shift else 1), push=not event.isAutoRepeat())
             elif key == Qt.Key_Right and not ctrl:
-                self.shift_selected_keys(10 if shift else 1, push=not event.isAutoRepeat())
+                if self.pitch_mode:
+                    self.shift_selected_pitch(10 if shift else 1, push=not event.isAutoRepeat(), sync_keys=True)
+                else:
+                    self.shift_selected_keys(10 if shift else 1, push=not event.isAutoRepeat())
             elif ctrl and key == Qt.Key_A:
                 self.select_all()
             elif key == Qt.Key_Escape:
@@ -2155,10 +2385,16 @@ class ChartView(QWidget):
 
         # ── 鍵位平移 ─────────────────────────────────────────────────
         if key == Qt.Key_Left and not ctrl:
-            self.shift_selected_keys(-(10 if shift else 1), push=not event.isAutoRepeat())
+            if self.pitch_mode:
+                self.shift_selected_pitch(-(10 if shift else 1), push=not event.isAutoRepeat(), sync_keys=True)
+            else:
+                self.shift_selected_keys(-(10 if shift else 1), push=not event.isAutoRepeat())
             return
         if key == Qt.Key_Right and not ctrl:
-            self.shift_selected_keys(10 if shift else 1, push=not event.isAutoRepeat())
+            if self.pitch_mode:
+                self.shift_selected_pitch(10 if shift else 1, push=not event.isAutoRepeat(), sync_keys=True)
+            else:
+                self.shift_selected_keys(10 if shift else 1, push=not event.isAutoRepeat())
             return
 
         # ── Undo ──────────────────────────────────────────────────────
@@ -2302,12 +2538,47 @@ class ChartView(QWidget):
                         beat_ms=60000.0 / max(1.0, self.model.bpm))
                 if dlg.exec_() == QDialog.Accepted:
                     self.model.push_history()
+                    dlg.apply_to(auth)
                     auth.apply_back()
                     self.model.rebuild_display_cache()
                     self.update()
                     self.note_edited.emit()
             act_prop.triggered.connect(_open_prop)
             menu.addAction(act_prop)
+            act_note_bpm = _QA('從此音符開始變拍…', self)
+            def _set_note_bpm():
+                from PyQt5.QtWidgets import QMessageBox
+
+                if hit in self.model.notes_tree:
+                    auth = hit
+                else:
+                    auth = next((n for n in self.model.notes_tree if n.idx == hit.idx), hit)
+                if not self.model.get_beat_entries():
+                    QMessageBox.warning(self, '缺少拍點資料', '目前譜面沒有可編輯的 beat_data / beat_timings。')
+                    return
+                current_bpm = self.model.get_measure_bpm(self.model.get_measure_at_ms(auth.start))
+                bpm, ok = QInputDialog.getDouble(
+                    self,
+                    '從此音符開始變拍',
+                    f'從 {int(auth.start)} ms 開始的新 BPM：',
+                    float(current_bpm),
+                    1.0,
+                    9999.0,
+                    2,
+                )
+                if not ok:
+                    return
+                try:
+                    self.model.push_history()
+                    self.model.set_note_bpm(int(auth.start), float(bpm))
+                    self.rebuild_mapper()
+                    self._update_unit_bounds()
+                    self.update()
+                    self.note_edited.emit()
+                except Exception as exc:
+                    QMessageBox.critical(self, '變拍失敗', str(exc))
+            act_note_bpm.triggered.connect(_set_note_bpm)
+            menu.addAction(act_note_bpm)
             menu.addSeparator()
 
         # ── 音符類型（有選取才啟用）───────────────────────────────────
@@ -2324,6 +2595,51 @@ class ChartView(QWidget):
             a = hand_m.addAction(label)
             a.setEnabled(has_sel)
             a.triggered.connect(lambda checked=False, _h=h: self.set_hand_selected(_h))
+
+        if self.model.is_midi_mode():
+            midi_m = menu.addMenu('MIDI')
+            ch_m = midi_m.addMenu('Set Channel')
+            for ch in range(16):
+                a = ch_m.addAction(f'Channel {ch}')
+                a.setEnabled(has_sel)
+                a.triggered.connect(lambda checked=False, _ch=ch: self.set_channel_selected(_ch))
+            act_ch_custom = midi_m.addAction('Set Channel...')
+            act_ch_custom.setEnabled(has_sel)
+            def _set_channel_dialog():
+                if not has_sel:
+                    return
+                existing = next(
+                    (int(n.channel) for n in self.model.notes_tree if n.idx in self.selected and n.channel is not None),
+                    0,
+                )
+                value, ok = QInputDialog.getInt(
+                    self,
+                    'Set MIDI Channel',
+                    'Channel (0-15)',
+                    existing,
+                    0,
+                    15,
+                    1,
+                )
+                if ok:
+                    self.set_channel_selected(value)
+            act_ch_custom.triggered.connect(_set_channel_dialog)
+            selected_channels = sorted({
+                int(n.channel) for n in self.model.notes_tree
+                if n.idx in self.selected and n.channel is not None
+            })
+            if selected_channels:
+                del_color_m = midi_m.addMenu('Delete By Color')
+                del_color_top = menu.addMenu('Delete By Color')
+                for ch in selected_channels:
+                    label = f'Channel {ch}'
+                    a_sub = del_color_m.addAction(self._channel_icon(ch), label)
+                    a_sub.triggered.connect(lambda checked=False, _ch=ch: self.delete_selected_channel(_ch))
+                    a_top = del_color_top.addAction(self._channel_icon(ch), label)
+                    a_top.triggered.connect(lambda checked=False, _ch=ch: self.delete_selected_channel(_ch))
+            act_del_track = midi_m.addAction('Delete Selected Track(s)')
+            act_del_track.setEnabled(has_sel)
+            act_del_track.triggered.connect(self.delete_selected_tracks)
 
         width_m = menu.addMenu('設定寬度')
         for label, w in [('寬度 1', 1), ('寬度 2', 2), ('寬度 3', 3),

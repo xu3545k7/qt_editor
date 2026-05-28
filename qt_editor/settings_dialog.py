@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (
     QLabel, QVBoxLayout, QWidget,
 )
 
+from PyQt5.QtWidgets import QCheckBox
+
 from .i18n import t
 from .settings import settings
 
@@ -66,6 +68,12 @@ class SettingsDialog(QDialog):
         self._note_label.setStyleSheet('color: gray; font-size: 10px;')
         layout.addWidget(self._note_label)
 
+        # ── 匯出音訊自動處理 ──────────────────────────────────────────
+        self._audio_auto_chk = QCheckBox('匯出時自動處理音訊（解析檔名偏移並裁切/補零）')
+        audio_auto = bool(settings.get('export_auto_process_audio', True))
+        self._audio_auto_chk.setChecked(audio_auto)
+        form.addRow(QLabel('匯出音訊處理'), self._audio_auto_chk)
+
         # ── 按鈕 ──────────────────────────────────────────────────────
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self._on_accept)
@@ -77,6 +85,8 @@ class SettingsDialog(QDialog):
         scroll_inv = self._scroll_combo.currentData()
         settings.set('language',      lang_code)
         settings.set('scroll_invert', scroll_inv)
+        # Save export audio processing setting
+        settings.set('export_auto_process_audio', bool(self._audio_auto_chk.isChecked()))
         self.accept()
 
         if lang_code != self._original_lang:

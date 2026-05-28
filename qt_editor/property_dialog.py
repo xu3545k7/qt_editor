@@ -1,7 +1,5 @@
 """
-property_dialog.py
-==================
-音符屬性編輯對話框（取代原 tkinter Toplevel）。
+Simple note property editor dialog.
 """
 
 from __future__ import annotations
@@ -9,24 +7,21 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt5.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit,
-    QMessageBox, QVBoxLayout, QWidget,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
 )
 
-from .models import GNote
 from .i18n import t
+from .models import GNote, TOTAL_GAME_KEYS, lane_from_external, lane_to_external
 
 
 class NotePropertyDialog(QDialog):
-    """單一音符屬性編輯對話框。
-
-    用法
-    ----
-    dlg = NotePropertyDialog(parent, note, beat_ms=beat_ms)
-    if dlg.exec_() == QDialog.Accepted:
-        # note 的欄位已原地更新
-    """
-
     def __init__(
         self,
         parent: Optional[QWidget],
@@ -35,7 +30,8 @@ class NotePropertyDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(t('prop_title', note.idx))
-        self._note    = note
+        self._note = note
+        self._edited = note.clone(note.idx)
         self._beat_ms = max(1.0, beat_ms)
 
         layout = QVBoxLayout(self)
@@ -50,14 +46,13 @@ class NotePropertyDialog(QDialog):
             self._fields[label] = le
             return le
 
-        add('start (ms)',    note.start)
+        add('start (ms)', self._edited.start)
 
-        # ── length：ms 與 拍數 雙向即時同步 ─────────────────────
-        init_len_ms    = note.end - note.start
+        init_len_ms = self._edited.end - self._edited.start
         init_len_beats = init_len_ms / self._beat_ms
 
-        ms_le    = add('length (ms)',  init_len_ms)
-        beats_le = add('時值（拍）',       f'{init_len_beats:.1f}')
+        ms_le = add('length (ms)', init_len_ms)
+        beats_le = add('length (beats)', f'{init_len_beats:.1f}')
 
         self._syncing = False
 
@@ -85,13 +80,16 @@ class NotePropertyDialog(QDialog):
 
         ms_le.textEdited.connect(_ms_edited)
         beats_le.textEdited.connect(_beats_edited)
-        # ───────────────────────────────────────────────────────────────
-        add('min_key',       note.min_key)
-        add('width',         note.max_key - note.min_key + 1)
-        add('note_type',     note.note_type)  # 0=tap 1=soft 2=long 3=staccato
-        add('hand',          note.hand)       # 0=右 1=左
-        add('track',         note.track)
-        add('pitch',         note.pitch)
+
+        add('min_key', lane_to_external(self._edited.min_key))
+        add('width', self._edited.max_key - self._edited.min_key + 1)
+        add('note_type', self._edited.note_type)
+        add('hand', self._edited.hand)
+        add('track', self._edited.track)
+        add('pitch', self._edited.pitch)
+        add('velocity', self._edited.velocity)
+        add('channel', self._edited.channel)
+        add('off_velocity', self._edited.off_velocity)
 
         note_type_hint = QLabel('note_type: 0=tap  1=soft  2=long  3=staccato')
         note_type_hint.setStyleSheet('color: gray; font-size: 10px;')
@@ -101,34 +99,67 @@ class NotePropertyDialog(QDialog):
         hand_hint.setStyleSheet('color: gray; font-size: 10px;')
         layout.addWidget(hand_hint)
 
+        midi_hint = QLabel('MIDI: track/channel are 0-based, velocity range is 0-127.')
+        midi_hint.setStyleSheet('color: gray; font-size: 10px;')
+        layout.addWidget(midi_hint)
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
 
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(360)
 
     def _on_accept(self) -> None:
-        n = self._note
+        n = self._edited
         try:
-            n.start    = int(self._fields['start (ms)'].text())
-            length     = int(self._fields['length (ms)'].text())
-            n.end      = n.start + max(0, length)
-            n.min_key  = int(self._fields['min_key'].text())
-            width      = int(self._fields['width'].text())
-            n.max_key  = n.min_key + max(0, width - 1)
+            n.start = int(self._fields['start (ms)'].text())
+            length = int(self._fields['length (ms)'].text())
+            n.end = n.start + max(0, length)
+
+            min_key_external = int(self._fields['min_key'].text())
+            n.min_key = lane_from_external(min_key_external)
+            width = int(self._fields['width'].text())
+            n.max_key = n.min_key + max(0, width - 1)
+            n.min_key = max(0, min(TOTAL_GAME_KEYS - 1, n.min_key))
+            n.max_key = max(n.min_key, min(TOTAL_GAME_KEYS - 1, n.max_key))
+
             n.note_type = int(self._fields['note_type'].text())
-            n.hand     = int(self._fields['hand'].text())
+            n.hand = int(self._fields['hand'].text())
 
-            track_txt  = self._fields['track'].text().strip()
-            n.track    = int(track_txt) if track_txt else None
+            track_txt = self._fields['track'].text().strip()
+            n.track = int(track_txt) if track_txt else None
 
-            pitch_txt  = self._fields['pitch'].text().strip()
-            n.pitch    = int(pitch_txt) if pitch_txt else None
+            pitch_txt = self._fields['pitch'].text().strip()
+            n.pitch = int(pitch_txt) if pitch_txt else None
 
-            n.gate     = max(0, n.end - n.start)
+            velocity_txt = self._fields['velocity'].text().strip()
+            n.velocity = int(velocity_txt) if velocity_txt else None
+
+            channel_txt = self._fields['channel'].text().strip()
+            n.channel = int(channel_txt) if channel_txt else None
+
+            off_velocity_txt = self._fields['off_velocity'].text().strip()
+            n.off_velocity = int(off_velocity_txt) if off_velocity_txt else None
+
+            n.gate = max(0, n.end - n.start)
         except ValueError as e:
             QMessageBox.critical(self, t('prop_err_title'), t('prop_err_msg', e))
             return
 
         self.accept()
+
+    def apply_to(self, note: GNote) -> None:
+        edited = self._edited
+        note.start = edited.start
+        note.end = edited.end
+        note.gate = edited.gate
+        note.min_key = edited.min_key
+        note.max_key = edited.max_key
+        note.note_type = edited.note_type
+        note.hand = edited.hand
+        note.track = edited.track
+        note.pitch = edited.pitch
+        note.velocity = edited.velocity
+        note.channel = edited.channel
+        note.off_velocity = edited.off_velocity

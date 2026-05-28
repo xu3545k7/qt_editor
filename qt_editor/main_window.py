@@ -45,13 +45,17 @@ from .export_song_dialog import ExportSongDialog, SONGS_ROOT
 
 # 可選：MIDI 轉換器
 try:
-    import sys as _sys
-    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from midi_to_xml_converter import MIDIToXMLConverter
+    from .midi_to_xml_converter import MIDIToXMLConverter
     _HAS_MIDI_CONV = True
 except Exception:
-    MIDIToXMLConverter = None  # type: ignore
-    _HAS_MIDI_CONV = False
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from midi_to_xml_converter import MIDIToXMLConverter
+        _HAS_MIDI_CONV = True
+    except Exception:
+        MIDIToXMLConverter = None  # type: ignore
+        _HAS_MIDI_CONV = False
 
 # 可選：simpleaudio（打擊聲用）
 try:
@@ -75,6 +79,14 @@ class MainWindow(QMainWindow):
         # ── 中央編輯區 ───────────────────────────────────────────────
         self.view = ChartView(self)
         self.setCentralWidget(self.view)
+        # 五線譜編輯（dock）: 建立但預設隱藏
+        try:
+            from .staff_editor import StaffEditor
+            self._staff_editor = StaffEditor(self)
+            self.addDockWidget(Qt.RightDockWidgetArea, self._staff_editor)
+            self._staff_editor.hide()
+        except Exception:
+            self._staff_editor = None
 
         # ── 音訊播放器 ────────────────────────────────────────────────
         self.audio = AudioPlayer(self)
@@ -174,6 +186,8 @@ class MainWindow(QMainWindow):
         self._add_action(file_m, t('action_save'), self.save_file, QKeySequence.Save)
         self._add_action(file_m, t('action_save_as'), self.save_file_as, 'Ctrl+Shift+S')
         self._add_action(file_m, t('action_save_json'), self.save_as_json, 'Ctrl+Shift+J')
+        self._add_action(file_m, t('action_save_xml'), self.save_as_xml, 'Ctrl+Shift+X')
+        self._add_action(file_m, t('action_save_xml_midi_restore'), self.save_as_xml_midi_restore)
         self._add_action(file_m, t('action_export_song'), self.export_song)
         file_m.addSeparator()
         self._add_action(file_m, t('action_quit'), self.close, QKeySequence.Quit)
@@ -260,6 +274,16 @@ class MainWindow(QMainWindow):
             self._add_action(tools_m, '移除重複音符（同 start/pitch）', self.remove_duplicate_start_pitch_dialog)
         except Exception:
             self._add_action(tools_m, '移除重複音符…', self.remove_duplicate_start_pitch_dialog)
+
+        # 五線譜編輯顯示切換
+        try:
+            self._act_staff = QAction('五線譜編輯', self, checkable=True)
+            self._act_staff.setChecked(False)
+            # 切換 dock 顯示
+            self._act_staff.toggled.connect(lambda ch: self._staff_editor.setVisible(ch) if getattr(self, '_staff_editor', None) else None)
+            tools_m.addAction(self._act_staff)
+        except Exception:
+            pass
 
         # 檢視
         view_m = mb.addMenu(t('menu_view'))
@@ -421,10 +445,11 @@ class MainWindow(QMainWindow):
         self._act_preview.setToolTip(tip_text)
         self._act_preview.toggled.connect(self.view.toggle_preview_mode)
         tb.addAction(self._act_preview)
-        self._act_time_uniform = QAction(t('tb_time_uniform'), self, checkable=True)
+        self._act_time_uniform = QAction(t('tb_time_uniform_measure'), self)
         self._act_time_uniform.setToolTip(t('tb_time_uniform_tip'))
-        self._act_time_uniform.toggled.connect(self._on_time_uniform_toggle)
+        self._act_time_uniform.triggered.connect(self._cycle_view_mode)
         tb.addAction(self._act_time_uniform)
+        self._refresh_view_mode_action()
         tb.addSeparator()
         # ── 音量區塊：彈性間距把它推到工具列右端 ───────────────────
         spacer = QWidget()
@@ -807,6 +832,15 @@ class MainWindow(QMainWindow):
         apply_ts_chk = QCheckBox('同時修改拍號 (應用於上述小節範圍)')
         vbox.addWidget(apply_ts_chk)
 
+        vbox.addWidget(QLabel('音符處理：'))
+        note_hb = QHBoxLayout()
+        rb_adjust_notes = QRadioButton('調整音符')
+        rb_keep_notes = QRadioButton('不調整音符')
+        rb_adjust_notes.setChecked(True)
+        note_hb.addWidget(rb_adjust_notes)
+        note_hb.addWidget(rb_keep_notes)
+        vbox.addLayout(note_hb)
+
         vbox.addWidget(QLabel('小節內音符重排方式（拍號變更時）：'))
         hb = QHBoxLayout()
         rb_uniform = QRadioButton('均分小節內拍子（等距）')
@@ -836,6 +870,7 @@ class MainWindow(QMainWindow):
         new_num = int(num_spin.value())
         new_den = int(den_spin.value())
         uniform_choice = bool(rb_uniform.isChecked())
+        adjust_notes = bool(rb_adjust_notes.isChecked())
 
         s_idx = start - 1
         e_idx = end - 1
@@ -843,7 +878,7 @@ class MainWindow(QMainWindow):
             m.push_history()
             for mi in range(s_idx, e_idx + 1):
                 try:
-                    m.set_measure_bpm(mi, bpm, uniform=bool(self.view.time_uniform))
+                    m.set_measure_bpm(mi, bpm, uniform=bool(self.view.time_uniform), adjust_notes=adjust_notes)
                 except Exception:
                     continue
                 if apply_ts:
@@ -1012,7 +1047,10 @@ class MainWindow(QMainWindow):
 
     def _open_midi_hand(self, hand: int) -> None:
         """開啟 MIDI，將其中**所有**音符視為指定手（0=右 1=左），合併進目前譜面。"""
-        if not _HAS_MIDI_CONV:
+        # 對於正在執行的應用，嘗試延遲匯入 converter（避免需重啟）
+        try:
+            from .midi_to_xml_converter import MIDIToXMLConverter
+        except Exception:
             QMessageBox.warning(self, t('dlg_warn'), t('dlg_midi_no_conv'))
             return
         path, _ = QFileDialog.getOpenFileName(
@@ -1056,13 +1094,7 @@ class MainWindow(QMainWindow):
             if ext == '.json':
                 model.load_json(path)
             elif ext in ('.mid', '.midi'):
-                if not _HAS_MIDI_CONV:
-                    QMessageBox.warning(self, t('dlg_warn'), t('dlg_midi_no_conv'))
-                    return
-                xml_out = os.path.splitext(path)[0] + '_converted.xml'
-                MIDIToXMLConverter().convert_midi_to_xml(path, xml_out, resolve_overlaps=False)
-                model.load_xml(xml_out)
-                model.current_file = xml_out
+                model.load_midi(path)
             else:
                 model.load_xml(path)
             self.view.load_model(model)
@@ -1102,9 +1134,17 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self, t('dlg_save_as_title'),
             default,
-            'XML (*.xml);;JSON (*.json)',
+            'MIDI (*.mid *.midi);;XML (*.xml);;JSON (*.json)',
         )
         if path:
+            if not os.path.splitext(path)[1]:
+                selected_filter = _.lower()
+                if 'midi' in selected_filter:
+                    path += '.mid'
+                elif 'json' in selected_filter:
+                    path += '.json'
+                else:
+                    path += '.xml'
             self._do_save(path)
 
     def save_as_json(self) -> None:
@@ -1121,20 +1161,51 @@ class MainWindow(QMainWindow):
                 path += '.json'
             self._do_save(path)
 
-    def _do_save(self, path: str) -> None:
+    def save_as_xml(self) -> None:
+        m = self.view.model
+        default = (
+            os.path.splitext(m.current_file)[0] + '.xml'
+            if m.current_file else ''
+        )
+        if not default and hasattr(m, '_song_name') and m._song_name:
+            default = m._song_name + '.xml'
+        path, _ = QFileDialog.getSaveFileName(
+            self, t('dlg_save_xml_title'), default, 'XML (*.xml)',
+        )
+        if path:
+            if not path.lower().endswith('.xml'):
+                path += '.xml'
+            self._do_save(path)
+
+    def save_as_xml_midi_restore(self) -> None:
+        m = self.view.model
+        default = (
+            os.path.splitext(m.current_file)[0] + '_midi_restore.xml'
+            if m.current_file else ''
+        )
+        if not default and hasattr(m, '_song_name') and m._song_name:
+            default = m._song_name + '_midi_restore.xml'
+        path, _ = QFileDialog.getSaveFileName(
+            self, t('dlg_save_xml_midi_restore_title'), default, 'XML (*.xml)',
+        )
+        if path:
+            if not path.lower().endswith('.xml'):
+                path += '.xml'
+            self._do_save(path, use_midi_restore=True)
+
+    def _do_save(self, path: str, use_midi_restore: bool = False) -> None:
         ext = os.path.splitext(path)[1].lower()
         try:
             m = self.view.model
             if ext == '.json':
                 m.save_json(path)
                 actual = path
+            elif ext in ('.mid', '.midi'):
+                m.save_midi(path)
+                actual = path
             else:
-                if m.root is None:
-                    actual = os.path.splitext(path)[0] + '.json'
-                    m.save_json(actual)
-                else:
-                    m.save_xml(path)
-                    actual = path
+                m.save_xml(path, use_midi_restore=use_midi_restore)
+                actual = path
             self._refresh_title()
             QMessageBox.information(self, t('dlg_save_ok_title'), t('dlg_save_ok_msg', actual))
         except Exception as e:
@@ -1385,6 +1456,24 @@ class MainWindow(QMainWindow):
             t('tb_time_uniform_on') if checked else t('tb_time_uniform_off')
         )
 
+    def _refresh_view_mode_action(self) -> None:
+        mode = getattr(self.view, 'view_mode', 'measure')
+        text_key = {
+            'measure': 'tb_time_uniform_measure',
+            'time': 'tb_time_uniform_time',
+            'pitch': 'tb_time_uniform_pitch',
+        }.get(mode, 'tb_time_uniform_measure')
+        self._act_time_uniform.setText(t(text_key))
+        self._act_time_uniform.setToolTip(t('tb_time_uniform_tip'))
+
+    def _cycle_view_mode(self, checked: bool = False) -> None:
+        self.view.cycle_view_mode()
+        self._refresh_view_mode_action()
+
+    def _on_time_uniform_toggle(self, checked: bool) -> None:
+        self.view.toggle_time_uniform(checked)
+        self._refresh_view_mode_action()
+
     def _rebuild_hit_times(self) -> None:
         """從目前 model 建立排序的唯一 startTime 清單（輕量）。"""
         # Build candidate times from note starts and beat timings, but only
@@ -1612,12 +1701,37 @@ class MainWindow(QMainWindow):
             logging.debug('processing audio with rip_ms=%s', rip_ms)
             if rip_ms == 0:
                 # 無偏移：若曲目資料夾已有同名 wav → 直接沿用，不複製
-                if os.path.isfile(audio_in_song_root):
-                    audio_dest = audio_in_song_root
-                else:
-                    audio_dest = audio_in_song_root
-                    shutil.copy2(str(src_wav), audio_dest)
-                audio_res_suffix = display_name          # 資源路徑用曲名 (放在曲目根)
+                # Check user settings: auto-process audio on export (parse filename offset)
+                auto_proc = bool(settings.get('export_auto_process_audio', True))
+                processed = None
+                if auto_proc:
+                    try:
+                        from .wav_process import parse_offset_from_filename, process_wav
+                        detected = parse_offset_from_filename(str(src_wav))
+                        if detected is not None and detected != 0:
+                            sign = '+' if detected > 0 else ''
+                            offset_tag = f'{sign}{detected}ms'
+                            wav_name = f'{display_name}_{offset_tag}.wav'
+                            audio_dest = os.path.join(diff_folder, wav_name)
+                            try:
+                                process_wav(str(src_wav), audio_dest, offset_ms=detected,
+                                            trim_end_ms=int(settings.get('export_trim_end_ms', 0)))
+                                processed = audio_dest
+                            except Exception:
+                                processed = None
+                            if processed:
+                                audio_res_suffix = f'{diff_name}/{Path(wav_name).stem}'
+                                logging.debug('audio processed to %s (audio_dest=%s)', processed, audio_dest)
+                    except Exception:
+                        processed = None
+
+                if processed is None:
+                    if os.path.isfile(audio_in_song_root):
+                        audio_dest = audio_in_song_root
+                    else:
+                        audio_dest = audio_in_song_root
+                        shutil.copy2(str(src_wav), audio_dest)
+                    audio_res_suffix = display_name          # 資源路徑用曲名 (放在曲目根)
             else:
                 # 有偏移：處理音源後放入難度子資料夾，檔名標註偏移量
                 sign = '+' if offset > 0 else ''

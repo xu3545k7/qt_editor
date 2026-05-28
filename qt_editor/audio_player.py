@@ -423,25 +423,39 @@ class AudioPlayer(QObject):
     def _slice(self, start_ms: float, end_ms: float) -> Optional[bytes]:
         if self.audio_bytes is None or self.audio_rate <= 0:
             return None
+        if end_ms <= start_ms:
+            return None
+        bps = self.audio_channels * self.audio_sampwidth
+        lead_ms = max(0.0, min(end_ms, 0.0) - start_ms)
+        lead_frames = int(lead_ms / 1000.0 * self.audio_rate)
+        lead = b'\x00' * (lead_frames * bps)
         s_ms = max(0.0, start_ms)
-        e_ms = max(s_ms, end_ms)
-        bps  = self.audio_channels * self.audio_sampwidth
-        sb   = int(s_ms / 1000.0 * self.audio_rate) * bps
-        eb   = int(e_ms / 1000.0 * self.audio_rate) * bps
-        eb   = min(len(self.audio_bytes), eb)
-        return self.audio_bytes[sb:eb] if eb > sb else None
+        audio_end_ms = max(0.0, end_ms)
+        sb = int(s_ms / 1000.0 * self.audio_rate) * bps
+        eb = int(audio_end_ms / 1000.0 * self.audio_rate) * bps
+        eb = min(len(self.audio_bytes), eb)
+        body = self.audio_bytes[sb:eb] if eb > sb else b''
+        out = lead + body
+        return out or None
 
     def _slice2(self, start_ms: float, end_ms: float) -> Optional[bytes]:
         """Slice secondary audio buffer using its own audio params."""
         if self.audio2_bytes is None or self.audio2_rate <= 0:
             return None
-        s_ms = max(0.0, start_ms)
-        e_ms = max(s_ms, end_ms)
+        if end_ms <= start_ms:
+            return None
         bps = self.audio2_channels * self.audio2_sampwidth
+        lead_ms = max(0.0, min(end_ms, 0.0) - start_ms)
+        lead_frames = int(lead_ms / 1000.0 * self.audio2_rate)
+        lead = b'\x00' * (lead_frames * bps)
+        s_ms = max(0.0, start_ms)
+        audio_end_ms = max(0.0, end_ms)
         sb = int(s_ms / 1000.0 * self.audio2_rate) * bps
-        eb = int(e_ms / 1000.0 * self.audio2_rate) * bps
+        eb = int(audio_end_ms / 1000.0 * self.audio2_rate) * bps
         eb = min(len(self.audio2_bytes), eb)
-        return self.audio2_bytes[sb:eb] if eb > sb else None
+        body = self.audio2_bytes[sb:eb] if eb > sb else b''
+        out = lead + body
+        return out or None
 
     def _mix_pcm(self, pcm1: bytes, pcm2: bytes, sampwidth: int) -> bytes:
         """Mix two PCM byte streams with same sampwidth (8/16-bit)."""
