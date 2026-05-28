@@ -1,0 +1,77 @@
+2026-04-19 04:08:55,198 DEBUG: export_song: start
+2026-04-19 04:08:55,198 DEBUG: model current_file=C:/Users/shawn/Downloads/wiktoria-hua-linaru-da-quan-yuan-wu-qu-long-ver_converted.xml dirty=True
+2026-04-19 04:08:55,198 DEBUG: audio_path=C:/Users/shawn/Downloads/【IIDX】 華麗なる大犬\u5186舞曲 (Long ver.) _ Wiktoria 【Sound Only】 - THun (youtube).wav
+2026-04-19 04:10:35,319 DEBUG: export_song: dialog accepted
+2026-04-19 04:10:35,319 DEBUG: export params: display_name=華麗なる大犬\u5186舞曲, diff_name=Real, diff_level=20, append=False
+2026-04-19 04:10:35,319 DEBUG: creating song_folder=D:\Nostalgia\qt_editor\UnityProject\nos_clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲
+2026-04-19 04:10:35,319 DEBUG: creating diff_folder=D:\Nostalgia\qt_editor\UnityProject\nos_clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\Real
+2026-04-19 04:10:35,322 DEBUG: saving chart json to D:\Nostalgia\qt_editor\UnityProject\nos_clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\Real\華麗なる大犬\u5186舞曲.json
+2026-04-19 04:10:35,354 DEBUG: chart saved
+2026-04-19 04:10:35,354 DEBUG: processing audio with rip_ms=-1000
+2026-04-19 04:10:35,369 DEBUG: audio processed to C:\Users\shawn\Downloads\【IIDX】 華麗なる大犬\u5186舞曲 (Long ver.) _ Wiktoria 【Sound Only】 - THun (youtube).wav (audio_dest=D:\Nostalgia\qt_editor\UnityProject\nos_clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\Real\華麗なる大犬\u5186舞曲_+1000ms.wav)
+2026-04-19 04:10:35,370 DEBUG: cover copied to D:\Nostalgia\qt_editor\UnityProject\nos_clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\華麗なる大犬\u5186舞曲.png
+2026-04-19 04:10:35,370 DEBUG: writing register.json to D:\Nostalgia\qt_editor\UnityProject\nos_clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\register.json
+2026-04-19 04:10:35,370 DEBUG: register.json written
+2026-04-19 04:18:44,335 DEBUG: export_song: start
+2026-04-19 04:18:44,335 DEBUG: model current_file=C:/Users/shawn/Downloads/wiktoria-hua-linaru-da-quan-yuan-wu-qu-long-ver_converted.xml dirty=False
+2026-04-19 04:18:44,335 DEBUG: audio_path=
+2026-04-19 04:18:52,377 DEBUG: export_song: dialog cancelled
+2026-04-19 04:18:58,678 DEBUG: export_song: start
+2026-04-19 04:18:58,678 DEBUG: model current_file=C:/Users/shawn/Downloads/wiktoria-hua-linaru-da-quan-yuan-wu-qu-long-ver_converted.xml dirty=False
+2026-04-19 04:18:58,678 DEBUG: audio_path=C:/Users/shawn/Downloads/【IIDX】 華麗なる大犬\u5186舞曲 (Long ver.) _ Wiktoria 【Sound Only】 - THun (youtube).wav
+2026-04-19 04:19:47,677 DEBUG: export_song: dialog accepted
+2026-04-19 04:19:47,677 DEBUG: export params: display_name=華麗なる大犬\u5186舞曲, diff_name=Real, diff_level=20, append=True
+2026-04-19 04:19:47,677 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲
+2026-04-19 04:19:47,679 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\Real
+2026-04-19 04:19:47,679 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\Real\華麗なる大犬\u5186舞曲.json
+2026-04-19 04:19:47,734 DEBUG: chart saved
+2026-04-19 04:19:47,734 DEBUG: processing audio with rip_ms=-1000
+2026-04-19 04:19:47,750 DEBUG: audio processed to C:\Users\shawn\Downloads\【IIDX】 華麗なる大犬\u5186舞曲 (Long ver.) _ Wiktoria 【Sound Only】 - THun (youtube).wav (audio_dest=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\Real\華麗なる大犬\u5186舞曲_+1000ms.wav)
+2026-04-19 04:19:47,750 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\華麗なる大犬\u5186舞曲.png
+2026-04-19 04:19:47,750 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\華麗なる大犬\u5186舞曲\register.json
+2026-04-19 04:19:47,752 DEBUG: register.json written
+2026-05-03 04:38:23,231 DEBUG: export_song: start
+2026-05-03 04:38:23,254 DEBUG: model current_file=C:/Users/shawn/Downloads/Melodiniq (piano version)_converted.xml dirty=False
+2026-05-03 04:38:23,254 DEBUG: audio_path=C:/Users/shawn/Downloads/[CHUNITHM] onoken a.k.a. owl＊tree - Melodiniq (piano version by 95jack) - 95jack (youtube).wav
+2026-05-03 04:38:24,757 DEBUG: export_song: dialog cancelled
+2026-05-03 04:39:50,140 DEBUG: export_song: start
+2026-05-03 04:39:50,140 DEBUG: model current_file=C:/Users/shawn/Downloads/Melodiniq (piano version)_converted.xml dirty=False
+2026-05-03 04:39:50,140 DEBUG: audio_path=C:/Users/shawn/Downloads/[CHUNITHM] onoken a.k.a. owl＊tree - Melodiniq (piano version by 95jack) - 95jack (youtube).wav
+2026-05-03 04:40:46,769 DEBUG: export_song: dialog accepted
+2026-05-03 04:40:46,769 DEBUG: export params: display_name=Melodiq, diff_name=ULTIMA, diff_level=20, append=False
+2026-05-03 04:40:46,769 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiq
+2026-05-03 04:40:46,792 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiq\ULTIMA
+2026-05-03 04:40:46,794 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiq\ULTIMA\Melodiq.json
+2026-05-03 04:40:46,815 DEBUG: chart saved
+2026-05-03 04:40:46,815 DEBUG: processing audio with rip_ms=0
+2026-05-03 04:40:46,831 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiq\Melodiq.jpg
+2026-05-03 04:40:46,831 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiq\register.json
+2026-05-03 04:40:46,831 DEBUG: register.json written
+2026-05-03 04:45:11,736 DEBUG: export_song: start
+2026-05-03 04:45:11,736 DEBUG: model current_file=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiq\ULTIMA\Melodiq.json dirty=False
+2026-05-03 04:45:11,736 DEBUG: audio_path=C:/Users/shawn/Downloads/[CHUNITHM] onoken a.k.a. owl＊tree - Melodiniq (piano version by 95jack) - 95jack (youtube).wav
+2026-05-03 04:45:37,582 DEBUG: export_song: dialog accepted
+2026-05-03 04:45:37,583 DEBUG: export params: display_name=Melodiq, diff_name=ULTIMA., diff_level=20, append=True
+2026-05-03 04:45:37,583 DEBUG: creating song_folder=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/Melodiq
+2026-05-03 04:45:37,583 DEBUG: creating diff_folder=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/Melodiq\ULTIMA.
+2026-05-03 04:45:37,583 DEBUG: saving chart json to D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/Melodiq\ULTIMA.\Melodiq.json
+2026-05-03 04:45:37,606 DEBUG: chart saved
+2026-05-03 04:45:37,606 DEBUG: processing audio with rip_ms=200
+2026-05-03 04:45:37,617 DEBUG: audio processed to C:\Users\shawn\Downloads\[CHUNITHM] onoken a.k.a. owl＊tree - Melodiniq (piano version by 95jack) - 95jack (youtube).wav (audio_dest=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/Melodiq\ULTIMA.\Melodiq_-200ms.wav)
+2026-05-03 04:45:37,617 DEBUG: cover copied to D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/Melodiq\Melodiq.jpg
+2026-05-03 04:45:37,617 DEBUG: writing register.json to D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/Melodiq\register.json
+2026-05-03 04:45:37,617 DEBUG: register.json written
+2026-05-03 04:49:44,658 DEBUG: export_song: start
+2026-05-03 04:49:44,658 DEBUG: model current_file=C:/Users/shawn/Downloads/Melodiniq (piano version)_converted.xml dirty=False
+2026-05-03 04:49:44,658 DEBUG: audio_path=
+2026-05-03 04:50:36,613 DEBUG: export_song: dialog accepted
+2026-05-03 04:50:36,613 DEBUG: export params: display_name=Melodiniq, diff_name=MASTER, diff_level=20, append=False
+2026-05-03 04:50:36,613 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq
+2026-05-03 04:50:36,614 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\MASTER
+2026-05-03 04:50:36,614 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\MASTER\Melodiniq.json
+2026-05-03 04:50:36,637 DEBUG: chart saved
+2026-05-03 04:50:36,637 DEBUG: processing audio with rip_ms=200
+2026-05-03 04:50:36,648 DEBUG: audio processed to C:\Users\shawn\Downloads\[CHUNITHM] onoken a.k.a. owl＊tree - Melodiniq (piano version by 95jack) - 95jack (youtube).wav (audio_dest=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\MASTER\Melodiniq_-200ms.wav)
+2026-05-03 04:50:36,649 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\Melodiniq.jpg
+2026-05-03 04:50:36,649 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\register.json
+2026-05-03 04:50:36,649 DEBUG: register.json written

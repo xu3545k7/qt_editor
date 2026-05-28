@@ -1,0 +1,75 @@
+<?xml version="1.0" ?>
+<music_score>
+  <header>
+    <max_scale __type="s32">60</max_scale>
+    <min_scale __type="s32">60</min_scale>
+    <file_version __type="s16">1</file_version>
+    <first_bpm __type="s64">120</first_bpm>
+    <music_finish_time_msec __type="s32">500</music_finish_time_msec>
+    <time_signature_numerator __type="s32">4</time_signature_numerator>
+    <time_signature_denominator __type="s32">4</time_signature_denominator>
+    <time_signature __type="str">4/4</time_signature>
+  </header>
+  <note_data>
+    <note>
+      <index __type="s32">0</index>
+      <start_timing_msec __type="s32">0</start_timing_msec>
+      <end_timing_msec __type="s32">500</end_timing_msec>
+      <gate_time_msec __type="s32">500</gate_time_msec>
+      <scale_piano __type="u8">60</scale_piano>
+      <min_key_index __type="s32">11</min_key_index>
+      <max_key_index __type="s32">13</max_key_index>
+      <note_type __type="s32">2</note_type>
+      <hand __type="s32">1</hand>
+      <key_kind __type="s32">1</key_kind>
+      <param1 __type="s32">0</param1>
+      <param2 __type="s32">0</param2>
+      <param3 __type="s32">0</param3>
+      <measure_index __type="s32">0</measure_index>
+      <sub_note_data>
+        <sub_note>
+          <start_timing_msec __type="s32">0</start_timing_msec>
+          <end_timing_msec __type="s32">500</end_timing_msec>
+          <scale_piano __type="u8">60</scale_piano>
+          <velocity __type="u8">64</velocity>
+          <track_index __type="s32">0</track_index>
+        </sub_note>
+      </sub_note_data>
+    </note>
+  </note_data>
+  <beat_data>
+    <beat>
+      <index __type="s32">0</index>
+      <start_timing_msec __type="s32">0</start_timing_msec>
+    </beat>
+  </beat_data>
+  <time_signature_changes>
+    <ts_change>
+      <start_timing_msec __type="s32">0</start_timing_msec>
+      <numerator __type="s32">4</numerator>
+      <denominator __type="s32">4</denominator>
+    </ts_change>
+  </time_signature_changes>
+  <track_info>
+    <track>
+      <index __type="s32">1</index>
+      <name __type="str">key_apiano1</name>
+    </track>
+    <track>
+      <index __type="s32">2</index>
+      <name __type="str">key_apiano1</name>
+    </track>
+    <track>
+      <index __type="s32">3</index>
+      <name __type="str">key_apiano1</name>
+    </track>
+  </track_info>
+  <velocity_zone_data>
+    <velocity_zone>
+      <index __type="s32">0</index>
+      <start_timing_msec __type="s32">0</start_timing_msec>
+      <end_timing_msec __type="s32">500</end_timing_msec>
+      <velocity_type __type="s32">0</velocity_type>
+    </velocity_zone>
+  </velocity_zone_data>
+</music_score>
