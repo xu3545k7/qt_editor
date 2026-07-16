@@ -95,6 +95,11 @@ def game_lane_index_to_midi_pitch(key_index: int) -> int:
     return int(max(MIDI_PIANO_MIN, min(MIDI_PIANO_MAX, pitch)))
 
 
+def bpm_to_xml_value(bpm: float) -> int:
+    """Store XML BPM in the official scaled integer format."""
+    return int(round(float(bpm) * 100000.0))
+
+
 def lane_center_to_width3_range(preferred_center: int) -> Tuple[int, int]:
     """Expand a center lane to the width-3 range used by MIDI restore output."""
     center = max(0, min(TOTAL_GAME_KEYS - 1, int(preferred_center)))
@@ -1278,6 +1283,20 @@ class NoteModel:
         el.set('__type', type_attr)
         return el
 
+    @staticmethod
+    def _upsert_typed_xml(
+        parent: ET.Element,
+        tag: str,
+        text: Any,
+        type_attr: str,
+    ) -> ET.Element:
+        el = parent.find(tag)
+        if el is None:
+            el = ET.SubElement(parent, tag)
+        el.text = str(text)
+        el.set('__type', type_attr)
+        return el
+
     def _ensure_event_data_for_export(self) -> None:
         assert self.root is not None
         if self.root.find('event_data') is not None:
@@ -1310,7 +1329,7 @@ class NoteModel:
         self._add_typed_xml(hdr, 'max_scale', 108, 's32')
         self._add_typed_xml(hdr, 'min_scale', 21, 's32')
         self._add_typed_xml(hdr, 'file_version', 1, 's16')
-        self._add_typed_xml(hdr, 'first_bpm', int(round(self.bpm)), 's64')
+        self._add_typed_xml(hdr, 'first_bpm', bpm_to_xml_value(self.bpm), 's64')
         self._add_typed_xml(hdr, 'music_finish_time_msec', int(round(self.music_end_ms)), 's32')
         self._add_typed_xml(hdr, 'time_signature_numerator', int(self.beats_per_bar), 's32')
         self._add_typed_xml(hdr, 'time_signature_denominator', int(self.time_sig_denominator), 's32')
@@ -1344,6 +1363,49 @@ class NoteModel:
         ET.SubElement(root, 'note_data')
         self.root = root
         self.tree = ET.ElementTree(root)
+
+    def _sync_xml_metadata_for_export(self) -> None:
+        self._ensure_xml_tree_for_export()
+        assert self.root is not None
+
+        hdr = self.root.find('header')
+        if hdr is None:
+            hdr = ET.SubElement(self.root, 'header')
+
+        self._upsert_typed_xml(hdr, 'max_scale', 108, 's32')
+        self._upsert_typed_xml(hdr, 'min_scale', 21, 's32')
+        self._upsert_typed_xml(hdr, 'file_version', 1, 's16')
+        self._upsert_typed_xml(hdr, 'first_bpm', bpm_to_xml_value(self.bpm), 's64')
+        self._upsert_typed_xml(hdr, 'music_finish_time_msec', int(round(self.music_end_ms)), 's32')
+        self._upsert_typed_xml(hdr, 'time_signature_numerator', int(self.beats_per_bar), 's32')
+        self._upsert_typed_xml(hdr, 'time_signature_denominator', int(self.time_sig_denominator), 's32')
+        self._upsert_typed_xml(
+            hdr,
+            'time_signature',
+            f'{int(self.beats_per_bar)}/{int(self.time_sig_denominator)}',
+            'str',
+        )
+        if abs(float(self.beat_offset_ms)) > 1e-6:
+            self._upsert_typed_xml(hdr, 'beat_offset_ms', int(round(self.beat_offset_ms)), 's32')
+        else:
+            beat_offset_el = hdr.find('beat_offset_ms')
+            if beat_offset_el is not None:
+                hdr.remove(beat_offset_el)
+
+        ts_root = self.root.find('time_signature_changes')
+        if self.time_sig_changes:
+            if ts_root is None:
+                ts_root = ET.SubElement(self.root, 'time_signature_changes')
+            else:
+                for child in list(ts_root):
+                    ts_root.remove(child)
+            for tms, tnum, tden in self.time_sig_changes:
+                ch = ET.SubElement(ts_root, 'ts_change')
+                self._add_typed_xml(ch, 'start_timing_msec', int(tms), 's32')
+                self._add_typed_xml(ch, 'numerator', int(tnum), 's32')
+                self._add_typed_xml(ch, 'denominator', int(tden), 's32')
+        elif ts_root is not None:
+            self.root.remove(ts_root)
 
     @staticmethod
     def _lane_ranges_overlap(
@@ -1422,6 +1484,87 @@ class NoteModel:
             for note in restored
         ]
 
+    def apply_midi_pitches_from_source_notes(
+        self,
+        source_notes: List[GNote],
+    ) -> Dict[str, int]:
+        current_groups: Dict[int, List[GNote]] = {}
+        for note in self.notes_tree:
+            current_groups.setdefault(int(note.start), []).append(note)
+
+        source_groups: List[Tuple[int, List[Tuple[int, int]]]] = []
+        for start_ms in sorted({int(note.start) for note in source_notes}):
+            source_entries: List[Tuple[int, int]] = []
+            for note in source_notes:
+                if int(note.start) != start_ms or note.pitch is None:
+                    continue
+                pitch = (
+                    official_piano_index_to_midi(note.pitch)
+                    if int(note.pitch) < MIDI_PIANO_MIN else int(note.pitch)
+                )
+                hand = 1 if int(getattr(note, 'hand', 0)) else 0
+                source_entries.append((int(pitch), hand))
+            if source_entries:
+                source_entries.sort(key=lambda item: item[0], reverse=True)
+                source_groups.append((int(start_ms), source_entries))
+
+        source_index_by_time = {
+            int(start_ms): idx for idx, (start_ms, _entries) in enumerate(source_groups)
+        }
+        used_source_indices: set[int] = set()
+        next_source_idx = 0
+        matched_groups = 0
+        exact_groups = 0
+        matched_notes = 0
+        partial_groups = 0
+
+        for start_ms in sorted(current_groups):
+            target_notes = sorted(
+                current_groups[start_ms],
+                key=lambda note: (
+                    (int(note.min_key) + int(note.max_key)) / 2.0,
+                    int(note.max_key),
+                    -int(note.idx),
+                ),
+                reverse=True,
+            )
+            source_idx = source_index_by_time.get(int(start_ms))
+            if source_idx in used_source_indices:
+                source_idx = None
+            if source_idx is not None:
+                exact_groups += 1
+            else:
+                while next_source_idx < len(source_groups) and next_source_idx in used_source_indices:
+                    next_source_idx += 1
+                if next_source_idx >= len(source_groups):
+                    break
+                source_idx = next_source_idx
+
+            used_source_indices.add(source_idx)
+            if source_idx == next_source_idx:
+                next_source_idx += 1
+
+            _source_start_ms, source_entries = source_groups[source_idx]
+            applied = 0
+            for note, (pitch, hand) in zip(target_notes, source_entries):
+                note.pitch = int(pitch)
+                note.hand = int(hand)
+                applied += 1
+            if applied:
+                matched_groups += 1
+                matched_notes += applied
+                if applied != len(target_notes) or applied != len(source_entries):
+                    partial_groups += 1
+
+        return {
+            'matched_notes': int(matched_notes),
+            'matched_groups': int(matched_groups),
+            'exact_groups': int(exact_groups),
+            'partial_groups': int(partial_groups),
+            'target_groups': int(len(current_groups)),
+            'source_groups': int(len(source_groups)),
+        }
+
     def save_xml(self, path: Optional[str] = None, use_midi_restore: bool = False) -> None:
         if use_midi_restore:
             self.save_xml_with_midi_restore(path)
@@ -1431,6 +1574,7 @@ class NoteModel:
         if path is None:
             raise ValueError('未指定存檔路徑')
         self._ensure_xml_tree_for_export()
+        self._sync_xml_metadata_for_export()
         assert self.root is not None and self.tree is not None
 
         # ── 永遠從 notes_tree 重建 note_data ────────────────────────
@@ -1442,8 +1586,10 @@ class NoteModel:
             for child in list(nd):
                 nd.remove(child)
 
-        sorted_notes = sorted(self.notes_tree, key=lambda _n: (_n.start, _n.min_key))
-        for i, n in enumerate(sorted_notes):
+        # Preserve the current note_data order for regular NOS XML saves.
+        # Re-sorting here can reshuffle nearby notes after reload and make
+        # left/right hand labels appear to jump to a different note.
+        for i, n in enumerate(self.notes_tree):
             if n.elem is not None:
                 # 更新既有 XML 元素後重新掛入
                 n.apply_back(EXTERNAL_LANE_BASE)
@@ -1472,6 +1618,7 @@ class NoteModel:
         if path is None:
             raise ValueError('No save path specified.')
         self._ensure_xml_tree_for_export()
+        self._sync_xml_metadata_for_export()
         assert self.root is not None and self.tree is not None
 
         nd = self.root.find('note_data')
@@ -1920,7 +2067,7 @@ class NoteModel:
         _add(hdr, 'max_scale',                    108,                    's32')
         _add(hdr, 'min_scale',                    21,                     's32')
         _add(hdr, 'file_version',                 1,                      's16')
-        _add(hdr, 'first_bpm',                    int(model.bpm),         's64')
+        _add(hdr, 'first_bpm',                    bpm_to_xml_value(model.bpm), 's64')
         _add(hdr, 'music_finish_time_msec',        int(model.music_end_ms),'s32')
         _add(hdr, 'time_signature_numerator',      model.beats_per_bar,    's32')
         _add(hdr, 'time_signature_denominator',    den,                    's32')

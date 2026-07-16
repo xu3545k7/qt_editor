@@ -75,3 +75,69 @@
 2026-05-03 04:50:36,649 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\Melodiniq.jpg
 2026-05-03 04:50:36,649 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Melodiniq\register.json
 2026-05-03 04:50:36,649 DEBUG: register.json written
+2026-06-04 05:54:39,891 DEBUG: export_song: start
+2026-06-04 05:54:39,915 DEBUG: model current_file=C:/Users/shawn/Downloads/¤Ñ®z.xml dirty=True
+2026-06-04 05:54:39,916 DEBUG: audio_path=C:/Users/shawn/Downloads/¤Ñ®z.wav
+2026-06-04 05:56:24,353 DEBUG: export_song: dialog accepted
+2026-06-04 05:56:24,353 DEBUG: export params: display_name=¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver., diff_name=Masker, diff_level=12, append=False
+2026-06-04 05:56:24,354 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver.
+2026-06-04 05:56:24,354 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver.\Masker
+2026-06-04 05:56:24,354 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver.\Masker\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver..json
+2026-06-04 05:56:24,368 DEBUG: chart saved
+2026-06-04 05:56:24,368 DEBUG: processing audio with rip_ms=0
+2026-06-04 05:56:24,415 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver.\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver..jpg
+2026-06-04 05:56:24,415 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver.\register.json
+2026-06-04 05:56:24,415 DEBUG: register.json written
+2026-06-04 06:10:58,786 DEBUG: export_song: start
+2026-06-04 06:10:58,786 DEBUG: model current_file=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver.\Masker\¤ÑÇf®z -ÆªÆ§Æ÷Æ´Piano Ver..json dirty=False
+2026-06-04 06:10:58,786 DEBUG: audio_path=C:/Users/shawn/Downloads/¤Ñ®z.wav
+2026-06-04 06:11:31,542 DEBUG: export_song: dialog accepted
+2026-06-04 06:11:31,542 DEBUG: export params: display_name=¤ÑÇf®z, diff_name=Master, diff_level=10, append=False
+2026-06-04 06:11:31,542 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z
+2026-06-04 06:11:31,542 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z\Master
+2026-06-04 06:11:31,542 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z\Master\¤ÑÇf®z.json
+2026-06-04 06:11:31,556 DEBUG: chart saved
+2026-06-04 06:11:31,556 DEBUG: processing audio with rip_ms=0
+2026-06-04 06:11:31,577 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z\¤ÑÇf®z.jpg
+2026-06-04 06:11:31,577 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\¤ÑÇf®z\register.json
+2026-06-04 06:11:31,578 DEBUG: register.json written
+2026-07-06 08:18:17,550 DEBUG: export_song: start
+2026-07-06 08:18:17,559 DEBUG: model current_file=C:/Users/shawn/Downloads/etude-tableau-little-red-riding-hood-and-the-wolf-op39-no-6-sergei-rachmaninoff.xml dirty=True
+2026-07-06 08:18:17,559 DEBUG: audio_path=C:/Users/shawn/Downloads/etude-tableau-little-red-riding-hood-and-the-wolf-op39-no-6-sergei-rachmaninoff.wav
+2026-07-06 08:18:53,410 DEBUG: export_song: dialog accepted
+2026-07-06 08:18:53,410 DEBUG: export params: display_name=\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v, diff_name=Real, diff_level=13, append=False
+2026-07-06 08:18:53,410 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v
+2026-07-06 08:18:53,411 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v\Real
+2026-07-06 08:18:53,411 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v\Real\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v.json
+2026-07-06 08:18:53,433 DEBUG: chart saved
+2026-07-06 08:18:53,433 DEBUG: processing audio with rip_ms=0
+2026-07-06 08:18:53,447 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v.png
+2026-07-06 08:18:53,447 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\\u7d75\u753bªº½m²ß¦±¡u­µÆÒ\u7d75¡v²Ä6¦±¡u¨ªÆ¾Æ±Æ÷ÆÌ¯T¡v\register.json
+2026-07-06 08:18:53,447 DEBUG: register.json written
+2026-07-11 05:21:28,916 DEBUG: export_song: start
+2026-07-11 05:21:28,919 DEBUG: model current_file=C:/Users/shawn/Downloads/etude-op25-no11-in-a-minor-winter-wind-f-chopin.xml dirty=False
+2026-07-11 05:21:28,919 DEBUG: audio_path=C:/Users/shawn/Downloads/etude-op25-no11-in-a-minor-winter-wind-f-chopin.wav
+2026-07-11 05:28:48,201 DEBUG: export_song: dialog accepted
+2026-07-11 05:28:48,201 DEBUG: export params: display_name=Etude Op.25 No.11 ¡§Winter Wind¡¨, diff_name=Real, diff_level=13, append=False
+2026-07-11 05:28:48,202 DEBUG: creating song_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Etude Op.25 No.11 ¡§Winter Wind¡¨
+2026-07-11 05:28:48,202 DEBUG: creating diff_folder=D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Etude Op.25 No.11 ¡§Winter Wind¡¨\Real
+2026-07-11 05:28:48,202 DEBUG: saving chart json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Etude Op.25 No.11 ¡§Winter Wind¡¨\Real\Etude Op.25 No.11 ¡§Winter Wind¡¨.json
+2026-07-11 05:28:48,231 DEBUG: chart saved
+2026-07-11 05:28:48,231 DEBUG: processing audio with rip_ms=0
+2026-07-11 05:28:48,249 DEBUG: cover copied to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Etude Op.25 No.11 ¡§Winter Wind¡¨\Etude Op.25 No.11 ¡§Winter Wind¡¨.png
+2026-07-11 05:28:48,249 DEBUG: writing register.json to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\Etude Op.25 No.11 ¡§Winter Wind¡¨\register.json
+2026-07-11 05:28:48,250 DEBUG: register.json written
+2026-07-14 05:52:41,011 DEBUG: export_song: start
+2026-07-14 05:52:41,014 DEBUG: model current_file=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura/Æ¦Æ»ÆéÆíÆ»ÆéÆí___asyurasyura.json dirty=False
+2026-07-14 05:52:41,014 DEBUG: audio_path=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura/[ÇlÆùÇf _ piano] Æ¦Æ»ÆéÆíÆ»ÆéÆí.wav
+2026-07-14 05:53:00,334 DEBUG: export_song: dialog accepted
+2026-07-14 05:53:00,334 DEBUG: export params: display_name=Æ¦Æ»ÆéÆíÆ»ÆéÆí, diff_name=Master, diff_level=10, append=True
+2026-07-14 05:53:00,334 DEBUG: creating song_folder=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura
+2026-07-14 05:53:00,334 DEBUG: creating diff_folder=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura\Master
+2026-07-14 05:53:00,334 DEBUG: saving chart json to D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura\Master\Æ¦Æ»ÆéÆíÆ»ÆéÆí.json
+2026-07-14 05:53:00,357 DEBUG: chart saved
+2026-07-14 05:53:00,357 DEBUG: processing audio with rip_ms=-2450
+2026-07-14 05:53:00,368 DEBUG: audio processed to D:\Nostalgia\Nostalgia-clone\Assets\Resources\songs\asyurasyura\[ÇlÆùÇf _ piano] Æ¦Æ»ÆéÆíÆ»ÆéÆí.wav (audio_dest=D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura\Master\Æ¦Æ»ÆéÆíÆ»ÆéÆí_+2450ms.wav)
+2026-07-14 05:53:00,369 DEBUG: cover copied to D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura\Æ¦Æ»ÆéÆíÆ»ÆéÆí.jpg
+2026-07-14 05:53:00,369 DEBUG: writing register.json to D:/Nostalgia/Nostalgia-clone/Assets/Resources/songs/asyurasyura\register.json
+2026-07-14 05:53:00,369 DEBUG: register.json written

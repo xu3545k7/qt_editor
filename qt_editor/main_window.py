@@ -1178,20 +1178,37 @@ class MainWindow(QMainWindow):
             self._do_save(path)
 
     def save_as_xml_midi_restore(self) -> None:
-        m = self.view.model
-        default = (
-            os.path.splitext(m.current_file)[0] + '_midi_restore.xml'
-            if m.current_file else ''
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            t('dlg_save_xml_midi_restore_title'),
+            '',
+            'MIDI (*.mid *.midi)',
         )
-        if not default and hasattr(m, '_song_name') and m._song_name:
-            default = m._song_name + '_midi_restore.xml'
-        path, _ = QFileDialog.getSaveFileName(
-            self, t('dlg_save_xml_midi_restore_title'), default, 'XML (*.xml)',
-        )
-        if path:
-            if not path.lower().endswith('.xml'):
-                path += '.xml'
-            self._do_save(path, use_midi_restore=True)
+        if not path:
+            return
+        try:
+            source_model = NoteModel()
+            source_model.load_midi(path)
+            current_model = self.view.model
+            current_model.push_history()
+            result = current_model.apply_midi_pitches_from_source_notes(source_model.notes_tree)
+            current_model.rebuild_display_cache()
+            self.view.update()
+            self.view.note_edited.emit()
+            self._refresh_title()
+            QMessageBox.information(
+                self,
+                t('dlg_save_ok_title'),
+                t(
+                    'dlg_apply_midi_restore_done',
+                    os.path.basename(path),
+                    result.get('matched_notes', 0),
+                    result.get('matched_groups', 0),
+                    result.get('partial_groups', 0),
+                ),
+            )
+        except Exception as e:
+            QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
 
     def _do_save(self, path: str, use_midi_restore: bool = False) -> None:
         ext = os.path.splitext(path)[1].lower()
@@ -1884,8 +1901,12 @@ class MainWindow(QMainWindow):
             cur, 10.0, 999.0, 2,
         )
         if ok:
+            self.view.model.push_history()
             self.view.model.bpm = bpm
             self.view.rebuild_mapper()
+            self.view.model.dirty = True
+            self.view.update()
+            self.view.note_edited.emit()
 
     def adjust_beats_dialog(self) -> None:
         cur = self.view.model.beats_per_bar
