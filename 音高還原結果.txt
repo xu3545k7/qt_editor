@@ -1,0 +1,68 @@
+模式: 寫檔
+
+曲目                         譜面                                 完整度      順序      相關 用的 MIDI
+Abiogenesis                abiogenesis.json                100.0%  100.0%   0.964 abiogenesis.mid
+Break_Through_the_Dome     Break_Through_the_Dome.json     100.0%  100.0%   0.988 Break_Through_the_Dome.mid
+Chronomia                  chronomia--lime.json            100.0%  100.0%   0.960 chronomia--lime.mid
+Chronomia                  chronomia--lime.json            100.0%  100.0%   0.970 chronomia--lime.mid
+Chronomia                  chronomia--lime_RAW.json        100.0%  100.0%   0.967 chronomia--lime.mid
+Croatian_Rhapsody          Croatian_Rhapsody.json               -       -       - (沒有候選 MIDI)
+End_Time                   End_Time.json                   100.0%  100.0%   0.977 cres-end-time-piano-arrangment
+Entrance                   entrance_bpm90.json                  -       -       - (沒有候選 MIDI)
+Entrance                   entrance.json                        -       -       - (沒有候選 MIDI)
+Evans                      Evans_ex.json                    99.9%  100.0%   0.913 Evans.mid
+Evans                      Evans_ex_clean.json              99.9%  100.0%   0.784 Evans.mid
+Evans                      Evans.json                       99.9%  100.0%   0.951 Evans.mid
+Flight_of_the_Bamboo_Cutt  flight_of_the_bamboo_cutter_l   100.0%  100.0%   0.978 Flight_of_the_Bamboo_Cutter_Lu
+Flight_of_the_Bamboo_Cutt  flight_of_the_bamboo_cutter_l   100.0%  100.0%   0.978 Flight_of_the_Bamboo_Cutter_Lu
+Grievous_Lady              Grievous_Lady_expert_12.json    100.0%  100.0%   0.945 grievous-lady.mid
+Grievous_Lady              Grievous_Lady_Real_16.json      100.0%  100.0%   0.945 grievous-lady.mid
+Grievous_Lady              Grievous_Lady_Real_old.json      96.4%  100.0%   0.161 grievous-lady.mid  ← 不合格，跳過
+LaVI_Bavellabion           LaVI_Bavellabion.json                -       -       - (沒有候選 MIDI)
+LaVI_Bavellabion           LaVI_Bavellabion.json                -       -       - (沒有候選 MIDI)
+La_Campanella              La_Campanella.json                   -       -       - (沒有候選 MIDI)
+Latent_Kingdom             Latent_Kingdom.json              99.1%  100.0%   0.867 latent-kingdom.mid
+Longinus                   Longinus.json                   100.0%  100.0%   0.989 Longinus.mid
+Marigold                   marigold_ex.json                100.0%  100.0%   0.959 Marigold.mid
+Marigold                   marigold.json                   100.0%  100.0%   0.968 Marigold.mid
+Ocean's_Wish               ocean's_wish_raw.json            99.7%  100.0%   0.952 Ocean's Wish.mid
+Oceanus                    --cosmop-phyxinon-oceanus-ven   100.0%  100.0%   0.977 --cosmop-phyxinon-oceanus-vent
+PRAGMATISM -RESURRECTION-  pragmatism--laur-pragmatism--   100.0%  100.0%   0.928 pragmatism--laur-pragmatism--r
+PRAGMATISM -RESURRECTION-  pragmatism--laur-pragmatism--    99.2%  100.0%   0.915 pragmatism--laur-pragmatism--r
+PRAGMATISM -RESURRECTION-  pragmatism--laur-pragmatism--    99.3%  100.0%   0.915 pragmatism--laur-pragmatism--r
+RE_UNION_Duo_Blade_Agains  reunion--duo-blade-against---   100.0%  100.0%   0.973 reunion--duo-blade-against---i
+RE_UNION_Duo_Blade_Agains  reunion--duo-blade-against---   100.0%  100.0%   0.972 reunion--duo-blade-against---i
+Re_miniscence              Re_miniscence.json              100.0%  100.0%   0.949 Re_miniscence.mid
+Recollect Lines            recollect-lines.json            100.0%  100.0%   0.921 recollect-lines---vs-.mid
+Recollect Lines            recollect-lines_ele.json        100.0%  100.0%   0.920 recollect-lines---vs-.mid
+Rrhar'il                   Rrhar'il.json                   100.0%  100.0%   0.982 Rrhar'il.mid
+Scorpion_fire              Scorpion_fire_ex.json           100.0%  100.0%   0.961 Scorpion_fire.mid
+Scorpion_fire              Scorpion_fire_real.json         100.0%  100.0%   0.976 Scorpion_fire_real.mid
+Sheriruth                  Sheriruth_Real_15.json               -       -       - (沒有候選 MIDI)
+Testify                    testify.json                    100.0%  100.0%   0.969 testify.mid
+Testify                    testify_mv.json                  97.9%  100.0%   0.960 testify-void_mv.mid
+Testify                    testify_mv_raw.json              97.9%  100.0%   0.960 testify-void_mv.mid
+anima                      xi-anima-phyxinon-cover.json    100.0%  100.0%   0.971 xi-anima-phyxinon-cover-new-so
+anima                      anima-xi-fullarr-phyxinon_mas   100.0%  100.0%   0.967 anima-xi-arr-phyxinon.mid
+asyurasyura                あしゅらしゅら___asyurasyura.json       99.5%  100.0%   0.932 あしゅらしゅら___Asyurasyura.mid
+asyurasyura                あしゅらしゅら.json                     99.5%  100.0%   0.932 あしゅらしゅら___Asyurasyura.mid
+birth_of_devil             birth_of_devil.json                  -       -       - (沒有候選 MIDI)
+birth_of_devil             birth_of_devil.json                  -       -       - (沒有候選 MIDI)
+broken-moon                東方萃夢想 - 砕月.json                      -       -       - (沒有候選 MIDI)
+no45-scherzo-alla-napolit  Scherzo_alla_napolitana.json     37.7%  100.0%   0.097 scherzo-pain-in-rain-xi-vs-ice  ← 不合格，跳過
+no45-scherzo-alla-napolit  Scherzo_alla_napolitana_bpm19    39.3%  100.0%   0.094 scherzo-pain-in-rain-xi-vs-ice  ← 不合格，跳過
+one_voice                  one_voice.json                       -       -       - (沒有候選 MIDI)
+this_game_animenz          this_game_animenz.json          100.0%  100.0%   0.957 this_game_animenz.mid
+this_game_animenz          this_game_animenz.json          100.0%  100.0%   0.957 this_game_animenz.mid
+ulti_force                 ulti_force.json                      -       -       - (沒有候選 MIDI)
+wings_of_piano             wings-of-piano.json                  -       -       - (沒有候選 MIDI)
+エンドマークに希望と涙を添えて            endomakuni-xi-wangto-leiwo-ti   100.0%  100.0%   0.980 endomakuni-xi-wangto-leiwo-tia
+エンドマークに希望と涙を添えて            endomakuni-xi-wangto-leiwo-ti   100.0%  100.0%   0.981 endomakuni-xi-wangto-leiwo-tia
+其のエメラルドを見よ                 其のエメラルドを見よ.json                 100.0%  100.0%   0.881 qinoemerarudowo-jianyo-ting-sh
+氷滅の135小節                   氷滅の135小節 _ 大国奏音_Real_16.json     37.3%  100.0%   0.183 feng-yanno135miao (1).mid  ← 不合格，跳過
+系ぎて                       xigite.json                      99.8%  100.0%   0.923 xigite.mid
+系ぎて                       xigite_ele.json                  55.3%  100.0%   0.247 xigite.mid  ← 不合格，跳過
+系ぎて                       xigite_raw.json                  99.8%  100.0%   0.923 xigite.mid
+
+可還原 44 份、品質不合格跳過 5 份、沒有候選 13 份
+原檔備份在 D:\Nostalgia\Songs_backup\_pitch_restore_backup

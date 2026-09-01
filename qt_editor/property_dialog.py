@@ -85,13 +85,15 @@ class NotePropertyDialog(QDialog):
         add('width', self._edited.max_key - self._edited.min_key + 1)
         add('note_type', self._edited.note_type)
         add('hand', self._edited.hand)
+        add('param1 (slide prev)', self._edited.param1)
+        add('param2 (slide next)', self._edited.param2)
         add('track', self._edited.track)
         add('pitch', self._edited.pitch)
         add('velocity', self._edited.velocity)
         add('channel', self._edited.channel)
         add('off_velocity', self._edited.off_velocity)
 
-        note_type_hint = QLabel('note_type: 0=tap  1=soft  2=long  3=staccato')
+        note_type_hint = QLabel('note_type(bitmask): 0=tap 2=long 4=slide 64=trill  (+8=black skin)')
         note_type_hint.setStyleSheet('color: gray; font-size: 10px;')
         layout.addWidget(note_type_hint)
 
@@ -127,6 +129,11 @@ class NotePropertyDialog(QDialog):
             n.note_type = int(self._fields['note_type'].text())
             n.hand = int(self._fields['hand'].text())
 
+            p1_txt = self._fields['param1 (slide prev)'].text().strip()
+            n.param1 = int(p1_txt) if p1_txt else 0
+            p2_txt = self._fields['param2 (slide next)'].text().strip()
+            n.param2 = int(p2_txt) if p2_txt else 0
+
             track_txt = self._fields['track'].text().strip()
             n.track = int(track_txt) if track_txt else None
 
@@ -158,6 +165,9 @@ class NotePropertyDialog(QDialog):
         note.max_key = edited.max_key
         note.note_type = edited.note_type
         note.hand = edited.hand
+        note.param1 = edited.param1
+        note.param2 = edited.param2
+        note.param3 = edited.param3
         note.track = edited.track
         note.pitch = edited.pitch
         note.velocity = edited.velocity

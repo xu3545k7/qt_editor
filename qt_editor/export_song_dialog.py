@@ -100,7 +100,8 @@ class ExportSongDialog(QDialog):
     def __init__(self, parent=None, *,
                  offset_ms: int = 0,
                  wav_path: str = '',
-                 chart_json_path: str = ''):
+                 chart_json_path: str = '',
+                 default_root: str = ''):
         super().__init__(parent)
         self.setWindowTitle(t('dlg_export_title'))
         self.setMinimumWidth(520)
@@ -110,8 +111,21 @@ class ExportSongDialog(QDialog):
 
         self._existing_register: Optional[dict] = None
         self._selected_song_folder: str = ''   # 追加模式選中的曲目資料夾完整路徑
+        # 匯出根目錄（songs 資料夾）；空 → 用自動偵測的 SONGS_ROOT
+        self._export_root: str = default_root or (SONGS_ROOT if os.path.isdir(SONGS_ROOT) else '')
 
         main_layout = QVBoxLayout(self)
+
+        # ── 匯出根目錄（songs 資料夾）─────────────────────────────
+        root_row = QHBoxLayout()
+        root_row.addWidget(QLabel(t('dlg_export_root')))
+        self._le_root = QLineEdit(self._export_root)
+        self._le_root.setReadOnly(True)
+        root_row.addWidget(self._le_root)
+        self._btn_browse_root = QPushButton(t('dlg_export_browse_folder'))
+        self._btn_browse_root.clicked.connect(self._browse_export_root)
+        root_row.addWidget(self._btn_browse_root)
+        main_layout.addLayout(root_row)
 
         # ── 追加模式選項 ──────────────────────────────────────────
         mode_row = QHBoxLayout()
@@ -192,6 +206,15 @@ class ExportSongDialog(QDialog):
             self._le_cover.clear()
             self._btn_cover.setEnabled(True)
 
+    def _browse_export_root(self):
+        """選擇匯出根目錄（songs 資料夾）。"""
+        start_dir = self._export_root if os.path.isdir(self._export_root) else ''
+        folder = QFileDialog.getExistingDirectory(
+            self, t('dlg_export_root_pick'), start_dir)
+        if folder:
+            self._export_root = os.path.normpath(folder)
+            self._le_root.setText(self._export_root)
+
     def _browse_song_folder(self):
         """讓使用者選擇資料夾，自動判斷是母資料夾或子資料夾。"""
         # 預設開啟 SONGS_ROOT（若存在）
@@ -267,6 +290,11 @@ class ExportSongDialog(QDialog):
             self._le_cover.setText(path)
 
     def _validate_and_accept(self):
+        # 追加模式若已用完整路徑選定曲目，匯出根目錄可忽略；否則必須有效
+        if not (self._chk_append.isChecked() and self._selected_song_folder):
+            if not self._export_root or not os.path.isdir(self._export_root):
+                QMessageBox.warning(self, t('dlg_warn'), t('dlg_export_err_no_root'))
+                return
         if not self._le_display.text().strip():
             QMessageBox.warning(self, t('dlg_warn'), t('dlg_export_err_no_name'))
             return
@@ -296,6 +324,10 @@ class ExportSongDialog(QDialog):
         if raw.endswith(auto_hint):
             raw = raw[:-len(auto_hint)].strip()
         return raw
+
+    def export_root(self) -> str:
+        """回傳匯出根目錄（songs 資料夾）；空字串代表未設定。"""
+        return self._export_root
 
     def is_append_mode(self) -> bool:
         return self._chk_append.isChecked()

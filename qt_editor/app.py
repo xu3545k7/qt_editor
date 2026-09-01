@@ -74,6 +74,13 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     try:
+        from .settings import settings as _st
+        from .theme import apply_theme
+    except ImportError:
+        from qt_editor.settings import settings as _st
+        from qt_editor.theme import apply_theme
+    apply_theme(app, bool(_st.get('dark_mode', False)))
+    try:
         from .i18n import t as _t
     except Exception:
         from qt_editor.i18n import t as _t

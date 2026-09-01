@@ -1,0 +1,40 @@
+曲目                                 譜面                                音符      還原     沒配到
+Break_Through_the_Dome             Break_Through_the_Dome.json     2092    2092       0   完整度 100.0%
+Chronomia                          chronomia--lime.json            1949    1188    1329   完整度 61.0%
+Chronomia                          chronomia--lime.json            2145    1312    1414   完整度 61.2%
+Chronomia                          chronomia--lime_RAW.json        2145    2145       0   完整度 100.0%
+End_Time                           End_Time.json                   1837    1837      12   完整度 100.0%
+Evans                              Evans_ex.json                   1908    1906     105   完整度 99.9%
+Evans                              Evans_ex_clean.json             1680    1678     276   完整度 99.9%
+Evans                              Evans.json                      2124    2122      15   完整度 99.9%
+Flight_of_the_Bamboo_Cutter_Lunat  flight_of_the_bamboo_cutter     5213    5213       0   完整度 100.0%
+Flight_of_the_Bamboo_Cutter_Lunat  flight_of_the_bamboo_cutter     5213    5213       0   完整度 100.0%
+Longinus                           Longinus.json                   3114    3114       0   完整度 100.0%
+Marigold                           marigold_ex.json                2178    2178      75   完整度 100.0%
+Marigold                           marigold.json                   2365    2365       2   完整度 100.0%
+Ocean's_Wish                       ocean's_wish_raw.json            664     491     253   完整度 73.9%
+Oceanus                            --cosmop-phyxinon-oceanus-v     4095    4094       2   完整度 100.0%
+PRAGMATISM -RESURRECTION-          pragmatism--laur-pragmatism     2161    2161       9   完整度 100.0%
+PRAGMATISM -RESURRECTION-          pragmatism--laur-pragmatism     2183    2166      32   完整度 99.2%
+PRAGMATISM -RESURRECTION-          pragmatism--laur-pragmatism     2181    2165      32   完整度 99.3%
+RE_UNION_Duo_Blade_Against         reunion--duo-blade-against-     2389    2389       4   完整度 100.0%
+RE_UNION_Duo_Blade_Against         reunion--duo-blade-against-     2389    2389       4   完整度 100.0%
+Re_miniscence                      Re_miniscence.json              3029    3029      21   完整度 100.0%
+Recollect Lines                    recollect-lines.json            3223    3223       5   完整度 100.0%
+Recollect Lines                    recollect-lines_ele.json        3223    1637    2403   完整度 50.8%
+Rrhar'il                           Rrhar'il.json                   3946    3946       2   完整度 100.0%
+Scorpion_fire                      Scorpion_fire_ex.json           1520    1520       1   完整度 100.0%
+Scorpion_fire                      Scorpion_fire_real.json         1899     723    1599   完整度 38.1%
+Testify                            testify.json                    2413    1284    1705   完整度 53.2%
+Testify                            testify_mv.json                 2816     364    2595   完整度 12.9%
+Testify                            testify_mv_raw.json             2816    2756      61   完整度 97.9%
+this_game_animenz                  this_game_animenz.json          4232    4232       0   完整度 100.0%
+this_game_animenz                  this_game_animenz.json          4232    4232       0   完整度 100.0%
+エンドマークに希望と涙を添えて                    endomakuni-xi-wangto-leiwo-     2514    1320    1824   完整度 52.5%
+エンドマークに希望と涙を添えて                    endomakuni-xi-wangto-leiwo-     2514    2514       0   完整度 100.0%
+其のエメラルドを見よ                         其のエメラルドを見よ.json                 2978    2978       0   完整度 100.0%
+系ぎて                               xigite.json                     1960     785    1577   完整度 40.1%
+系ぎて                               xigite_ele.json                 1960     873    1520   完整度 44.5%
+系ぎて                               xigite_raw.json                 1960    1956     252   完整度 99.8%
+
+沒有音高的譜面 37 份，總共還原 85590 顆、沒配到 17129 顆（成功率 83.3%）

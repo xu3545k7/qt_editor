@@ -10,6 +10,7 @@ dist/
 build/
 build_tmp/
 *.spec
+!NostalgiaChartEditor.spec
 
 # VSCode
 .vscode/
@@ -35,3 +36,26 @@ Thumbs.db
 
 # Node / Others
 node_modules/
+
+# 音源與大型二進位資產（GitHub 單檔上限 100MB，而且這些不是原始碼）
+soundfonts/
+UprightPianoKW-SF2-20220221/
+*.sf2
+*.sfz
+
+# Unity 專案與歌曲資產（另有自己的 repo）
+UnityProject/
+
+# 執行/建置產生的東西
+*.log
+_ab_out/
+build_tmp/
+PianoSamples*/
+*.wav
+*.mp3
+*.ogg
+!qt_editor/Tap.wav
+
+# 測試產生的暫存輸出
+test_midi_conv.xml
+test_tmp.xml

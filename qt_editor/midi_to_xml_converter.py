@@ -15,6 +15,23 @@ import mido
 import xml.dom.minidom
 import xml.etree.ElementTree as ET
 
+from .models import open_midi
+
+
+def _midi_to_official_scale(pitch: int) -> int:
+    """MIDI pitch (A0=21..C8=108) → 官方 scale_piano (A0=1..C8=88)。
+    遊戲與 qt_editor 都以 scale_piano=1 對應 A0(MIDI21)，載入時 +20。
+    轉換器內部的 scale_piano 存的是 MIDI pitch，寫 XML 前要 -20。"""
+    return max(1, min(88, int(pitch) - 20))
+
+try:
+    from .smart_chart import (
+    SmartChartSettings, SmartChartStats, arrange_midi_notes,
+    settings_for_style, STYLE_EATHER,
+)
+except ImportError:  # pragma: no cover - direct script execution
+    from smart_chart import SmartChartSettings, SmartChartStats, arrange_midi_notes
+
 
 @dataclass
 class SubNote:
@@ -38,6 +55,40 @@ class Note:
     hand: int
     key_kind: int
     sub_notes: List[SubNote]
+
+    # smart_chart works with the editor's GNote interface. These aliases keep
+    # the standalone converter on the exact same arrangement path.
+    @property
+    def start(self) -> int:
+        return self.start_timing_msec
+
+    @property
+    def end(self) -> int:
+        return self.end_timing_msec
+
+    @property
+    def pitch(self) -> int:
+        return self.scale_piano
+
+    @property
+    def min_key(self) -> int:
+        return self.min_key_index
+
+    @min_key.setter
+    def min_key(self, value: int) -> None:
+        self.min_key_index = int(value)
+
+    @property
+    def max_key(self) -> int:
+        return self.max_key_index
+
+    @max_key.setter
+    def max_key(self, value: int) -> None:
+        self.max_key_index = int(value)
+
+    @property
+    def track(self) -> int:
+        return self.sub_notes[0].track if self.sub_notes else 0
 
 
 @dataclass
@@ -66,10 +117,15 @@ class MIDIToXMLConverter:
         self.tempo_map_ticks: List[Tuple[int, int]] = []
         self.time_signature_events_ticks: List[Tuple[int, int, int]] = []
         self.song_end_tick: int = 0
+        self.smart_stats: Optional[SmartChartStats] = None
+        # 音高映射範圍：預設用「本 MIDI 實際最低~最高音高」平均分配到 28 鍵，
+        # 而非固定滿量程 21~108（None = 尚未計算，退回滿量程）。
+        self.pitch_lo: Optional[int] = None
+        self.pitch_hi: Optional[int] = None
 
     def convert_midi_to_xml(self, midi_path: str, output_path: str, resolve_overlaps: bool = True) -> None:
         print(f"轉換 {midi_path} -> {output_path}")
-        mid = mido.MidiFile(midi_path)
+        mid = open_midi(midi_path)
 
         self.velocity_zones = []
         self.time_signature_events_ticks = []
@@ -82,11 +138,26 @@ class MIDIToXMLConverter:
         self._analyze_velocity_zones(raw_notes)
 
         simple_notes = self._create_simple_notes(raw_notes)
-        if resolve_overlaps:
+        beat_ms = 60_000.0 / max(1.0, float(self.first_bpm or 120))
+        self.smart_stats = arrange_midi_notes(
+            simple_notes,
+            settings_for_style(
+                getattr(self, 'chart_style', None) or STYLE_EATHER,
+                beat_ms=beat_ms,
+                classify_articulations=True,
+            ),
+        )
+        # The smart arranger already guarantees non-overlap for close-time
+        # groups. Keep the legacy fallback only for physically impossible
+        # groups, since running it unconditionally can move pitch peaks away
+        # from the chart edges.
+        if resolve_overlaps and self.smart_stats.unresolved_overlaps:
             self._resolve_overlaps(simple_notes)
 
         for idx, note in enumerate(simple_notes):
             note.index = idx
+            center = (note.min_key_index + note.max_key_index) // 2
+            note.key_kind = self._determine_key_kind(center)
 
         self.notes = simple_notes
         self._write_xml(output_path)
@@ -105,15 +176,12 @@ class MIDIToXMLConverter:
             (0, self.time_signature_numerator, self.time_signature_denominator)
         ]
 
-        # Check if the MIDI file has exactly two tracks
-        is_two_tracks = len(mid.tracks) == 2
-
         # Output the number of tracks for debugging
         print(f"MIDI 檔案包含 {len(mid.tracks)} 個音軌")
 
         for track_idx, track in enumerate(mid.tracks):
             current_tick = 0
-            active: Dict[int, Tuple[int, int]] = {}
+            active: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
 
             for msg in track:
                 current_tick += msg.time
@@ -142,10 +210,21 @@ class MIDIToXMLConverter:
                         pass
 
                 if msg.type == "note_on" and msg.velocity > 0:
-                    active[msg.note] = (current_tick, int(msg.velocity))
+                    key = (int(msg.channel), int(msg.note))
+                    active.setdefault(key, []).append(
+                        (current_tick, int(msg.velocity))
+                    )
                 elif msg.type in {"note_off", "note_on"}:
-                    if msg.note in active:
-                        start_tick, velocity = active.pop(msg.note)
+                    key = (int(msg.channel), int(msg.note))
+                    stack = active.get(key)
+                    if stack:
+                        # 同音配對用**先進先出**：最早那個還沒配對的
+                        # note_on，配下一個 note_off。舊版是 stack.pop()
+                        # （後進先出），碰到真實鋼琴 MIDI 常見的圓滑奏
+                        # ——下一顆已經響了、前一顆的 note_off 才晚一兩個
+                        # tick 到——就會把 off 配給剛響的那顆，解析成
+                        # 「前一顆 500ms + 新的那顆 1ms」的鬼音。
+                        start_tick, velocity = stack.pop(0)
                         raw_notes_ticks.append(
                             {
                                 "start_tick": start_tick,
@@ -157,6 +236,24 @@ class MIDIToXMLConverter:
                         )
                         if current_tick > self.song_end_tick:
                             self.song_end_tick = current_tick
+                        if not stack:
+                            active.pop(key, None)
+
+            # Preserve hanging notes instead of silently dropping them. A
+            # malformed MIDI without note-off is closed at the track end.
+            for (_channel, pitch), stack in active.items():
+                for start_tick, velocity in stack:
+                    end_tick = max(int(start_tick) + 1, int(current_tick))
+                    raw_notes_ticks.append(
+                        {
+                            "start_tick": int(start_tick),
+                            "end_tick": end_tick,
+                            "scale_piano": int(pitch),
+                            "velocity": int(velocity),
+                            "track": track_idx,
+                        }
+                    )
+                    self.song_end_tick = max(self.song_end_tick, end_tick)
 
         raw_notes_ticks.sort(key=lambda n: n["start_tick"])
         tempo_map = self._build_tempo_map(tempo_events_ticks, self.first_tempo_us)
@@ -167,6 +264,8 @@ class MIDIToXMLConverter:
             for tick, tempo in tempo_map
         ]
 
+        left_tracks, fallback_pitch = self._split_hands(raw_notes_ticks)
+
         raw_notes_ms: List[Dict[str, int]] = []
         for note in raw_notes_ticks:
             start_ms = int(round(self._ticks_to_ms(note["start_tick"], tempo_map)))
@@ -174,8 +273,10 @@ class MIDIToXMLConverter:
             if end_ms <= start_ms:
                 end_ms = start_ms + 1
 
-            # Assign hand based on track index if there are exactly two tracks
-            hand = 0 if is_two_tracks and note["track"] == 0 else 1
+            if left_tracks is not None:
+                hand = 1 if int(note["track"]) in left_tracks else 0
+            else:
+                hand = 1 if int(note["scale_piano"]) < fallback_pitch else 0
 
             raw_notes_ms.append(
                 {
@@ -193,6 +294,40 @@ class MIDIToXMLConverter:
             print(f"音符: start={note['start_timing_msec']}, track={note['track']}, hand={note['hand']}")
 
         return raw_notes_ms
+
+
+    @staticmethod
+    def _split_hands(raw_notes_ticks: List[Dict[str, int]]):
+        """決定哪些音軌算左手。回傳 (左手音軌集合 或 None, 退路用的分界音高)。
+
+        原本的寫法是 `hand = 0 if len(mid.tracks) == 2 and track == 0 else 1`，
+        有兩個問題：
+
+        1. **音軌數不是 2 就整份變成左手。** `len(mid.tracks)` 連沒有音符的軌也算，
+           而 format 1 的鋼琴 MIDI 很常是 [指揮軌, 右手, 左手] 三軌。這個曲庫裡就有
+           5 個檔案中招（RedStormSentiment 3 軌、DF 3 軌、xigite 4 軌、Designant 22 軌）。
+        2. **假設 track 0 是右手。** 這個曲庫的 22 個兩軌 MIDI 剛好全部成立（track 0
+           的平均音高都比較高），但那是慣例不是保證，而且一旦不成立就整份左右相反。
+
+        改成看**平均音高**：只算有音符的音軌，照平均音高排序，低的那一半給左手。
+        這和 `smart_chart._assign_hands` 用的是同一條規則，兩邊才不會各自為政。
+        只有一條有音符的音軌時回 None，改用該軌音高中位數當分界（同樣比照排譜器）。
+        """
+        by_track: Dict[int, List[int]] = {}
+        for note in raw_notes_ticks:
+            by_track.setdefault(int(note["track"]), []).append(int(note["scale_piano"]))
+        by_track = {track: ps for track, ps in by_track.items() if ps}
+
+        if len(by_track) >= 2:
+            means = {track: sum(ps) / len(ps) for track, ps in by_track.items()}
+            ordered = sorted(by_track, key=lambda track: (means[track], track))
+            split = max(1, len(ordered) // 2)
+            return set(ordered[:split]), 0
+
+        pitches = sorted(p for ps in by_track.values() for p in ps)
+        if not pitches:
+            return None, 60
+        return None, pitches[len(pitches) // 2]
 
     def _build_tempo_map(
         self, events_ticks: List[Tuple[int, int]], default_tempo: int
@@ -244,6 +379,11 @@ class MIDIToXMLConverter:
 
     def _create_simple_notes(self, raw_notes: List[Dict[str, int]]) -> List[Note]:
         notes: List[Note] = []
+        # 以本 MIDI 實際的最低/最高音高當映射範圍（整體最低~最高平均分配到 28 鍵）。
+        pitches = [int(d["scale_piano"]) for d in raw_notes if "scale_piano" in d]
+        if pitches:
+            self.pitch_lo = min(pitches)
+            self.pitch_hi = max(pitches)
         for idx, data in enumerate(raw_notes):
             start = data["start_timing_msec"]
             end = data["end_timing_msec"]
@@ -394,7 +534,14 @@ class MIDIToXMLConverter:
             )
 
     def _map_pitch_to_index(self, pitch: int) -> int:
-        normalized = (pitch - self.MIN_MIDI_PITCH) / (self.MAX_MIDI_PITCH - self.MIN_MIDI_PITCH)
+        # 預設用本 MIDI 實際音域（pitch_lo~pitch_hi）平均分配；未計算時退回滿量程 21~108。
+        lo = self.pitch_lo if self.pitch_lo is not None else self.MIN_MIDI_PITCH
+        hi = self.pitch_hi if self.pitch_hi is not None else self.MAX_MIDI_PITCH
+        span = hi - lo
+        if span <= 0:
+            # 全部同一音高（或無資料）→ 置中
+            return self.TARGET_KEYS // 2
+        normalized = (pitch - lo) / span
         normalized = max(0.0, min(1.0, normalized))
         raw_index = round(normalized * (self.TARGET_KEYS - 1))
         return int(max(0, min(self.TARGET_KEYS - 1, raw_index)))
@@ -479,8 +626,8 @@ class MIDIToXMLConverter:
         min_scale = min((note.scale_piano for note in self.notes), default=self.MIN_MIDI_PITCH)
         total_finish = max((note.end_timing_msec for note in self.notes), default=0)
 
-        self._add_xml_element(header, "max_scale", max_scale, "s32")
-        self._add_xml_element(header, "min_scale", min_scale, "s32")
+        self._add_xml_element(header, "max_scale", _midi_to_official_scale(max_scale), "s32")
+        self._add_xml_element(header, "min_scale", _midi_to_official_scale(min_scale), "s32")
         self._add_xml_element(header, "file_version", 1, "s16")
         self._add_xml_element(header, "first_bpm", self.first_bpm or 0, "s64")
         self._add_xml_element(header, "music_finish_time_msec", total_finish, "s32")
@@ -500,15 +647,15 @@ class MIDIToXMLConverter:
             self._add_xml_element(note_elem, "start_timing_msec", note.start_timing_msec, "s32")
             self._add_xml_element(note_elem, "end_timing_msec", note.end_timing_msec, "s32")
             self._add_xml_element(note_elem, "gate_time_msec", note.gate_time_msec, "s32")
-            self._add_xml_element(note_elem, "scale_piano", note.scale_piano, "u8")
+            self._add_xml_element(note_elem, "scale_piano", _midi_to_official_scale(note.scale_piano), "u8")
             self._add_xml_element(note_elem, "min_key_index", note.min_key_index, "s32")
             self._add_xml_element(note_elem, "max_key_index", note.max_key_index, "s32")
             self._add_xml_element(note_elem, "note_type", note.note_type, "s32")
             self._add_xml_element(note_elem, "hand", note.hand, "s32")
             self._add_xml_element(note_elem, "key_kind", note.key_kind, "s32")
-            self._add_xml_element(note_elem, "param1", 0, "s32")
-            self._add_xml_element(note_elem, "param2", 0, "s32")
-            self._add_xml_element(note_elem, "param3", 0, "s32")
+            self._add_xml_element(note_elem, "param1", getattr(note, "param1", 0), "s32")
+            self._add_xml_element(note_elem, "param2", getattr(note, "param2", 0), "s32")
+            self._add_xml_element(note_elem, "param3", getattr(note, "param3", 0), "s32")
 
             measure_index = self._estimate_measure_index(note.start_timing_msec)
             self._add_xml_element(note_elem, "measure_index", measure_index, "s32")
@@ -518,7 +665,7 @@ class MIDIToXMLConverter:
                 sub_elem = ET.SubElement(sub_data, "sub_note")
                 self._add_xml_element(sub_elem, "start_timing_msec", sub_note.start_timing_msec, "s32")
                 self._add_xml_element(sub_elem, "end_timing_msec", sub_note.end_timing_msec, "s32")
-                self._add_xml_element(sub_elem, "scale_piano", sub_note.scale_piano, "u8")
+                self._add_xml_element(sub_elem, "scale_piano", _midi_to_official_scale(sub_note.scale_piano), "u8")
                 self._add_xml_element(sub_elem, "velocity", sub_note.velocity, "u8")
                 self._add_xml_element(sub_elem, "track_index", sub_note.track, "s32")
 

@@ -21,7 +21,8 @@ class PlaybackOffsetDialog(QDialog):
     """讓使用者以 ms 或拍數設定播放提前/延後偏移。"""
 
     def __init__(self, parent=None, bpm: float = 120.0,
-                 current_ms: int = 0, is_advance: bool = True):
+                 current_ms: int = 0, is_advance: bool = True,
+                 latency_ms: float = 0.0):
         super().__init__(parent)
         self.setWindowTitle(t('dlg_pb_offset_title'))
         self.setMinimumWidth(340)
@@ -67,6 +68,24 @@ class PlaybackOffsetDialog(QDialog):
         beat_row.addWidget(self._spin_beat)
         layout.addLayout(beat_row)
 
+        # ── 判定線延遲補償 ────────────────────────────────────────
+        # 上面的偏移是「音訊相對譜面」；這一項是「判定線相對音訊」——把 buffer
+        # 交給音效裝置到真的發出聲音之間的延遲扣掉，判定線才會在聽到聲音的
+        # 那一刻剛好碰到音符。裝置/驅動不同，值也不同，所以讓使用者自己校。
+        lat_row = QHBoxLayout()
+        lat_row.addWidget(QLabel('判定線延遲補償'))
+        self._spin_latency = QSpinBox()
+        self._spin_latency.setRange(0, 1000)
+        self._spin_latency.setSuffix(' ms')
+        self._spin_latency.setValue(int(round(latency_ms)))
+        self._spin_latency.setToolTip(
+            '判定線比聲音早到就調大，比聲音晚到就調小。\n'
+            '只影響判定線與打擊聲的顯示/觸發時機，不會改動譜面資料。'
+        )
+        lat_row.addWidget(self._spin_latency)
+        lat_row.addStretch()
+        layout.addLayout(lat_row)
+
         # ── 確認 ──────────────────────────────────────────────────
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bbox.accepted.connect(self.accept)
@@ -110,3 +129,6 @@ class PlaybackOffsetDialog(QDialog):
 
     def is_advance(self) -> bool:
         return self._is_advance
+
+    def latency_ms(self) -> int:
+        return int(self._spin_latency.value())

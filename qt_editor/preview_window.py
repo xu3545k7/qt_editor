@@ -19,14 +19,34 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from PyQt5.QtCore import Qt, QRect, QSize
-from PyQt5.QtGui import QColor, QPainter, QPixmap, QPen, QFont
+from PyQt5.QtCore import Qt, QRect, QRectF, QSize, QPointF
+from PyQt5.QtGui import QColor, QPainter, QPixmap, QPen, QFont, QBrush, QPolygonF, QLinearGradient
 from PyQt5.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from .models import GNote, TOTAL_GAME_KEYS
+from .models import (
+    GNote, TOTAL_GAME_KEYS,
+    build_slide_index_map, slide_next_note,
+    note_is_slide, note_is_long, note_is_trill, note_has_duration,
+    trill_sub_cells, trill_fallback_cells,
+)
+
+# slide 梯形在預覽的「固定視覺厚度」（px，不隨 MIDI 時長）
+SLIDE_PREVIEW_THK = 14.0
+
+# slide（滑）梯形帶顏色：依 hand 區分左右手
+SLIDE_FILL_RIGHT = QColor(255, 110, 110, 150)
+SLIDE_FILL_LEFT  = QColor(110, 200, 255, 150)
+SLIDE_EDGE_RIGHT = QColor(255, 150, 150)
+SLIDE_EDGE_LEFT  = QColor(150, 220, 255)
+
+# trill（顫音）：中間淡色無邊方形 mesh + 開頭實心 tap / 尾端空心 tap
+TRILL_PALE_RIGHT = QColor(255, 140, 140, 110)
+TRILL_PALE_LEFT  = QColor(150, 185, 255, 110)
+TRILL_TAP_RIGHT  = QColor(230,  70,  70)
+TRILL_TAP_LEFT   = QColor( 70, 120, 230)
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
 GRAPHIC_DIR = os.path.join(os.path.dirname(__file__), 'graphic')
@@ -79,7 +99,7 @@ class PreviewCanvas(QWidget):
         if not self.notes:
             return 10_000
         return max(
-            n.end if n.note_type == 2 else n.start
+            n.end if note_has_duration(n.note_type) else n.start
             for n in self.notes
         )
 
@@ -104,6 +124,14 @@ class PreviewCanvas(QWidget):
         x      = n.min_key * cell_w + (full_w - draw_w) * 0.5
         return int(x), int(draw_w)
 
+    def _note_x_range(self, n: GNote) -> tuple[float, float]:
+        """梯形帶左右緣 px：與 note 一致取 90% 寬並置中，不占滿格寬。"""
+        cell_w = CANVAS_W / TOTAL_GAME_KEYS
+        x1 = n.min_key * cell_w
+        x2 = (n.max_key + 1) * cell_w
+        margin = (x2 - x1) * 0.05
+        return x1 + margin, x2 - margin
+
     # ------------------------------------------------------------------
     # paintEvent
     # ------------------------------------------------------------------
@@ -119,14 +147,53 @@ class PreviewCanvas(QWidget):
         # 格線
         self._draw_grid(qp)
 
-        # 第一遍：hold 主體（較低圖層）
+        # 第一遍：hold 主體 / trill 顫音條（較低圖層）
         for n in self.notes:
-            if n.note_type == 2:
+            if note_is_trill(n.note_type):
+                self._draw_trill_body(qp, n)
+            elif note_is_long(n.note_type):
                 self._draw_hold_body(qp, n)
+
+        # 第一.5遍：slide 梯形帶（連接鏈上最近的兩顆）
+        self._draw_slide_bands(qp)
 
         # 第二遍：所有 note head（較高圖層）
         for n in self.notes:
             self._draw_note_head(qp, n)
+
+    # ------------------------------------------------------------------
+    # Slide 梯形帶
+    # ------------------------------------------------------------------
+
+    def _draw_slide_bands(self, qp: QPainter) -> None:
+        """每顆 slide 畫成一個梯形：跨自身 start→end 厚度，
+        由自己的鍵道滑向下一顆（param2）的鍵道；只連明確鏈結。"""
+        index_map = build_slide_index_map(self.notes)
+        if not index_map:
+            return
+        for n in self.notes:
+            if not note_is_slide(n.note_type):
+                continue
+            nxt = slide_next_note(n, self.notes, index_map)
+            if nxt is None:
+                continue
+
+            # 預覽固定視覺厚度：尾巴 = 頭往後 SLIDE_PREVIEW_THK（不隨 MIDI 時長）
+            xa1, xa2 = self._note_x_range(n)
+            xb1, xb2 = self._note_x_range(nxt)
+            y_near = self.ms_y(n.start) + SLIDE_PREVIEW_THK
+            y_far  = self.ms_y(nxt.start)    # 下一顆頭
+            poly = QPolygonF([
+                QPointF(xa1, y_near), QPointF(xa2, y_near),
+                QPointF(xb2, y_far), QPointF(xb1, y_far),
+            ])
+            if n.hand == 1:
+                fill, edge = SLIDE_FILL_LEFT, SLIDE_EDGE_LEFT
+            else:
+                fill, edge = SLIDE_FILL_RIGHT, SLIDE_EDGE_RIGHT
+            qp.setBrush(QBrush(fill))
+            qp.setPen(QPen(edge, 1.5))
+            qp.drawPolygon(poly)
 
     # ------------------------------------------------------------------
     # 格線
@@ -178,6 +245,66 @@ class PreviewCanvas(QWidget):
         qp.drawPixmap(QRect(x, y_start, draw_w, h_body), img)
 
     # ------------------------------------------------------------------
+    # Trill 顫音條
+    # ------------------------------------------------------------------
+
+    def _draw_trill_body(self, qp: QPainter, n: GNote) -> None:
+        """顫音：中央直向方形 mesh（類似 hold）+ 左右六邊形節點 + 頭尾 tap 圖。"""
+        cell_w = CANVAS_W / TOTAL_GAME_KEYS
+        x1z = float(n.min_key * cell_w)
+        x2z = float((n.max_key + 1) * cell_w)
+        zone_w = x2z - x1z
+        if zone_w <= 0:
+            return
+        cells = trill_sub_cells(n) or trill_fallback_cells(int(n.start), int(n.end))
+        cells = sorted(cells, key=lambda c: c[2])
+        if not cells:
+            return
+
+        cx = (x1z + x2z) / 2.0
+        tapc = TRILL_TAP_LEFT if n.hand == 1 else TRILL_TAP_RIGHT
+        y_start = float(self.ms_y(n.start))
+        y_end   = float(self.ms_y(n.end))
+        ytop, ybot = (min(y_start, y_end), max(y_start, y_end))
+
+        # 預覽固定「向外滿」：依序左右交替、整個區寬滿版，不看內部音符排布
+        hx1, hx2 = x1z, x2z
+        inset = min(zone_w * 0.15, 16.0)
+        qp.setPen(Qt.NoPen)
+        for i, (relx, relw, st, en, pit, _idx) in enumerate(cells):
+            outer_x = x1z if (i % 2 == 0) else x2z
+            yt = float(self.ms_y(st))
+            yn = float(self.ms_y(cells[i + 1][2] if i + 1 < len(cells) else en))
+            a, b = (min(yt, yn), max(yt, yn))
+            pad = max(2.0, (b - a) * 0.15)
+            a -= pad
+            b += pad
+            ymid = (a + b) / 2.0
+            grad = QLinearGradient(outer_x, 0.0, cx, 0.0)
+            c0 = QColor(tapc); c0.setAlpha(235)
+            c1 = QColor(tapc); c1.setAlpha(110)
+            c2 = QColor(tapc); c2.setAlpha(14)
+            grad.setColorAt(0.0, c0)
+            grad.setColorAt(0.40, c0)
+            grad.setColorAt(0.78, c1)
+            grad.setColorAt(1.0, c2)
+            qp.setBrush(QBrush(grad))
+            qp.drawPolygon(QPolygonF([
+                QPointF(hx1, ymid), QPointF(hx1 + inset, a), QPointF(hx2 - inset, a),
+                QPointF(hx2, ymid), QPointF(hx2 - inset, b), QPointF(hx1 + inset, b),
+            ]))
+
+        # 頭尾 tap 素材（開頭實心、尾端空心=淡化）
+        img = _pix('left_note.png' if n.hand == 1 else 'right_note.png')
+        if not img.isNull() and img.width() > 0:
+            th = 16.0
+            qp.setOpacity(1.0)
+            qp.drawPixmap(QRect(int(x1z), int(y_start - th / 2.0), int(zone_w), int(th)), img)
+            qp.setOpacity(0.35)
+            qp.drawPixmap(QRect(int(x1z), int(y_end - th / 2.0), int(zone_w), int(th)), img)
+            qp.setOpacity(1.0)
+
+    # ------------------------------------------------------------------
     # Note Head（tap / soft / stac，以及 hold 的 tap head）
     # ------------------------------------------------------------------
 
@@ -185,6 +312,9 @@ class PreviewCanvas(QWidget):
         """依音符類型選圖，以 0.9 寬、原始比例繪製於 starttime 位置。"""
         nt   = n.note_type
         hand = n.hand
+
+        if note_is_trill(nt):
+            return  # trill 的頭尾 tap 由 _draw_trill_body 負責
 
         # 選圖 ──────────────────────────────────────────────────────────
         if nt == 1:                              # soft

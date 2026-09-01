@@ -1,4 +1,27 @@
 {
   "language": "zh_tw",
-  "scroll_invert": false
+  "chart_style": "eather",
+  "scroll_invert": false,
+  "export_auto_process_audio": true,
+  "export_trim_end_ms": 0,
+  "export_songs_root": "",
+  "show_midi_pitch": false,
+  "audio_latency_ms": 0,
+  "pitch_velocity_shading": true,
+  "pitch_velocity_numbers": true,
+  "pitch_dynamics_lane": true,
+  "pitch_pedal_lane": true,
+  "pitch_scale_highlight": true,
+  "pitch_scale_lock": false,
+  "ghost_other_hand": true,
+  "undo_memory_mb": 64,
+  "shortcut_cycle_view": "1",
+  "shortcut_note_input": "2",
+  "shortcut_play_pause": "Space",
+  "shortcut_play_full": "",
+  "shortcut_play_window": "",
+  "shortcut_stop": "",
+  "show_statusbar": false,
+  "keyboard_height_px": 168,
+  "dark_mode": false
 }
