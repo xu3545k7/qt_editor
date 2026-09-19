@@ -63,9 +63,54 @@ def _icon_path() -> str:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.png')
 
 
+def pop_lang_arg(argv: list) -> str:
+    """從指令列拿掉 `--lang xx`（或 `--lang=xx`）並回傳 xx；沒有或不認得就回傳空字串。"""
+    lang = ''
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--lang' and i + 1 < len(argv):
+            lang = argv[i + 1]
+            del argv[i:i + 2]
+        elif arg.startswith('--lang='):
+            lang = arg.split('=', 1)[1]
+            del argv[i]
+        else:
+            i += 1
+    return lang if lang in ('zh_tw', 'zh_cn', 'en') else ''
+
+
+def pop_library_arg(argv: list) -> str:
+    """從指令列拿掉 `--library 路徑`（或 `--library=路徑`）並回傳路徑；沒有就空字串。"""
+    root = ''
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--library' and i + 1 < len(argv):
+            root = argv[i + 1]
+            del argv[i:i + 2]
+        elif arg.startswith('--library='):
+            root = arg.split('=', 1)[1]
+            del argv[i]
+        else:
+            i += 1
+    return root
+
+
+def remember_library(root: str) -> None:
+    """啟動器告訴製譜器曲庫在哪（曲庫和製譜器分開放時，製譜器自己找不到）。"""
+    if root and os.path.isdir(root) and settings.get('song_library_root', '') != root:
+        settings.set('song_library_root', root)
+
+
 def main() -> None:
     # 載入設定（語言、捲動方向等）
     settings.load()
+    remember_library(pop_library_arg(sys.argv))
+    # NosMania 啟動器開製譜器時帶 --lang：沿用啟動器選的語言，並記進設定
+    lang = pop_lang_arg(sys.argv)
+    if lang and settings.get('language', 'zh_tw') != lang:
+        settings.set('language', lang)
     set_lang(settings.get('language', 'zh_tw'))
 
     # 高 DPI 支援
@@ -91,13 +136,23 @@ def main() -> None:
     app.setWindowIcon(icon)
 
     window = MainWindow()
-    window.show()
 
-    # 若指令列帶有檔案路徑，自動開啟
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
-        if os.path.isfile(path):
-            window._load_path(path)
+    # NosMania 啟動器叫開譜時，已經開著的製譜器直接接手
+    try:
+        from qt_editor.editor_ipc import EditorServer
+    except ImportError:
+        from .editor_ipc import EditorServer
+    window._ipc_server = EditorServer(window)
+
+    # 若指令列帶有檔案路徑，自動開啟（有較新的自動備份時 _load_path 會自己問）
+    path = sys.argv[1] if len(sys.argv) > 1 else ''
+    if path and os.path.isfile(path):
+        window._recovery_offered = True
+        window.show()
+        window._load_path(path)
+    else:
+        # 上次沒正常關閉留下的備份：視窗出來之後再問，不要擋在啟動前面
+        window.enter_editor()
 
     sys.exit(app.exec_())
 

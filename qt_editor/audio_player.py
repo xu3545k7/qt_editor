@@ -323,7 +323,7 @@ class AudioPlayer(QObject):
             offset_ms = max(0.0, cur - self._pcm_raw_origin_ms)
             start_byte = int(offset_ms / 1000.0 * self._pcm_rate) * bps
             start_byte = max(0, min(len(data), start_byte))
-            tail = data[start_byte:]
+            tail = memoryview(data)[start_byte:]    # 不複製整段尾巴
             self._pcm_volume = float(self._volume)
             if not tail or not self._start_pcm_backend(tail):
                 self._fail_stop()
@@ -374,6 +374,7 @@ class AudioPlayer(QObject):
                 except Exception:               # noqa: BLE001
                     pass
         import array as _arr
+        pcm = bytes(pcm)                        # 見上：array 不能直接吃 memoryview
         if sampwidth == 2:
             a = _arr.array('h', pcm)
             for i in range(len(a)):
@@ -544,7 +545,7 @@ class AudioPlayer(QObject):
         frame_sz = max(1, self._pcm_channels * self._pcm_sampwidth)
         offset = int((resume_ms - self._pcm_origin_ms) * self._pcm_rate / 1000.0) * frame_sz
         offset = max(0, min(len(buf), offset - offset % frame_sz))
-        tail = buf[offset:]
+        tail = memoryview(buf)[offset:]         # 不複製整段尾巴
         if not tail:
             self.stop()
             return
@@ -601,6 +602,10 @@ class AudioPlayer(QObject):
     def is_paused(self) -> bool:
         return self._paused
 
+    def is_pcm_playback(self) -> bool:
+        """目前是不是「只播 MIDI 合成的鋼琴音」那種播放（沒有歌曲音訊）。"""
+        return self._pcm_buf is not None
+
     # ------------------------------------------------------------------
     # 內部 - 計時 tick
     # ------------------------------------------------------------------
@@ -633,15 +638,22 @@ class AudioPlayer(QObject):
         primary_scaled = False
         preview = self._slice_preview(start_ms, end_ms)
         if preview is not None:
+            # 起播時整首歌的 PCM 會同時存在好幾份（歌曲、鋼琴、各自套音量、
+            # 混音結果）。實測 30MB 的歌疊鋼琴音，按一次播放尖峰多吃 152MB
+            # ——記憶體不夠的機器就是在這一刻被推過上限，然後 Qt 在下一次
+            # 重繪配置失敗、以「存取違規」崩潰。所以每一份用完立刻放掉。
             if len(preview) < len(primary):
-                preview += b'\x00' * (len(primary) - len(preview))
+                preview.extend(bytes(len(primary) - len(preview)))
             elif len(preview) > len(primary):
-                preview = preview[:len(primary)]
+                del preview[len(primary):]
             song = self._apply_volume(primary, self._volume, self.audio_sampwidth)
+            primary = None
             piano = self._apply_volume(
                 preview, self._preview_volume, self._preview_sampwidth
             )
+            preview = None
             primary = self._mix_pcm_add(song, piano, self.audio_sampwidth)
+            song = piano = None
             primary_scaled = True
 
         segments = [primary]
@@ -769,9 +781,14 @@ class AudioPlayer(QObject):
         sb = int(s_ms / 1000.0 * self.audio_rate) * bps
         eb = int(audio_end_ms / 1000.0 * self.audio_rate) * bps
         eb = min(len(self.audio_bytes), eb)
-        body = self.audio_bytes[sb:eb] if eb > sb else b''
-        out = lead + body
-        return out or None
+        if eb <= sb:
+            return lead or None
+        if not lead:
+            # 直接給一段 memoryview，不複製。以前這裡把整首歌切出一份新的
+            # bytes，按一次播放就先多吃一整首的記憶體；audioop 與 simpleaudio
+            # 都吃 buffer protocol，不需要真的 bytes。
+            return memoryview(self.audio_bytes)[sb:eb]
+        return lead + self.audio_bytes[sb:eb]
 
     def _slice2(self, start_ms: float, end_ms: float) -> Optional[bytes]:
         """Slice secondary audio buffer using its own audio params."""
@@ -788,9 +805,14 @@ class AudioPlayer(QObject):
         sb = int(s_ms / 1000.0 * self.audio2_rate) * bps
         eb = int(audio_end_ms / 1000.0 * self.audio2_rate) * bps
         eb = min(len(self.audio2_bytes), eb)
-        body = self.audio2_bytes[sb:eb] if eb > sb else b''
-        out = lead + body
-        return out or None
+        if eb <= sb:
+            return lead or None
+        if not lead:
+            # 直接給一段 memoryview，不複製。以前這裡把整首歌切出一份新的
+            # bytes，按一次播放就先多吃一整首的記憶體；audioop 與 simpleaudio
+            # 都吃 buffer protocol，不需要真的 bytes。
+            return memoryview(self.audio2_bytes)[sb:eb]
+        return lead + self.audio2_bytes[sb:eb]
 
     def _slice_preview(self, start_ms: float, end_ms: float) -> Optional[bytes]:
         if (
@@ -830,9 +852,10 @@ class AudioPlayer(QObject):
             destination_byte = destination_frame * bytes_per_frame
             byte_count = copy_frames * bytes_per_frame
             out[destination_byte:destination_byte + byte_count] = (
-                self._preview_pcm[source_byte:source_byte + byte_count]
+                memoryview(self._preview_pcm)[source_byte:source_byte + byte_count]
             )
-        return bytes(out)
+        # 回傳 bytearray 本身：呼叫端要就地補零或截斷，轉成 bytes 只是多一份。
+        return out
 
     @staticmethod
     def _stereo16_to_mono16(pcm: bytes) -> bytes:
@@ -871,8 +894,8 @@ class AudioPlayer(QObject):
                     return add(mul(pcm1[:n], 2, 0.5), mul(pcm2[:n], 2, 0.5), 2)
                 except Exception:               # noqa: BLE001
                     pass
-            a1 = _arr.array('h', pcm1)
-            a2 = _arr.array('h', pcm2)
+            a1 = _arr.array('h', bytes(pcm1))
+            a2 = _arr.array('h', bytes(pcm2))
             # length align
             n = min(len(a1), len(a2))
             res = _arr.array('h', [0]) * n
@@ -885,8 +908,8 @@ class AudioPlayer(QObject):
                 res[i] = v
             return bytes(res)
         if sampwidth == 1:
-            a1 = _arr.array('B', pcm1)
-            a2 = _arr.array('B', pcm2)
+            a1 = _arr.array('B', bytes(pcm1))
+            a2 = _arr.array('B', bytes(pcm2))
             n = min(len(a1), len(a2))
             res = _arr.array('B', [0]) * n
             for i in range(n):

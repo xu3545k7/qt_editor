@@ -64,7 +64,7 @@ from statistics import median
 
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, pyqtSignal
 from PyQt5.QtGui import (
-    QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QIcon,
+    QColor, QFont, QImage, QPainter, QPainterPath, QPen, QBrush, QIcon,
     QKeyEvent, QLinearGradient,
     QMouseEvent, QPaintEvent, QPixmap, QPolygonF, QResizeEvent, QWheelEvent,
 )
@@ -76,7 +76,7 @@ from .models import (
     note_is_long, note_is_slide, note_is_trill,
     hold_fix_candidate, classify_hold_length,
     trill_sub_cells, trill_fallback_cells,
-    make_trill_from_notes, explode_trill,
+    make_trill_from_notes, explode_trill, chain_slide_notes,
     move_trill_cell, shift_trill_cells, refit_trill_cells,
 )
 from .time_mapper import TimeMapper
@@ -91,6 +91,33 @@ GRID_MINOR       = QColor(50, 50, 58)
 GRID_MAJOR       = QColor(90, 90, 100)
 BARLINE_COLOR    = QColor(220, 200, 60)
 BEATLINE_COLOR   = QColor(70, 70, 85)
+# 放置格線：比拍線再淡一階，它只是「音符會落在哪」的參考
+PLACE_GRID_COLOR = QColor(58, 58, 72)
+
+
+def grid_division_color(n: float) -> QColor:
+    """格線的顏色：一個全音符分成 n 份的那一層。
+
+    粗的亮、細的暗；三連音系（3 的倍數）用紫色，一眼分得出 12 分和 16 分。
+    """
+    rounded = int(round(n))
+    exact = abs(n - rounded) < 1e-6
+    if exact and rounded in (1, 2, 4):
+        return QColor(165, 165, 190)
+    if exact and rounded % 3 == 0:
+        return QColor(140, 100, 185) if rounded <= 12 else QColor(100, 78, 135)
+    if exact and rounded == 8:
+        return QColor(90, 128, 190)
+    if exact and rounded == 16:
+        return QColor(78, 112, 96)      # 不用金色：會跟小節線撞色
+    if exact and rounded in (32, 64):
+        return QColor(72, 72, 88)
+    return QColor(60, 140, 140)
+# 音高模式「黑白鍵分色」的欄位底色。白鍵提亮、黑鍵壓暗，兩邊各站在
+# BG_COLOR(28,28,32) 的一側，整體亮度不變但看得出交替。
+# 第一版只把黑鍵設成 (26,26,32)——和背景差 2 級，等於沒畫。
+PITCH_WHITE_COLUMN = QColor(40, 40, 47)
+PITCH_BLACK_COLUMN = QColor(19, 19, 23)
 
 # 一般模式的分區金線：28 格分成 4 區（1~7 / 8~14 / 15~21 / 22~28），
 # 邊界畫在格線層（音符之下），所以只是背景參考線、不會蓋住音符。
@@ -145,6 +172,70 @@ MIDI_CHANNEL_COLORS = [
     QColor(77, 182, 172),
     QColor(79, 195, 247),
 ]
+
+
+# 原版 note 幀左右尖端外面那圈柔邊要多淡才算「看不見」。w_r_03 最左邊 7 px
+# 的最高 alpha 只有 43，在深色底上肉眼等於沒有東西；到 x=7 才跳到 157。
+ART_SOLID_ALPHA = 128
+_ART_SPAN_CACHE: Dict[int, Tuple[float, float]] = {}
+
+
+def _art_solid_span(img: QPixmap) -> Tuple[float, float]:
+    """圖裡「真的看得見」的那一段佔全圖寬度的比例，回傳 (左, 右)，值域 0~1。
+
+    原版 note 幀是尖頭六邊形，兩端各留了一圈幾乎全透明的柔邊當抗鋸齒。把整張
+    圖貼滿鍵道的話，實心的尖端會停在離鍵道邊界約 5% 的地方，兩顆相鄰的音符
+    中間就永遠合不起來——設成 100% 寬也還是差一點。所以量出實心範圍，繪製時
+    把圖往外撐到讓**實心尖端**落在鍵道邊界上，溢出去的只有那圈看不見的柔邊。
+
+    整張圖掃 alpha 是 O(w×h)，密集譜上每幀做會很痛，但我們只要左右兩個邊界，
+    從兩側往內找到第一根「有實心像素」的直行就可以停，通常十幾行就結束。
+    結果依 `cacheKey()` 快取（同一張 QPixmap 換算一次就好）。
+    """
+    if img.isNull() or img.width() <= 0 or img.height() <= 0:
+        return 0.0, 1.0
+    ck = img.cacheKey()
+    span = _ART_SPAN_CACHE.get(ck)
+    if span is not None:
+        return span
+    qi = img.toImage().convertToFormat(QImage.Format_ARGB32)
+    w, h = qi.width(), qi.height()
+    bpl = qi.bytesPerLine()
+    ptr = qi.constBits()
+    ptr.setsize(bpl * h)
+    buf = bytes(ptr)
+
+    def solid(x: int) -> bool:
+        # ARGB32 在小端機器上的位元組序是 B,G,R,A → alpha 在每個像素的第 4 個
+        base = 4 * x + 3
+        return any(buf[y * bpl + base] >= ART_SOLID_ALPHA for y in range(h))
+
+    lo = 0
+    while lo < w and not solid(lo):
+        lo += 1
+    if lo >= w:                       # 整張都是柔邊/全透明 → 當成滿版
+        span = (0.0, 1.0)
+    else:
+        hi = w - 1
+        while hi > lo and not solid(hi):
+            hi -= 1
+        span = (lo / w, (hi + 1) / w)
+    _ART_SPAN_CACHE[ck] = span
+    return span
+
+
+def _art_fill_rect(rect: QRectF, img: QPixmap) -> QRectF:
+    """把 `rect` 換成「貼上去之後圖的實心部分剛好填滿 rect」的繪製矩形。
+
+    只撐水平方向：使用者要的是左右尖端互相碰到，上下是固定的音符高度，一起
+    撐的話反而會把長押頭撐出格子。
+    """
+    lo, hi = _art_solid_span(img)
+    solid = hi - lo
+    if solid <= 0.0 or solid >= 0.999:
+        return rect
+    width = rect.width() / solid
+    return QRectF(rect.left() - lo * width, rect.top(), width, rect.height())
 
 
 def _note_gradient(base: QColor, rect) -> QLinearGradient:
@@ -581,6 +672,9 @@ class ChartView(QWidget):
 
         # ── 放置音符模式 ───────────────────────────────────────
         self._note_input_mode:     bool            = False
+        # 分割檢視時：另一格正在放置嗎。放置模式是單格的（工具列固定操作
+        # 某一格），但格線是給眼睛看的參考，另一格顯示同一段音樂時也該有。
+        self._peer_placing:        bool            = False
         # 音階輔助模式：像放置模式一樣是個常駐模式，按住往上拖決定音數
         self._pattern_mode:        bool            = False
         self._pattern_kind:        str             = 'scale'
@@ -601,6 +695,10 @@ class ChartView(QWidget):
         self._dyn_scale_cache:     dict            = {}     # hand -> (lo, hi)
         self._vel_shade_on:        bool            = True   # 每幀開頭讀一次
         self._lane_flag_cache:     Optional[tuple] = None   # 同上
+        self._note_width_frac:     Optional[float] = None   # 同上
+        self._place_grid_cache:    Optional[str]   = None   # 同上
+        self._pitch_column_cache:  Optional[str]   = None   # 同上
+        self._hold_width_frac:     Optional[float] = None   # 同上
         # 二分搜尋用的 start 陣列與最長時值，都綁 model.notes 這個 list 的身分
         self._note_start_cache:    Optional[tuple] = None
         self._max_span_cache:      Optional[tuple] = None
@@ -928,6 +1026,19 @@ class ChartView(QWidget):
         h = max(1, self.height())
         return min(0.9, max(0.02, (h - self._judge_py()) / float(h)))
 
+    def judge_line_view_ms(self) -> float:
+        """目前畫面上，判定線（＝鍵盤上緣）對到的是哪一刻。
+
+        `follow_to_ms` 的反函式：那邊是「把某一刻捲到判定線」，這裡是「判定線
+        現在停在哪一刻」。暫停後使用者捲去看別的地方，繼續播放時要從這裡開始。
+        """
+        frac = self._judge_fraction()
+        if self.time_uniform:
+            span_ms = max(1.0, float(self._time_uniform_span_ms or 1.0))
+            return self.mapper.unit_to_ms(self.window_start_unit) + span_ms * frac
+        return self.mapper.unit_to_ms(
+            self.window_start_unit + self.window_size_unit * frac)
+
     def follow_to_ms(self, ms: float) -> None:
         """把 `ms` 那一刻捲到判定線（＝鍵盤上緣）。"""
         frac = self._judge_fraction()
@@ -1068,7 +1179,7 @@ class ChartView(QWidget):
             self.update()
             self.note_edited.emit()
         elif push and self.model.undo_stack:
-            self.model.undo_stack.pop()
+            self.model.discard_last_history()
             self.model.dirty = was_dirty
         return moved
 
@@ -1133,7 +1244,7 @@ class ChartView(QWidget):
             self.note_edited.emit()
         elif push and self.model.undo_stack:
             # 沒有任何變更 → 撤掉剛剛壓入的歷史紀錄並還原 dirty
-            self.model.undo_stack.pop()
+            self.model.discard_last_history()
             self.model.dirty = was_dirty
         return changed
 
@@ -1233,12 +1344,16 @@ class ChartView(QWidget):
             self.update()
             self.note_edited.emit()
         elif self.model.undo_stack:
-            self.model.undo_stack.pop()
+            self.model.discard_last_history()
             self.model.dirty = was_dirty
         return stats
 
     def set_type_selected(self, t: int) -> None:
         if not self.selected or self.alloc_active:
+            return
+        if not self.type_allowed(t):
+            self._drag_status = 'XML（PAN）格式沒有這個音符類型——要用請另存成 JSON'
+            self._emit_status()
             return
         self.model.push_history()
         for n in self.model.notes_tree:
@@ -1247,6 +1362,33 @@ class ChartView(QWidget):
         self.model.rebuild_display_cache()
         self.update()
         self.note_edited.emit()
+
+    def toggle_tap_hold_selected(self) -> Optional[int]:
+        """快捷鍵用：選取的全是長條就改成點擊，否則全部改成長條。回傳改成的類型。"""
+        if not self.selected or self.alloc_active:
+            return None
+        picked = [n for n in self.model.notes_tree if n.idx in self.selected]
+        if not picked:
+            return None
+        target = 0 if all(int(n.note_type) == 2 for n in picked) else 2
+        self.set_type_selected(target)
+        return target
+
+    #: 鍵寬切換的兩檔
+    TOGGLE_WIDTHS = (2, 3)
+
+    def toggle_width_selected(self) -> Optional[int]:
+        """快捷鍵用：選取的全是寬 3 就改成寬 2，否則全部改成寬 3（右緣不動）。回傳新寬度。"""
+        if not self.selected or self.alloc_active:
+            return None
+        picked = [n for n in self.model.notes_tree if n.idx in self.selected]
+        if not picked:
+            return None
+        narrow, wide = self.TOGGLE_WIDTHS
+        all_wide = all(int(n.max_key) - int(n.min_key) + 1 == wide for n in picked)
+        target = narrow if all_wide else wide
+        self.set_width_selected(target)
+        return target
 
     def set_hand_selected(self, hand: int) -> None:
         """把選取的音符改成左手／右手。所有檢視模式都能用，音高模式也一樣。
@@ -1277,6 +1419,64 @@ class ChartView(QWidget):
         self.status_changed.emit(
             '%d 顆音符改成%s' % (len(picked), '左手' if hand else '右手'))
 
+    # ── 排列分布：複製一段的鍵道配置，套到另一段相似的段落 ─────────────
+
+    #: 複製起來的排列分布。放在類別上：分割成兩格時，左邊複製、右邊也能套
+    _pattern_clipboard = None
+
+    def copy_distribution_selected(self) -> None:
+        from .pattern_transfer import capture
+        picked = [n for n in self.model.notes_tree if n.idx in self.selected]
+        dist = capture(picked)
+        if not dist.shapes:
+            self.status_changed.emit('排列分布：選取裡沒有可以複製的音符（顫音不算）')
+            return
+        ChartView._pattern_clipboard = dist
+        self.status_changed.emit('已複製排列分布：%d 顆，長 %.1f 秒。選另一段按右鍵「套用排列分布」'
+                                 % (len(dist), dist.span_ms / 1000.0))
+
+    def distribution_preview(self):
+        """目前選取和複製起來的分布對得多好（選單上顯示相似度用）。"""
+        from .pattern_transfer import match
+        dist = ChartView._pattern_clipboard
+        if dist is None or not self.selected:
+            return None
+        picked = [n for n in self.model.notes_tree if n.idx in self.selected]
+        if len(picked) * max(1, len(dist)) > 400_000:
+            return None
+        return match(dist, picked)
+
+    def apply_distribution_selected(self) -> None:
+        """把複製起來的排列分布套到目前選取。沒對上的音符不動，套完把它們選起來。"""
+        from .pattern_transfer import apply, match
+        dist = ChartView._pattern_clipboard
+        if dist is None or not self.selected or self.alloc_active:
+            return
+        picked = [n for n in self.model.notes_tree if n.idx in self.selected]
+        result = match(dist, picked)
+        if not result.pairs:
+            self.status_changed.emit('套用排列分布：兩段對不起來（相似度 %.0f%%）'
+                                     % (result.similarity * 100))
+            return
+        self.model.push_history()
+        changed = apply(self.model, result)
+        self.model.rebuild_display_cache()
+        # 沒對上的留給使用者自己看：直接選起來
+        self.selected = {n.idx for n in result.unmatched}
+        self.selection_changed.emit(len(self.selected))
+        self.update()
+        self.note_edited.emit()
+        extra = []
+        if result.transpose:
+            extra.append('移調 %+d' % result.transpose)
+        if abs(result.scale - 1.0) > 0.005:
+            extra.append('快慢 ×%.2f' % result.scale)
+        self.status_changed.emit(
+            '套用排列分布：相似度 %.0f%%，對上 %d 顆、改了 %d 顆%s%s' % (
+                result.similarity * 100, len(result.pairs), changed,
+                ('（%s）' % '、'.join(extra)) if extra else '',
+                ('；%d 顆沒對上，已經選起來' % len(result.unmatched)) if result.unmatched else ''))
+
     def chain_slides_selected(self) -> None:
         """把選取的音符全設成 slide（type4）並串成鏈。
 
@@ -1291,36 +1491,12 @@ class ChartView(QWidget):
             return
         self.model.push_history()
 
-        # 蒐集現有 note_index，供指派唯一值
-        used = {
-            int(n.note_index)
-            for n in self.model.notes_tree
-            if getattr(n, 'note_index', None) is not None
-        }
-        # 從 1 開始：param2 == 0 在格式上代表「未設定」，index 0 會讓鏈結
-        # 被誤判成未串鏈而觸發推測連線。
-        next_idx = (max(used) + 1) if used else 1
-        next_idx = max(1, next_idx)
-
-        for n in sel:
-            n.note_type = 4
-            if n.note_index is None:
-                while next_idx in used:
-                    next_idx += 1
-                n.note_index = next_idx
-                used.add(next_idx)
-                next_idx += 1
-
-        # 依手分組並按時間串鏈
+        # 依手分組並按時間串鏈（和匯出時把連續 soft 轉滑奏用同一份，見 soft_runs）
         groups: Dict[int, List[GNote]] = {}
         for n in sel:
             groups.setdefault(int(n.hand), []).append(n)
         for notes in groups.values():
-            notes.sort(key=lambda g: (int(g.start), int(g.min_key)))
-            for i, n in enumerate(notes):
-                n.param1 = notes[i - 1].note_index if i > 0 else -1
-                n.param2 = notes[i + 1].note_index if i < len(notes) - 1 else -1
-                n.param3 = 0
+            chain_slide_notes(self.model.notes_tree, notes)
 
         self.model.rebuild_display_cache()
         self.update()
@@ -1396,8 +1572,11 @@ class ChartView(QWidget):
         for n in self.model.notes_tree:
             if n.idx not in self.selected:
                 continue
-            new_max = min(n.min_key + target_width - 1, TOTAL_GAME_KEYS - 1)
-            n.max_key = new_max
+            # 右緣不動、動左緣：右緣是排序與視覺的權威（音高高的音右緣要更右），
+            # 動它會把排好的高低關係弄壞。寬度不夠時才往右讓。
+            new_min = max(0, int(n.max_key) - target_width + 1)
+            n.min_key = new_min
+            n.max_key = min(new_min + target_width - 1, TOTAL_GAME_KEYS - 1)
             # trill：寬度改變後，把 mesh cell 依比例重排回新範圍內
             if note_is_trill(n.note_type):
                 refit_trill_cells(n)
@@ -1405,17 +1584,30 @@ class ChartView(QWidget):
         self.update()
         self.note_edited.emit()
 
+    def lanes_follow_pitch(self) -> bool:
+        """改音高時，音符的鍵道要不要跟著音高搬？
+
+        預設**不搬**：調音高（修音、吸到調內）不該把已經排好的譜面重排——
+        鍵道是排譜的結果，音高只是它該彈哪個音。放置模式（含音階輔助）例外，
+        那時候本來就是在排版，鍵道跟著音高走比較直覺。
+        偏好設定的「改音高時重排鍵道」可以一律打開。
+        """
+        if self._note_input_mode or self._pattern_mode:
+            return True
+        return _setting_on('pitch_edit_moves_lanes', False)
+
     def shift_selected_pitch(self, delta: int, push: bool = True, sync_keys: bool = False) -> None:
         if not self.selected or self.alloc_active:
             return
         if push:
             self.model.push_history()
+        move_lanes = sync_keys and self.lanes_follow_pitch()
         for n in self.model.notes_tree:
             if n.idx in self.selected and n.pitch is not None:
                 hi = PITCH_MIDI_MAX if sync_keys else 127
                 lo = PITCH_MIDI_MIN if sync_keys else 0
                 n.pitch = max(lo, min(hi, n.pitch + delta))
-                if sync_keys:
+                if move_lanes:
                     self._sync_note_keys_to_pitch(n)
         self.model.rebuild_display_cache()
         self.update()
@@ -1601,14 +1793,21 @@ class ChartView(QWidget):
 
     def undo(self) -> None:
         if self.model.undo():
-            self.selected.clear()
-            # Undo may change beat timings / time signatures; keep viewport mapping in sync.
-            self.rebuild_mapper()
-            self._update_unit_bounds()
-            self.update()
-            self.note_edited.emit()
-            self.selection_changed.emit(0)
-            self._emit_status()
+            self._after_history_jump()
+
+    def redo(self) -> None:
+        if self.model.redo():
+            self._after_history_jump()
+
+    def _after_history_jump(self) -> None:
+        self.selected.clear()
+        # Undo/redo may change beat timings / time signatures; keep viewport mapping in sync.
+        self.rebuild_mapper()
+        self._update_unit_bounds()
+        self.update()
+        self.note_edited.emit()
+        self.selection_changed.emit(0)
+        self._emit_status()
 
     # ── 視窗捲動/縮放 ─────────────────────────────────────────────────
 
@@ -1701,7 +1900,7 @@ class ChartView(QWidget):
                 '、%d 處放不下' % report['unresolved'] if report.get('unresolved') else '')
         else:
             if self.model.undo_stack:
-                self.model.undo_stack.pop()
+                self.model.discard_last_history()
             self.model.dirty = was_dirty
             self._drag_status = '智慧排序：已經照音程排好了，沒有需要調整的'
         self._emit_status()
@@ -1827,10 +2026,28 @@ class ChartView(QWidget):
             self._input_drag_note = None
         self.note_input_changed.emit(enabled)
         self._emit_status()
+        # 放置格線的顯示與間隔就是看這兩個值，不重畫的話要等下一次事件
+        # （通常是使用者又點了一下）才看得到，感覺像沒反應。
+        self.update()
+
+    def set_peer_placement(self, active: bool) -> None:
+        """告訴這一格「另一格正在放置」，好讓格線也畫出來。
+
+        不會打開這一格的放置模式——那樣點下去會誤放音符。時值本來就是
+        兩格共用的（`_on_dur_combo_changed` 套用到所有 pane），所以只要
+        傳這個布林值。
+        """
+        active = bool(active)
+        if self._peer_placing == active:
+            return
+        self._peer_placing = active
+        self.update()
 
     def set_note_duration(self, beats: float) -> None:
         """設定放置音符模式的音符時值（單位：拍次）。"""
         self._note_duration_beats = max(1.0 / 64, float(beats))
+        self._grid_layer_cache = None       # 「跟著放置時值」那一層跟著變
+        self.update()
 
     def set_note_input_hand(self, hand: int) -> None:
         """設定放置音符預設手（0=右 1=左）。"""
@@ -1850,8 +2067,10 @@ class ChartView(QWidget):
             t = int(note_type)
         except Exception:
             return
-        # 只接受已知類型（含官方 bitmask 的 trill=64）
-        self._note_input_note_type = t if t in (0, 1, 2, 3, 4, 64) else 0
+        # 只接受已知類型（含官方 bitmask 的 trill=64）；XML 模式不收 PAN 沒有的
+        if t not in (0, 1, 2, 3, 4, 64) or not self.type_allowed(t):
+            t = 0
+        self._note_input_note_type = t
 
     # ------------------------------------------------------------------
 
@@ -1889,11 +2108,61 @@ class ChartView(QWidget):
         """
         flags = self._lane_flag_cache
         if flags is None:
-            flags = self._lane_flag_cache = (
-                _setting_on('pitch_pedal_lane', True),
-                _setting_on('pitch_dynamics_lane', True),
-            )
+            if self.pan_mode:
+                # PAN（本家）沒有踏板也沒有強弱記號，XML 存不下，欄位直接收起來
+                flags = (False, False)
+            else:
+                flags = (
+                    _setting_on('pitch_pedal_lane', True),
+                    _setting_on('pitch_dynamics_lane', True),
+                )
+            self._lane_flag_cache = flags
         return flags
+
+    @property
+    def pan_mode(self) -> bool:
+        """目前的譜是 PAN 相容 XML：PAN 沒有的功能要關掉。"""
+        return bool(getattr(self.model, 'pan_xml', False))
+
+    def type_allowed(self, note_type: int) -> bool:
+        """這個音符類型在目前格式能不能用（XML 模式不能用 Soft／Staccato）。"""
+        if not self.pan_mode:
+            return True
+        from .pan_format import is_pan_note_type
+        return is_pan_note_type(int(note_type))
+
+    def _note_width_fraction(self) -> float:
+        """音符要佔鍵道寬度的幾成（0.4~1.0）。同一幀內只讀一次設定。
+
+        和 `_lane_flags` 同一個理由：這個值每畫一顆音符就會被問到一次，密集
+        譜一幀上千次，直接讀 settings 量得出來。快取由 `paintEvent` 開頭清掉。
+        """
+        frac = self._note_width_frac
+        if frac is None:
+            try:
+                from .settings import settings
+                pct = float(settings.get('note_width_pct', 100) or 100)
+            except Exception:                   # noqa: BLE001
+                pct = 100.0
+            frac = self._note_width_frac = max(0.4, min(1.0, pct / 100.0))
+        return frac
+
+    def _hold_width_fraction(self) -> float:
+        """長押主體要佔音符寬度的幾成（0.2~1.0）。同一幀內只讀一次設定。
+
+        和 `_note_width_fraction` 分開兩個設定：音符頭是「這顆音佔幾個鍵道」的
+        視覺依據，100% 要能貼滿鍵道讓尖端互相碰到；長押身體是壓在頭後面的裝飾
+        條，太寬會把整片畫面糊成一塊，所以預設比頭窄，但也讓使用者自己調。
+        """
+        frac = self._hold_width_frac
+        if frac is None:
+            try:
+                from .settings import settings
+                pct = float(settings.get('hold_width_pct', 55) or 55)
+            except Exception:                   # noqa: BLE001
+                pct = 55.0
+            frac = self._hold_width_frac = max(0.2, min(1.0, pct / 100.0))
+        return frac
 
     def _left_gutter_px(self) -> float:
         """畫面左側保留給欄位的總寬度：踏板欄 + 左手強弱欄。"""
@@ -2042,8 +2311,26 @@ class ChartView(QWidget):
         self._note_start_cache = None
         self._max_span_cache = None
 
+    def _pitch_column_mode(self) -> str:
+        """音高模式的欄位分色："blackwhite"（黑白鍵）或 "scale"（調性）。
+
+        同一幀只讀一次設定（見 `_lane_flags`）。
+        """
+        mode = self._pitch_column_cache
+        if mode is None:
+            try:
+                from .settings import settings
+                mode = str(settings.get("pitch_column_mode", "blackwhite"))
+            except Exception:                   # noqa: BLE001
+                mode = "blackwhite"
+            if mode not in ("blackwhite", "scale"):
+                mode = "blackwhite"
+            self._pitch_column_cache = mode
+        return mode
+
     def _scale_highlight_on(self) -> bool:
-        return self.pitch_mode and _setting_on('pitch_scale_highlight', True)
+        """調性分色開著嗎。琴鍵的底色也看這個，兩邊才會一致。"""
+        return self.pitch_mode and self._pitch_column_mode() == "scale"
 
     def _scale_lock_on(self) -> bool:
         return self.pitch_mode and _setting_on('pitch_scale_lock', False)
@@ -2158,7 +2445,7 @@ class ChartView(QWidget):
         self.model.push_history()
         for n, pitch in moved:
             n.pitch = max(PITCH_MIDI_MIN, min(PITCH_MIDI_MAX, int(pitch)))
-            if self.pitch_mode:
+            if self.pitch_mode and self.lanes_follow_pitch():
                 self._sync_note_keys_to_pitch(n)
         self.model.rebuild_display_cache()
         self.update()
@@ -2199,14 +2486,44 @@ class ChartView(QWidget):
         center = self._pitch_to_lane_center(int(n.pitch))
         n.min_key, n.max_key = self._center_to_lane_range(center, note_width)
 
+    def _trill_pitch_range(self, n: GNote) -> Optional[Tuple[int, int]]:
+        """顫音實際敲到的最低／最高音（MIDI）。沒有 sub_note 音高就回 None。"""
+        pitches = [cell[4] for cell in trill_sub_cells(n) if cell[4] is not None]
+        if not pitches:
+            return None
+        return min(pitches), max(pitches)
+
     def _note_display_x_range(self, n: GNote) -> Tuple[float, float]:
+        if self.pitch_mode and note_is_trill(int(n.note_type)):
+            # 音高模式下顫音橫跨它實際來回的那幾個音，不是只佔寄主那一格——
+            # 不然 79／81 交替的顫音會擠在 81 那一條細縫裡，看不出在彈哪兩個音。
+            span = self._trill_pitch_range(n)
+            if span is not None:
+                left, _ = self._key_span(self._pitch_to_slot(span[0]))
+                _, right = self._key_span(self._pitch_to_slot(span[1]))
+                return self._shrink_span(min(left, right), max(left, right))
         if self.pitch_mode:
             pitch = self._display_pitch(n)
             slot = self._pitch_to_slot(pitch)
-            return self._key_span(slot)
+            return self._shrink_span(*self._key_span(slot))
         x1, _ = self._key_span(int(n.min_key))
         _, x2 = self._key_span(int(n.max_key))
-        return x1, x2
+        return self._shrink_span(x1, x2)
+
+    def _shrink_span(self, x1: float, x2: float) -> Tuple[float, float]:
+        """依偏好設定的百分比，以中線為準把音符收窄。
+
+        收在這裡而不是各個繪製函式裡：音符本體、trill 網格、幽靈音符、長押
+        頭尾、選取外框全都是從這條算出來的，改一處就整批一致。`_visible` 也
+        用同一份矩形，所以點選判定跟著縮——所見即所點，不會有「看得到卻點
+        不到」或「點到空白處卻選到東西」。
+        """
+        frac = self._note_width_fraction()
+        if frac >= 0.999:
+            return x1, x2
+        half = (x2 - x1) * frac / 2.0
+        mid = (x1 + x2) / 2.0
+        return mid - half, mid + half
 
     def _beat_in_units(self) -> float:
         """1 拍 = 幾個 unit。
@@ -2499,6 +2816,26 @@ class ChartView(QWidget):
         self.selection_changed.emit(len(made))
         return len(made)
 
+    def _placement_blocked_at(self, pos: 'QPoint') -> bool:
+        """這個位置不是譜面、不能放音符（底部鍵盤、踏板欄、強弱欄）。
+
+        鍵盤那塊的 y 換算成時間其實還是有效的（判定線以下是稍早的時間），
+        所以不擋的話在鍵盤上點一下，音符會落在判定線底下看不到的地方——
+        使用者以為只是點到鍵盤，其實已經誤放了一顆。
+        """
+        if pos.y() >= self._keyboard_top_py():
+            return True
+        if self._pedal_lane_hit(pos.x()):
+            return True
+        return self._dyn_lane_hit(pos.x()) is not None
+
+    def leaveEvent(self, event) -> None:
+        # 游標離開畫面就收掉放置預覽，不然最後停的位置會一直留著一個假音符
+        if self._note_input_hover is not None and self._input_drag_note is None:
+            self._note_input_hover = None
+            self.update()
+        super().leaveEvent(event)
+
     def _place_note_at(self, pos: 'QPoint') -> None:
         """在游標位置（拍子 snap）新增一個音符。"""
         # 還沒有譜面就先請使用者建立一份：沒有拍點與長度的話，音符會落在
@@ -2569,7 +2906,8 @@ class ChartView(QWidget):
         if note is None:
             return
         raw_unit = self._py_to_unit_abs(pos.y())
-        snapped_end_unit = self._snap_unit_to_duration(raw_unit, self._note_duration_beats)
+        # 拉長的單位跟著格線走（最細的那層）；沒配格線就是放置時值
+        snapped_end_unit = self._snap_unit_to_duration(raw_unit, self.drag_step_beats())
         # 最短就是原本放下去的那個時值，往下拖不會比它更短
         min_end_ms = self._input_drag_base_end
         end_ms = int(round(self.mapper.unit_to_ms(snapped_end_unit)))
@@ -2606,6 +2944,30 @@ class ChartView(QWidget):
             self.model.rebuild_display_cache()
             self.update()
             self.note_edited.emit()
+
+    def _draw_note_input_badge(self, qp: 'QPainter', rect: QRectF, ghost: GNote) -> None:
+        """編輯模式的游標方塊旁邊貼一張「要放的是哪種音符」的小圖。
+
+        編輯模式的方塊只分得出左右手的顏色，Tap／Long／Slide 看起來都一樣；
+        預覽模式本來就用遊戲素材畫 ghost，不需要這張。
+        """
+        from .note_icons import ICON_H, ICON_W, note_type_pixmap
+        pix = note_type_pixmap(int(ghost.note_type), int(ghost.hand))
+        gap = 6.0
+        x = rect.right() + gap
+        if x + ICON_W > self.width():                  # 右邊放不下就放左邊
+            x = rect.left() - gap - ICON_W
+        y = rect.bottom() - ICON_H                     # 底邊對齊落點，和音符頭同高
+        qp.save()
+        qp.setRenderHint(QPainter.Antialiasing, True)
+        qp.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        # 深色底板：游標常常停在一堆粉紅／淺藍音符上，沒底板圖示會糊在一起
+        qp.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        qp.setBrush(QColor(18, 18, 24, 215))
+        qp.drawRoundedRect(QRectF(x - 3, y - 3, ICON_W + 6, ICON_H + 6), 5, 5)
+        qp.drawPixmap(QRectF(x, y, ICON_W, ICON_H), pix,
+                      QRectF(0, 0, pix.width(), pix.height()))
+        qp.restore()
 
     def _draw_note_input_cursor(self, qp: 'QPainter') -> None:
         """在游標位置畫 snap 指示線；預覽模式下使用圖示 ghost。"""
@@ -2701,6 +3063,7 @@ class ChartView(QWidget):
                 qp.setPen(QPen(NOTE_FRAME, 2))
                 qp.drawRoundedRect(rect, radius, radius)
                 qp.setRenderHint(QPainter.Antialiasing, False)
+                self._draw_note_input_badge(qp, rect, ghost)
 
         # 提示文字
         snapped_ms  = self.mapper.unit_to_ms(snapped_unit)
@@ -3030,6 +3393,11 @@ class ChartView(QWidget):
         self._visible.clear()
         self._trill_cell_hits.clear()
         self._lane_flag_cache = None      # 每幀讀一次設定就好
+        self._note_width_frac = None
+        self._place_grid_cache = None
+        self._grid_layer_cache = None
+        self._pitch_column_cache = None
+        self._hold_width_frac = None
         self._ensure_channel_colors()
         qp = QPainter(self)
         qp.setRenderHint(QPainter.Antialiasing, False)
@@ -3044,6 +3412,8 @@ class ChartView(QWidget):
         else:
             self._draw_bg(qp)
             self._draw_grid(qp)
+        # 放置格線畫在音符底下：它只是參考線，蓋在音符上會很吵
+        self._draw_place_grid(qp)
         if self.preview_mode:
             self._draw_notes_preview(qp)
             self._draw_preview_overlay(qp)
@@ -3303,13 +3673,35 @@ class ChartView(QWidget):
             qp.drawRect(int(x1), 0, max(1, int(x2 - x1)), h)
         qp.setBrush(Qt.NoBrush)
 
+    def _draw_black_key_columns(self, qp: QPainter) -> None:
+        """整片依黑白鍵分色（音高模式的預設）。
+
+        原本只有「放置模式而且靠近滑鼠」那幾欄才上色，其餘整片全黑——看不出
+        自己在哪個音區，要數格子。整片鋪上去之後，鍵盤的黑白排列本身就是刻度。
+
+        白鍵提亮、黑鍵壓暗，兩邊各站在背景色的一側——整體亮度不變，但交替看得
+        出來。只壓暗一邊是不夠的：背景本來就接近黑（28,28,32），再壓黑看不出
+        差別（第一版把黑鍵設成 26,26,32，和背景差 2 級，等於沒畫）。
+        """
+        h = self.height()
+        qp.setPen(Qt.NoPen)
+        for i in range(self._display_key_count()):
+            black = _is_black_pitch(PITCH_MIDI_MIN + i)
+            qp.setBrush(PITCH_BLACK_COLUMN if black else PITCH_WHITE_COLUMN)
+            x1, x2 = self._key_span(i)
+            qp.drawRect(int(x1), 0, max(1, int(x2 - x1)), h)
+        qp.setBrush(Qt.NoBrush)
+
     def _draw_grid(self, qp: QPainter) -> None:
         h = self.height()
         qp.setFont(self._font_key)
         display_keys = self._display_key_count()
         # 音高模式：黑鍵欄位加深色底，讓排列像鋼琴鍵盤
         if self.pitch_mode:
-            self._draw_scale_highlight(qp)
+            if self._pitch_column_mode() == 'scale':
+                self._draw_scale_highlight(qp)
+            else:
+                self._draw_black_key_columns(qp)
             # 音高模式：底色維持全黑，只有在放置模式、而且靠近滑鼠的欄位才
             # 畫出格線，其餘留白讓音符自己說話。
             if not (self._note_input_mode and self._grid_focus_slot is not None):
@@ -3352,6 +3744,102 @@ class ChartView(QWidget):
         for i in range(ZONE_LANES, display_keys, ZONE_LANES):
             x = int(self._display_key_to_px(i))
             qp.drawLine(x, 0, x, h)
+
+    def _place_grid_mode(self) -> str:
+        """放置格線的顯示模式。同一幀內只讀一次設定（見 `_lane_flags`）。"""
+        mode = self._place_grid_cache
+        if mode is None:
+            try:
+                from .settings import settings
+                mode = str(settings.get('place_grid_mode', 'placement'))
+            except Exception:                   # noqa: BLE001
+                mode = 'placement'
+            if mode not in ('placement', 'always', 'never'):
+                mode = 'placement'
+            self._place_grid_cache = mode
+        return mode
+
+    def grid_layers(self) -> List[Tuple[float, QColor]]:
+        """要畫的格線層：[(一格幾拍, 顏色)]，粗的在前。
+
+        一層是「跟著放置時值」（原本那條格線），其他是格線配置裡勾的 N 分音符。
+        同一個間隔只畫一次。同一幀內只讀一次設定。
+        """
+        cached = getattr(self, '_grid_layer_cache', None)
+        if cached is not None:
+            return cached
+        try:
+            from .settings import settings
+            follow = bool(settings.get('grid_follow_placement', True))
+            divisions = list(settings.get('grid_divisions', []) or [])
+        except Exception:                       # noqa: BLE001
+            follow, divisions = True, []
+        layers: List[Tuple[float, QColor]] = []
+        for n in divisions:
+            try:
+                n = float(n)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                layers.append((4.0 / n, grid_division_color(n)))
+        if follow and float(self._note_duration_beats) > 0:
+            beats = float(self._note_duration_beats)
+            if not any(abs(beats - b) < 1e-9 for b, _c in layers):
+                layers.append((beats, PLACE_GRID_COLOR))
+        layers.sort(key=lambda layer: -layer[0])
+        self._grid_layer_cache = layers
+        return layers
+
+    def drag_step_beats(self) -> float:
+        """手動拉長縮短（長條尾端、放置時往上拖）一格是幾拍：格線多細就多細。
+
+        格線配置裡最細的那一層就是單位。沒有自己配格線時，格線只有「跟著放置
+        時值」那一層，所以還是原本的行為（照工具列選的時值）。
+        """
+        beats = [b for b, _c in self.grid_layers() if b > 0]
+        return min(beats) if beats else float(self._note_duration_beats)
+
+    def _draw_place_grid(self, qp: QPainter) -> None:
+        """依「放置時值」畫水平參考線。
+
+        間隔就是放置模式選的音符時值，而且用的是同一個吸附函式，所以線的位置
+        **正好是音符會被放到的地方**——放之前就看得到會落在哪一條。
+
+        間隔隨拍號變動（`_beat_in_units_at`），所以是一格一格往前走、每步重算，
+        不是乘一個固定值：2/2 和 6/8 的小節裡一拍佔的 unit 不一樣。
+        """
+        mode = self._place_grid_mode()
+        placing = self._note_input_mode or self._peer_placing
+        if mode == 'never' or (mode == 'placement' and not placing):
+            return
+        win_end = self.window_start_unit + self.window_size_unit
+        width = self.width()
+        height = self.height()
+        drawn: set = set()
+        # 粗的先畫；細的那層碰到已經畫過的位置就跳過，重疊處看到的是粗線
+        for beats, color in self.grid_layers():
+            if beats <= 0:
+                continue
+            unit = self._snap_unit_to_duration(self.window_start_unit, beats)
+            step = beats * self._beat_in_units_at(unit)
+            if step <= 1e-9:
+                continue
+            # 太密就這層不畫：一格不到 4px 時，畫出來是一片糊掉的底色而不是格線
+            if abs(self._unit_to_py(0.0) - self._unit_to_py(step)) < 4.0:
+                continue
+            qp.setPen(QPen(color, 1))
+            guard = 0
+            while unit <= win_end and guard < 4096:
+                guard += 1
+                py = int(self._unit_to_py(unit - self.window_start_unit))
+                if -2 <= py <= height + 2 and py not in drawn \
+                        and (py - 1) not in drawn and (py + 1) not in drawn:
+                    qp.drawLine(0, py, width, py)
+                    drawn.add(py)
+                step = beats * self._beat_in_units_at(unit)
+                if step <= 1e-9:
+                    break
+                unit += step
 
     def _draw_beat_lines(self, qp: QPainter) -> None:
         w = self.width()
@@ -3615,6 +4103,10 @@ class ChartView(QWidget):
         for n in self._notes_in_window(ws_ms - self._max_note_span_ms(), we_ms):
             if not note_is_slide(int(n.note_type)) or self._is_ghost(n):
                 continue
+            # 隱藏的滑音節點不畫，連線也就不能從它拉出去——它在畫面上根本不
+            # 存在，卻會留下一條沒有端點的帶子。實測全庫有 240 顆隱藏滑音。
+            if self._note_is_concealed(n):
+                continue
             # 視窗裁切（以自身 start/end）
             ua = self.mapper.ms_to_unit(float(n.start)) - self.window_start_unit
             ub = self.mapper.ms_to_unit(float(n.end)) - self.window_start_unit
@@ -3623,8 +4115,8 @@ class ChartView(QWidget):
 
             # 下一顆：param2 優先，否則同手最近的下一顆（讓相鄰滑鍵連成一條）
             nxt = slide_next_note(n, notes, index_map)
-            if nxt is None:
-                continue
+            if nxt is None or self._note_is_concealed(nxt):
+                continue                    # 連到一顆看不見的音符沒有意義
 
             # 從本顆尾巴 → 下一顆頭；尾巴位置預覽/編輯分開算
             xa1, xa2 = self._slide_band_x_range(n)
@@ -3679,8 +4171,13 @@ class ChartView(QWidget):
             y1 = self._ms_to_py(en)
             top = min(y0, y1)
             h = max(3.0, abs(y1 - y0))
-            bx = x1 + relx * w
-            bw = max(2.0, relw * w)
+            if self.pitch_mode and pit is not None:
+                # 音高模式：每一下畫在它自己的音高那一格
+                bx, right = self._shrink_span(*self._key_span(self._pitch_to_slot(int(pit))))
+                bw = max(2.0, right - bx)
+            else:
+                bx = x1 + relx * w
+                bw = max(2.0, relw * w)
             cell = QRectF(bx + 1.0, top + 0.5, bw - 2.0, max(1.0, h - 1.0))
             is_sel_cell = (n, sidx) in self._sel_cells
             qp.setBrush(QBrush(mesh_fill.lighter(135) if is_sel_cell else mesh_fill))
@@ -3700,7 +4197,8 @@ class ChartView(QWidget):
             qp.setFont(self._font_pitch)
             for cell, pit in label_cells:
                 if cell.height() >= 10 and cell.width() >= 12:
-                    qp.drawText(cell, Qt.AlignCenter, str(pit))
+                    # 和一般音符同一套編號（預設遊戲的 1～88），不是直接印 MIDI
+                    qp.drawText(cell, Qt.AlignCenter, self._pitch_label(pit))
 
         # 前後兩個 tap（音符 start / end）
         tap_h = 10.0
@@ -3827,10 +4325,10 @@ class ChartView(QWidget):
             rect = self._note_rect(n)
             if rect is None:
                 continue
-            if getattr(n, 'hidden', False) and not self.pitch_mode:
-                # 其他模式完全不顯示隱藏音——也不進 _visible。進了的話 Pass 2
-                # 會照 _visible 畫音高數字，方塊雖然沒畫、數字還是會疊在寄主
-                # 上面糊成一團；順帶也讓這些音在非音高模式下不可被點選。
+            if self._note_is_concealed(n):
+                # 完全不顯示——也不進 _visible。進了的話 Pass 2 會照 _visible
+                # 畫音高數字，方塊雖然沒畫、數字還是會疊在寄主上面糊成一團；
+                # 順帶也讓這些音在這些模式下不可被點選。
                 continue
             if self._is_ghost(n):
                 # 幽靈音符：只畫個影子當參考，不進 _visible ＝ 點不到、框不到、
@@ -4255,7 +4753,7 @@ class ChartView(QWidget):
         是）拉出來的長度會是個怪數字。
         """
         start_unit = self.mapper.ms_to_unit(float(note.start))
-        step_units = max(1e-6, self._note_duration_beats
+        step_units = max(1e-6, self.drag_step_beats()
                          * self._beat_in_units_at(start_unit))
         raw_unit = self._py_to_unit_abs(float(py))
         return max(1, int(round((raw_unit - start_unit) / step_units)))
@@ -4271,8 +4769,8 @@ class ChartView(QWidget):
             return
         steps = self._hold_tail_steps(note, pos.y())
         start_unit = self.mapper.ms_to_unit(float(note.start))
-        step_units = max(1e-6, self._note_duration_beats
-                         * self._beat_in_units_at(start_unit))
+        step_beats = self.drag_step_beats()
+        step_units = max(1e-6, step_beats * self._beat_in_units_at(start_unit))
         end_ms = int(round(self.mapper.unit_to_ms(start_unit + step_units * steps)))
         end_ms = max(int(note.start) + 1, end_ms)
         if end_ms == int(note.end):
@@ -4283,19 +4781,24 @@ class ChartView(QWidget):
         self.model.rebuild_display_cache()
         self._update_unit_bounds()
         self._drag_status = '長條長度 %d ms（%g × %s）' % (
-            note.gate, steps, self._note_value_label(self._note_duration_beats))
+            note.gate, steps, self._note_value_label(step_beats))
         self.update()
         self._emit_status()
 
     @staticmethod
     def _note_value_label(beats: float) -> str:
         """拍數 → 音符值名稱，狀態列用。"""
-        table = {4.0: '全音符', 2.0: '二分音符', 1.0: '四分音符', 0.5: '八分音符',
-                 1.0 / 3.0: '八分三連', 0.25: '16分音符', 1.0 / 6.0: '16分三連',
-                 0.125: '32分音符', 0.0625: '64分音符'}
+        # 名稱和工具列「音符時值」下拉同一套（main_window._note_dur_items）
+        table = {4.0: '全音符', 2.0: '二分音符', 1.0: '四分音符',
+                 2.0 / 3.0: '6分音符', 0.5: '八分音符', 1.0 / 3.0: '12分音符',
+                 0.25: '16分音符', 1.0 / 6.0: '24分音符', 0.125: '32分音符',
+                 1.0 / 12.0: '48分音符', 0.0625: '64分音符'}
         for value, name in table.items():
             if abs(float(beats) - value) < 1e-6:
                 return name
+        division = 4.0 / float(beats) if float(beats) > 0 else 0.0
+        if division >= 1 and abs(division - round(division)) < 1e-4:
+            return '%d分音符' % int(round(division))       # 自訂的 N 分音符
         return '%.4g 拍' % float(beats)
 
     def _finish_hold_tail_drag(self) -> None:
@@ -4306,7 +4809,7 @@ class ChartView(QWidget):
         if not self._hold_tail_moved:
             # 只是點了一下尾巴，沒拉動：不要在 undo 堆裡留一筆空的
             if self.model.undo_stack:
-                self.model.undo_stack.pop()
+                self.model.discard_last_history()
         else:
             self.model.rebuild_display_cache()
             self.note_edited.emit()
@@ -4832,16 +5335,21 @@ class ChartView(QWidget):
         if not img.isNull() and img.width() > 0:
             th = 16.0
             qp.setOpacity(1.0)
-            qp.drawPixmap(QRectF(x1z, y_start - th / 2.0, zone_w, th).toRect(), img)
+            qp.drawPixmap(_art_fill_rect(
+                QRectF(x1z, y_start - th / 2.0, zone_w, th), img).toRect(), img)
             qp.setOpacity(0.35)
-            qp.drawPixmap(QRectF(x1z, y_end - th / 2.0, zone_w, th).toRect(), img)
+            qp.drawPixmap(_art_fill_rect(
+                QRectF(x1z, y_end - th / 2.0, zone_w, th), img).toRect(), img)
             qp.setOpacity(1.0)
 
     def _preview_head_rect(self, n: GNote) -> Optional[QRectF]:
         start_u = self.mapper.ms_to_unit(float(n.start)) - self.window_start_unit
         if start_u > self.window_size_unit + 1.0 or start_u < -1.0:
             return None
-        x, draw_w = self._preview_note_xw(n, 0.9)
+        # 1.0 = 佔滿整個鍵道範圍：相鄰音符的尖端剛好互相碰到。想留間隙請調
+        # 偏好設定的「音符寬度」，那個百分比已經包在 `_note_display_x_range`
+        # 裡了，這裡再乘一次縮放的話 100% 就永遠排不滿。
+        x, draw_w = self._preview_note_xw(n, 1.0)
         draw_h = max(float(MIN_NOTE_HEIGHT_PX), float(PREVIEW_PX))
         start_py = self._unit_to_py(start_u)
         # 以 startTime 為中線：圖示垂直置中於 start 位置
@@ -4852,8 +5360,8 @@ class ChartView(QWidget):
         rect = self._note_rect(n)
         if rect is None or rect.height() < 1:
             return None
-        # mesh 比 note 頭(0.9)窄一些，畫在音符後面（低圖層）
-        x, draw_w = self._preview_note_xw(n, 0.55)
+        # mesh 預設比 note 頭窄一些，畫在音符後面（低圖層）；比例可在偏好設定調
+        x, draw_w = self._preview_note_xw(n, self._hold_width_fraction())
         return QRectF(float(x), float(rect.top()), float(draw_w), float(rect.height()))
 
     def _preview_stac_rect(self, n: GNote) -> Optional[QRectF]:
@@ -4914,7 +5422,7 @@ class ChartView(QWidget):
         return r
 
     def _preview_note_head(self, qp: QPainter, n: GNote) -> None:
-        """Note head：0.9 寬、原圖比例高度 clamp 至 rect。
+        """Note head：滿鍵道寬、原圖比例高度 clamp 至 rect。
         全部底部對齊於 starttime（rect.bottom）。
         stac 這裡畫 tap 圖（left/right_note），指示箭頭在 Pass 3 另行疊上。
         """
@@ -4937,31 +5445,38 @@ class ChartView(QWidget):
         rect = self._preview_head_rect(n)
         if rect is None:
             return
-        qp.drawPixmap(rect.toRect(), img)
+        # 撐掉圖裡尖端外面那圈透明柔邊，實心尖端才會真的落在鍵道邊界上。
+        # 命中範圍仍然用沒撐過的 rect：看得見的部分就是那一塊。
+        qp.drawPixmap(_art_fill_rect(rect, img).toRect(), img)
 
     def _draw_notes_preview(self, qp: QPainter) -> None:
         """預覽模式的音符繪製：依 note_type 使用 graphic/ 圖片。"""
         qp.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        # 隱藏音符一顆都不畫。這裡是**預覽自己的**繪製路徑，和編輯模式那條
+        # （`paintEvent` 的 Pass 1）完全分開——編輯那條早就濾掉隱藏音了，這
+        # 四個迴圈卻是直接跑整份 `model.notes`，所以預覽反而是唯一會把它們畫
+        # 出來的模式。實測 Melodiniq 的 Normal 一個畫面就多畫 281 顆。
+        drawn = [n for n in self.model.notes if not self._note_is_concealed(n)]
         # Pass 0：slide 梯形帶（最低圖層）
         self._draw_slide_bands(qp)
         # Pass 1：hold 主體 / trill 顫音條（低圖層）
-        for n in self.model.notes:
+        for n in drawn:
             if note_is_trill(n.note_type):
                 self._preview_trill_body(qp, n)
             elif note_is_long(n.note_type):
                 self._preview_hold_body(qp, n)
         # Pass 2：所有 note head（tap / soft / hold head）；stac 的層也在這裡畫 tap 底層
-        for n in self.model.notes:
+        for n in drawn:
             self._preview_note_head(qp, n)
         # Pass 3：staccato 標記 → V 型（chevron），畫在音符正上方
-        for n in self.model.notes:
+        for n in drawn:
             if n.note_type == 3:
                 self._preview_stac_v(qp, n)
 
         # Pass 4：建立 hit-test 區域 + 選取外框（圍繞圖示）
         qp.setPen(QPen(SEL_OUTLINE, 2))
         qp.setBrush(Qt.NoBrush)
-        for n in self.model.notes:
+        for n in drawn:
             hit_rect = self._preview_hit_rect(n)
             if hit_rect is None:
                 continue
@@ -5020,13 +5535,15 @@ class ChartView(QWidget):
         # ── 音階輔助模式：按住往上拖決定音數 ───────────────────────
         if self._pattern_mode and not self.alloc_active:
             if event.button() == Qt.LeftButton:
-                self._begin_pattern_drag(pos)
+                if not self._placement_blocked_at(pos):
+                    self._begin_pattern_drag(pos)
                 return
 
         # ── 放置音符模式 ───────────────────────────────────────────
         if self._note_input_mode and not self.alloc_active:
             if event.button() == Qt.LeftButton:
-                self._place_note_at(pos)
+                if not self._placement_blocked_at(pos):
+                    self._place_note_at(pos)
                 return
 
         # 預覽模式：允許選取（點擊/框選），其餘互動不開放
@@ -5196,6 +5713,17 @@ class ChartView(QWidget):
 
         # 放置音符模式：記錄游標並更新 snap 指示線
         if self._note_input_mode:
+            blocked = self._placement_blocked_at(pos)
+            if blocked and self._input_drag_note is None:
+                # 游標在鍵盤／踏板欄／強弱欄上：不畫預覽，按下去也不會放
+                if self._note_input_hover is not None:
+                    self._note_input_hover = None
+                    self.update()
+                if not self._hold_tail_hover and self.cursor().shape() != Qt.ArrowCursor:
+                    self.setCursor(Qt.ArrowCursor)
+                return
+            if not self._hold_tail_hover and self.cursor().shape() != Qt.CrossCursor:
+                self.setCursor(Qt.CrossCursor)
             self._note_input_hover = QPoint(pos)
             # 音高模式的格線只在滑鼠附近顯示，所以要跟著游標走
             if self.pitch_mode:
@@ -5274,7 +5802,7 @@ class ChartView(QWidget):
             self.model.pedal_spans = self.model._normalise_pedal_spans(
                 self.model.pedal_spans)
             if not self._pedal_edge_moved and self.model.undo_stack:
-                self.model.undo_stack.pop()   # 只是點了一下邊界，沒拉動
+                self.model.discard_last_history()   # 只是點了一下邊界，沒拉動
             else:
                 self.note_edited.emit()
             self._pedal_edge_moved = False
@@ -5294,7 +5822,7 @@ class ChartView(QWidget):
             else:
                 touched = self.model.pedal_add_span(start_ms, end_ms)
             if not touched and self.model.undo_stack:
-                self.model.undo_stack.pop()
+                self.model.discard_last_history()
                 self.model.dirty = was_dirty
             else:
                 self.note_edited.emit()
@@ -5696,9 +6224,15 @@ class ChartView(QWidget):
                 self.shift_selected_keys(10 if shift else 1, push=not event.isAutoRepeat())
             return
 
-        # ── Undo ──────────────────────────────────────────────────────
+        # ── Undo / Redo ───────────────────────────────────────────────
         if ctrl and key == Qt.Key_Z:
-            self.undo()
+            if shift:
+                self.redo()
+            else:
+                self.undo()
+            return
+        if ctrl and key == Qt.Key_Y:
+            self.redo()
             return
 
         # ── Copy / Paste ──────────────────────────────────────────────
@@ -5905,6 +6439,19 @@ class ChartView(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, '變拍失敗', str(exc))
 
+    def _note_is_concealed(self, note: 'GNote') -> bool:
+        """這顆音符在目前的模式下不該畫出來。
+
+        隱藏音符只有**音高模式**看得到（半透明、拉一條虛線連到寄主），因為那
+        個模式是拿來檢查音高資料的。預覽模式畫的是**遊戲裡的實際外觀**，而遊
+        戲從來不顯示隱藏音符——它們只貢獻 keysound——所以預覽要蓋過音高模式。
+
+        以前只寫「非音高模式就不畫」，音高模式開著再切到預覽，隱藏音就跟著留
+        在畫面上了。
+        """
+        return (getattr(note, 'hidden', False)
+                and (self.preview_mode or not self.pitch_mode))
+
     def _hidden_host(self, note: 'GNote'):
         """隱藏音符要掛在哪顆可見音符上（音高最近）。
 
@@ -6008,7 +6555,10 @@ class ChartView(QWidget):
                              ('Long  (H)', 2), ('Staccato  (K)', 3),
                              ('Slide  (滑)', 4), ('Trill  (顫音)', 64)]:
             a = type_m.addAction(label)
-            a.setEnabled(has_sel)
+            allowed = self.type_allowed(ntype)
+            if not allowed:
+                a.setText(label + '（XML 不支援）')
+            a.setEnabled(has_sel and allowed)
             a.triggered.connect(
                 lambda checked=False, _t=ntype: self.set_type_selected(_t))
 
@@ -6335,6 +6885,23 @@ class ChartView(QWidget):
             a.triggered.connect(lambda checked=False, _s=slot: _s())
         menu.addSeparator()
 
+        # 排列分布：這一段怎麼排，照抄到另一段相似的段落
+        a = menu.addAction('複製排列分布')
+        a.setEnabled(multi_sel)
+        a.setToolTip('記下選取音符的鍵道位置與左右手，之後可以套到另一段相似的段落')
+        a.triggered.connect(self.copy_distribution_selected)
+        dist = ChartView._pattern_clipboard
+        label = '套用排列分布'
+        preview = self.distribution_preview() if (dist is not None and has_sel) else None
+        if preview is not None:
+            label = '套用排列分布（相似度 %.0f%%）' % (preview.similarity * 100)
+        a = menu.addAction(label)
+        a.setEnabled(dist is not None and has_sel and not self.alloc_active)
+        a.setToolTip('把複製的排列套到選取的段落：兩段可以有一點點不同（多幾顆、少幾顆、'
+                     '移調、快慢差一點），對上的音符照抄鍵道與左右手，沒對上的不動')
+        a.triggered.connect(self.apply_distribution_selected)
+        menu.addSeparator()
+
         # 排序：預設走簡化版智慧路徑（直接排好，不用拖）。要自己框範圍再用基本排序。
         multi_pitched = sum(
             1 for n in self.model.notes_tree
@@ -6573,7 +7140,7 @@ class ChartView(QWidget):
             self.update()
         else:
             if self.model.undo_stack:
-                self.model.undo_stack.pop()
+                self.model.discard_last_history()
             self.status_changed.emit('這一手沒有帶力度的音符')
 
     def _ctx_add_dynamic(self, hand: int, ms: float, level: int, ramp: bool) -> None:
@@ -6593,7 +7160,7 @@ class ChartView(QWidget):
             self.note_edited.emit()
             self.update()
         elif self.model.undo_stack:
-            self.model.undo_stack.pop()
+            self.model.discard_last_history()
             self.status_changed.emit('這附近沒有強弱記號')
 
     def _ctx_clear_dynamics(self, hand: Optional[int]) -> None:
@@ -6604,7 +7171,7 @@ class ChartView(QWidget):
             self.status_changed.emit('清除了 %d 個強弱記號' % removed)
             self.update()
         elif self.model.undo_stack:
-            self.model.undo_stack.pop()
+            self.model.discard_last_history()
 
     def _ctx_apply_dynamics(self) -> None:
         """把強弱曲線當倍率乘進音符 velocity。"""
@@ -6622,7 +7189,7 @@ class ChartView(QWidget):
             self.update()
         else:
             if self.model.undo_stack:
-                self.model.undo_stack.pop()
+                self.model.discard_last_history()
             QMessageBox.information(self, '套用強弱', '音符力度已經符合曲線，沒有需要改的。')
 
     def _ctx_build_velocity_menu(self, menu, has_sel: bool) -> None:

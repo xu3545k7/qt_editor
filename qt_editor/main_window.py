@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 import logging
@@ -46,7 +46,9 @@ from .midi_preview import (
     build_preview_notes,
     pedal_spans_in_range,
 )
+from . import autosave
 from .i18n import t
+from .oplog import oplog, profile as oplog_profile
 from .settings import settings
 from .settings_dialog import SettingsDialog
 from .new_chart_dialog import NewChartDialog
@@ -216,6 +218,7 @@ class ToolbarSet:
         self.width_combo = None
         self.type_combo = None
         self.note_input_group: List[QWidget] = []
+        self.grid_btn = None
         # 音階輔助
         self.pattern_act: Optional[QAction] = None
         self.pattern_group: List[QWidget] = []
@@ -247,6 +250,45 @@ class ToolbarSet:
 # 兩者都是邏輯像素，Qt 的 High-DPI 縮放會自動跟著螢幕倍率放大。
 COMBO_CHROME_PX = 34
 LABEL_PAD_PX    = 6
+
+
+def _difficulty_report(rows) -> str:
+    """把生成結果排成一張可以和官方數字對照的表。
+
+    每一行都印出「實際值 / 官方目標」——生成器的門檻是二分搜尋出來的，沒有
+    這張表就沒辦法判斷它到底有沒有做到。
+    """
+    from .difficulty import TARGETS
+
+    lines = ['音訊事件總數不變（沒被選中的折進 sub_note）。', '']
+    for result, path in rows:
+        goal = TARGETS[result.difficulty]
+        lines.append('%s  →  %s' % (result.difficulty.upper(), os.path.basename(path)))
+        lines.append('    可見 %d / %d 顆（%.0f%%）  每秒 %.1f 顆'
+                     % (result.visible, result.total,
+                        result.visible_ratio * 100, result.notes_per_sec))
+        lines.append('    同手間隔 %.0fms（官方 %dms）  同時最多 %d 顆（官方 %d）'
+                     % (result.gap_hands_ms, goal.same_hand_gap_ms,
+                        result.max_simultaneous, goal.max_simultaneous))
+        lines.append('    長押 %.1f%%（官方 %.1f%%）  hand=2 %.0f%%（官方 %.0f%%）'
+                     % (result.long_ratio * 100, goal.long_ratio * 100,
+                        result.hand2_ratio * 100, goal.hand2_ratio * 100))
+        if result.orphans:
+            lines.append('    ⚠ %d 顆找不到寄主，被迫留成可見音符' % result.orphans)
+        lines.append('')
+    return '\n'.join(lines).rstrip()
+
+
+def _model_path(model) -> str:
+    """這份譜面在磁碟上的位置。沒存過就是空字串。
+
+    以前寫的是 `getattr(model, 'path', '')`，而 NoteModel 從來沒有 `path` 這個
+    欄位（叫 `current_file`），備援的 `self._current_path` 整個專案也不存在 ——
+    所以那四個地方拿到的永遠是空字串。看得見的後果是「生成其他難度到樂曲資料
+    夾…」永遠回一句「請先把這份譜面存檔」，即使譜面就是從磁碟開起來的：那個功
+    能從頭到尾沒有辦法用。
+    """
+    return getattr(model, 'current_file', '') or ''
 
 
 class MainWindow(QMainWindow):
@@ -349,15 +391,33 @@ class MainWindow(QMainWindow):
         except Exception:
             self._lbl_audio_mode = None
         # ── 放置音符模式狀態 ───────────────────────────────────
+        # 三連音照長度插在一起，捲下拉時長短是連續的。名稱用「N 分音符」
+        # （一個全音符切 N 份），和直拍那幾格同一套叫法；三連音的講法放在
+        # 選項提示裡——寫進選項文字的話，工具列的下拉會照最長那項被撐寬。
         self._note_dur_items = [
             ('全音符',   4.0),
             ('二分音符',   2.0),
             ('四分音符',   1.0),
+            ('6分音符',   2.0 / 3.0),
             ('八分音符',   0.5),
+            ('12分音符',  1.0 / 3.0),
             ('16分音符',  0.25),
+            ('24分音符',  1.0 / 6.0),
             ('32分音符',  0.125),
+            ('48分音符',  1.0 / 12.0),
             ('64分音符',  0.0625),
         ]
+        self._note_dur_tips = {
+            '6分音符': '四分三連音（三顆佔兩拍）',
+            '12分音符': '八分三連音（三顆佔一拍）',
+            '24分音符': '16分三連音（六顆佔一拍）',
+            '48分音符': '32分三連音（十二顆佔一拍）',
+        }
+        for division in settings.get('custom_note_divisions', []) or []:
+            self._insert_custom_duration(division)
+        # 自訂的比四分音符長（例如 3 分）會插在前面，預設要照長度找回四分音符
+        self._ni_dur_idx = next(i for i, (_nm, beats) in enumerate(self._note_dur_items)
+                                if abs(beats - 1.0) < 1e-9)
 
         # ── 音階輔助狀態 ───────────────────────────────────────
         from .music_theory import PATTERN_KINDS as _PATTERN_KINDS
@@ -394,6 +454,23 @@ class MainWindow(QMainWindow):
         self._title_timer = QTimer(self)
         self._title_timer.timeout.connect(self._refresh_title)
         self._title_timer.start(500)
+
+        # ── 操作紀錄 ──────────────────────────────────────────────────
+        # 一個動作是在「下一次編輯」時才結算的，所以閒下來要自己收尾一次，
+        # 否則最後一個動作會一直懸在那裡、關掉視窗就沒了。
+        oplog.configure(settings.get('oplog_enabled', True))
+        self._oplog_timer = QTimer(self)
+        self._oplog_timer.timeout.connect(self._flush_oplog)
+        self._oplog_timer.start(3000)
+
+        # ── 自動儲存（備份） ──────────────────────────────────────────
+        # 定時把還沒存的改動寫成備份，崩潰後重開可以救回來；不覆蓋原檔。
+        import uuid
+        self._autosave_session = uuid.uuid4().hex[:8]
+        self._autosave_pending = False
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._on_autosave_tick)
+        self._configure_autosave()
         # Give initial keyboard focus to the chart view so shortcuts (eg. Tab)
         # are immediately active without requiring a mouse click.
         try:
@@ -450,6 +527,65 @@ class MainWindow(QMainWindow):
                 if v is not anchor:
                     v.sync_window_from(anchor)
         self._refresh_pattern_key_label()
+        self._apply_format_mode()
+
+    # ── 格式模式：JSON（完整）／XML（PAN 相容）──────────────────────────
+
+    #: XML 模式要關掉的工具（PAN 沒有踏板）。用函式名比對，選單和工具列兩邊都抓得到。
+    _PAN_DISABLED_SLOTS = frozenset({'generate_pedal_dialog', 'clear_pedal'})
+
+    def _register_pan_gated(self, action, slot=None) -> None:
+        name = slot if isinstance(slot, str) else getattr(slot, '__name__', '')
+        if slot is not None and name not in self._PAN_DISABLED_SLOTS:
+            return
+        if not hasattr(self, '_pan_gated_actions'):
+            self._pan_gated_actions = []
+        self._pan_gated_actions.append(action)
+        action.setEnabled(not getattr(self.view.model, 'pan_xml', False)
+                          if hasattr(self, 'view') else True)
+
+    def _apply_format_mode(self) -> None:
+        """依目前譜面是 JSON 還是 PAN XML，把 PAN 沒有的功能開或關。
+
+        XML 模式下：放置類型選單的 Soft／Staccato 變灰（看得到、選不了），
+        編輯選單對應的類型、踏板工具、強弱曲線欄都關掉。
+        """
+        if not hasattr(self, 'view'):
+            return
+        from PyQt5 import sip
+        from .pan_format import is_pan_note_type
+        pan = bool(getattr(self.view.model, 'pan_xml', False))
+        values = getattr(self, '_type_combo_values', None) or []
+        tip = 'XML（PAN）格式沒有這個類型——另存成 JSON 才能用'
+        for tbs in getattr(self, '_toolbars', ()):
+            combo = getattr(tbs, 'type_combo', None)
+            if combo is None:
+                continue
+            items = combo.model()
+            for i, nt in enumerate(values[:combo.count()]):
+                item = items.item(i)
+                if item is None:
+                    continue
+                allowed = not pan or is_pan_note_type(nt)
+                item.setEnabled(allowed)
+                item.setToolTip('' if allowed else tip)
+            current = combo.currentIndex()
+            if 0 <= current < len(values) and pan and not is_pan_note_type(values[current]):
+                combo.setCurrentIndex(0)          # 會走 _on_type_combo_changed 同步到格子
+        alive = []
+        for act in getattr(self, '_pan_gated_actions', ()):
+            if sip.isdeleted(act):
+                continue
+            act.setEnabled(not pan)
+            alive.append(act)
+        self._pan_gated_actions = alive
+        dyn = getattr(self, '_act_dyn_lane', None)
+        if dyn is not None:
+            dyn.setEnabled(not pan)
+        for pane in getattr(self, '_panes', ()):
+            pane._lane_flag_cache = None
+            pane.update()
+        self._refresh_title()
 
     def _set_judge_line_all(self, ms) -> None:
         """更新所有格子的判定時刻。
@@ -496,7 +632,15 @@ class MainWindow(QMainWindow):
                 v.rebuild_mapper()
             # 新開的預設音高模式；但若原本那格已經是音高模式，
             # 就退回小節均分，讓兩格保持不同形態（否則分割沒意義）。
-            v.set_view_mode('measure' if anchor.pitch_mode else 'pitch')
+            #
+            # 未排譜的 MIDI 例外：它只有音高檢視有意義，硬指定 'measure'
+            # 會被 set_view_mode 擋回 pitch 並發出 arrange_required——結果
+            # 只是想開個分割對照左右手，卻跳出「要不要轉譜」。兩格都留在
+            # 音高模式就好（時間軸範圍還是可以各看各的）。
+            if getattr(model, 'midi_unarranged', False):
+                v.set_view_mode('pitch')
+            else:
+                v.set_view_mode('measure' if anchor.pitch_mode else 'pitch')
             v.show()
             self._apply_note_input_settings(v)
         # 新格子的時間範圍直接對齊原本那格（之後靠 time_sync 持續連動）
@@ -919,8 +1063,7 @@ class MainWindow(QMainWindow):
 
             act = tbs.split_dir_act
             if act is not None:
-                act.setText(dir_key)
-                act.setToolTip(t('tb_split_dir_tip'))
+                self._set_labeled_text(act, dir_key, t('tb_split_dir_tip'))
                 act.setEnabled(split_on)
 
             # 疊層模式才提示 Shift 可以切換塗層
@@ -948,6 +1091,17 @@ class MainWindow(QMainWindow):
         model = getattr(self.view, 'model', None) if getattr(self, '_panes', None) else None
         path = getattr(model, 'current_file', None)
         self.setWindowTitle('%s — %s' % (os.path.basename(path), base) if path else base)
+
+    def apply_language(self, lang: str) -> None:
+        """NosMania 啟動器換了語言：記進設定，和目前不同就就地換掉介面文字。"""
+        from .i18n import get_lang, set_lang
+        if lang not in ('zh_tw', 'zh_cn', 'en'):
+            return
+        if settings.get('language', 'zh_tw') != lang:
+            settings.set('language', lang)
+        if get_lang() != lang:
+            set_lang(lang)
+            self.retranslate_ui()
 
     def retranslate_ui(self) -> None:
         """換語言後就地重建介面文字，不重啟程式。
@@ -1004,6 +1158,10 @@ class MainWindow(QMainWindow):
         self._add_action(midi_sub, t('action_open_midi_right'), lambda: self._open_midi_hand(0))
         self._add_action(midi_sub, t('action_open_midi_left'),  lambda: self._open_midi_hand(1))
         self._add_action(midi_sub, t('action_open_midi_overlay'), self._open_midi_overlay)
+        # 音檔 → MIDI（ByteDance 鋼琴轉譜模型），轉完走一般的 MIDI 匯入
+        ai_sub = file_m.addMenu('AI 轉譜（音檔 → 譜面）')
+        self._add_action(ai_sub, '從音檔轉譜…', self.transcribe_audio_ai)
+        self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe)
         file_m.addSeparator()
         self._add_action(file_m, t('action_save'), self.save_file, QKeySequence.Save)
         self._add_action(file_m, t('action_save_as'), self.save_file_as, 'Ctrl+Shift+S')
@@ -1012,12 +1170,16 @@ class MainWindow(QMainWindow):
         self._add_action(file_m, t('action_save_xml_midi_restore'), self.save_as_xml_midi_restore)
         self._add_action(file_m, '匯出 MIDI…', self.export_midi_file)
         self._add_action(file_m, t('action_export_song'), self.export_song)
+        self._add_action(file_m, '輸出 Hiraeth 歌曲包（ZIP）…', self.export_hiraeth_packages)
         file_m.addSeparator()
         self._add_action(file_m, t('action_quit'), self.close, QKeySequence.Quit)
 
         # ── 編輯 ──────────────────────────────────────────────────────
         edit_m = mb.addMenu(t('menu_edit'))
         self._add_action(edit_m, t('action_undo'), lambda: self.view.undo(), QKeySequence.Undo)
+        redo_act = self._add_action(edit_m, t('action_redo'), lambda: self.view.redo())
+        # 兩種習慣都收：Ctrl+Y（Windows 慣例）與 Ctrl+Shift+Z（Photoshop／DAW 慣例）
+        redo_act.setShortcuts([QKeySequence('Ctrl+Y'), QKeySequence('Ctrl+Shift+Z')])
         edit_m.addSeparator()
         self._add_action(edit_m, t('action_select_all'), lambda: self.view.select_all(), QKeySequence.SelectAll)
         self._add_action(edit_m, t('action_deselect'), lambda: self.view.deselect_all())
@@ -1032,13 +1194,17 @@ class MainWindow(QMainWindow):
         # 寬度
         self._add_action(edit_m, t('action_width2'), lambda: self.view.set_width_selected(2))
         self._add_action(edit_m, t('action_width3'), lambda: self.view.set_width_selected(3))
+        self._add_action(edit_m, '鍵寬 2 / 3 切換', self._shortcut_toggle_width)
         edit_m.addSeparator()
 
         # ── 音符類型（直接展開，不再藏子選單）
         self._add_action(edit_m, t('action_type_tap'), lambda: self.view.set_type_selected(0))
-        self._add_action(edit_m, t('action_type_soft'), lambda: self.view.set_type_selected(1))
+        self._register_pan_gated(self._add_action(
+            edit_m, t('action_type_soft'), lambda: self.view.set_type_selected(1)))
         self._add_action(edit_m, t('action_type_long'), lambda: self.view.set_type_selected(2))
-        self._add_action(edit_m, t('action_type_staccato'), lambda: self.view.set_type_selected(3))
+        self._register_pan_gated(self._add_action(
+            edit_m, t('action_type_staccato'), lambda: self.view.set_type_selected(3)))
+        self._add_action(edit_m, '點擊 / 長條切換', self._shortcut_toggle_tap_hold)
         edit_m.addSeparator()
 
         # ── 左右手（直接展開）
@@ -1161,13 +1327,16 @@ class MainWindow(QMainWindow):
         view_m.addSeparator()
         scale_m = view_m.addMenu('調性輔助（音高模式）')
         scale_m.setToolTipsVisible(True)
+        # 這一項現在是「音高欄位分色」下拉的其中一個選項（偏好設定 → 顯示）。
+        # 選單留著當快捷開關：勾起來 = 調性分色，取消 = 回到黑白鍵分色。
         self._act_scale_hl = QAction('調性高亮', self, checkable=True)
-        self._act_scale_hl.setChecked(bool(settings.get('pitch_scale_highlight', True)))
+        self._act_scale_hl.setChecked(
+            str(settings.get('pitch_column_mode', 'blackwhite')) == 'scale')
         self._act_scale_hl.setToolTip(
             '調內的音格鋪一層淡底、主音再亮一點，調外的琴鍵壓暗。\n'
-            '調性取自「編輯」分頁的調性下拉（自動偵測或自己指定）。')
+            '取消勾選會回到黑白鍵分色。調性取自「編輯」分頁的調性下拉。')
         self._act_scale_hl.toggled.connect(
-            lambda on: self._set_velocity_display('pitch_scale_highlight', on))
+            lambda on: self._set_pitch_column_mode('scale' if on else 'blackwhite'))
         scale_m.addAction(self._act_scale_hl)
 
         self._act_scale_lock = QAction('鎖調：只放得下調內音', self, checkable=True)
@@ -1226,7 +1395,31 @@ class MainWindow(QMainWindow):
             (self._tool_label('action_set_measure_time_signature', '修改小節拍號…'),
              self.set_measure_time_sig_dialog,
              '修改目前視窗中央所在小節的拍號。整首的總拍號請用 工具 → 樂曲總資訊'),
+            ('事件（速度／音效）…', self.edit_events_dialog,
+             '編輯譜面事件：速度變化（BPM）、殘響／回音／EQ 參數、區段標記。\n'
+             'PAN 靠速度事件知道速度；JSON 與 XML 都會存。'),
         ]
+
+    def edit_events_dialog(self) -> None:
+        """開事件編輯。按確定才寫進譜面（可以復原）。"""
+        from .event_dialog import EventEditorDialog
+        m = self.view.model
+        if not m.has_chart():
+            QMessageBox.warning(self, t('dlg_warn'), t('status_need_chart'))
+            return
+        dlg = EventEditorDialog(self, m, current_ms=self.view.judge_line_view_ms(),
+                                jump=self._jump_to_ms)
+        if dlg.exec_() != EventEditorDialog.Accepted:
+            return
+        events = dlg.events()
+        if events == m.sorted_events():
+            return
+        m.push_history()
+        m.events = events
+        m.dirty = True
+        self.view.note_edited.emit()
+        self._refresh_title()
+        self.statusBar().showMessage('已更新 %d 個事件' % len(events), 3000)
 
     def _tool_groups(self):
         """工具的分類表。選單與工具列「工具」分頁共用同一份，不會兩邊走味。
@@ -1246,14 +1439,24 @@ class MainWindow(QMainWindow):
                 (self._tool_label('action_hold_length_fix', '長押長度修整…'),
                  self.hold_length_fix_dialog),
                 ('移除重複音符（同 start/pitch）…', self.remove_duplicate_start_pitch_dialog),
+                ('取消整份譜面的隱藏音符…', self.unhide_all_dialog),
+            ]),
+            ('難度', [
+                # 預設走這條：直接寫進樂曲資料夾，生完進遊戲就看得到。
+                ('生成其他難度到樂曲資料夾…', self.generate_into_song_folder),
+                # 舊的那條留著：來源不在樂曲資料夾裡（例如剛轉好還沒歸檔的
+                # 譜）時還是要有辦法生。
+                ('生成難度成獨立檔案…', self.generate_difficulties_dialog),
+                ('掃描曲庫，補齊缺少的難度…', self.fill_library_difficulties),
             ]),
             ('樂曲總資訊', [
                 ('調整樂曲總資訊（BPM / 總拍號 / 整體位移）…', self.song_info_dialog),
             ]),
-            ('以 MIDI 重建修復', [
-                (t('action_align_reference_midi'), self.align_reference_midi_dialog),
+            ('以 MIDI 修復', [
+                ('從 MIDI 還原音高與表情（力度／踏板）…',
+                 self.restore_from_midi_dialog),
                 (t('action_conform_beats_midi'), self.conform_beats_to_midi_dialog),
-                (t('action_apply_midi_expression'), self.apply_midi_expression),
+                (t('action_align_reference_midi'), self.align_reference_midi_dialog),
             ]),
             ('延音踏板', [
                 ('依和聲生成踏板…', self.generate_pedal_dialog),
@@ -1274,12 +1477,17 @@ class MainWindow(QMainWindow):
         label = t(key)
         return fallback if label == key else label
 
-    def _add_action(self, menu, label: str, slot, shortcut=None) -> QAction:
+    def _add_action(self, menu, label: str, slot, shortcut=None, keys=None) -> QAction:
         act = QAction(label, self)
         if shortcut is not None:
             act.setShortcut(QKeySequence(shortcut) if isinstance(shortcut, str) else shortcut)
         act.triggered.connect(slot)
         menu.addAction(act)
+        self._register_pan_gated(act, slot or '')
+        if shortcut is None:
+            # 自己沒綁快捷鍵的選單項目（綁了的 Qt 會自己畫在右邊），看看偏好設定
+            # 裡有沒有人綁到同一個動作
+            self._label_shortcut(act, label, act.toolTip(), keys or slot, 'menu')
         return act
 
     # ==================================================================
@@ -1504,11 +1712,16 @@ class MainWindow(QMainWindow):
         return btn
 
     def _tab_action(self, tbs: ToolbarSet, label: str, slot, tip: str = '',
-                    checkable: bool = False) -> QAction:
-        """建立分頁上的動作。動作掛在這條工具列底下，工具列被刪就一起走。"""
+                    checkable: bool = False, keys=None) -> QAction:
+        """建立分頁上的動作。動作掛在這條工具列底下，工具列被刪就一起走。
+
+        `keys`：這顆按鈕對應哪個快捷鍵動作（函式名）。不給的話拿 slot 的函式名；
+        slot 是 lambda 時要自己給。
+        """
         act = QAction(label, tbs.root, checkable=checkable)
         if tip:
             act.setToolTip(tip)
+        self._label_shortcut(act, label, tip, keys or slot, 'button')
         # checkable 走 toggled（要 checked 旗標）；其餘走 triggered（不收參數）
         bound = self._bind(tbs, slot, forward=checkable)
         if checkable:
@@ -1547,7 +1760,8 @@ class MainWindow(QMainWindow):
 
         tbs.dur_combo = make_combo(
             [name for name, _ in self._note_dur_items], 88, self._ni_dur_idx,
-            '音符時值（放置音符模式下生效）', self._on_dur_combo_changed)
+            '音符時值（放置音符模式下生效）。最後一項「自訂…」可以輸入任意 N 分音符',
+            self._on_dur_combo_changed)
         tbs.hand_combo = make_combo(
             [t('tb_note_hand_r'), t('tb_note_hand_l')], 56, self._ni_hand_idx,
             '放置音符的預設手', self._on_hand_combo_changed)
@@ -1560,6 +1774,41 @@ class MainWindow(QMainWindow):
             '放置音符的預設類型', self._on_type_combo_changed)
         # 下拉索引 → note_type（trill 不是連號，需明確對照）
         self._type_combo_values = [0, 1, 2, 3, 4, 64]
+        # 選單上直接看得到每種音符長什麼樣（遊戲素材，顏色跟著放置的手）
+        from PyQt5.QtCore import QSize
+        from .note_icons import (VALUE_ICON_H, VALUE_ICON_W, hand_icon,
+                                 note_value_icon)
+        # 工具列上縮小一點（原圖 42x30），不然整條工具列會被撐高
+        icon_w, icon_h = 28, 20
+        for combo in (tbs.type_combo, tbs.hand_combo):
+            combo.setIconSize(QSize(icon_w, icon_h))
+        # 時值選單：每一項前面畫出音符符號（三連音左上角標 3）
+        value_h = icon_h
+        value_w = int(round(VALUE_ICON_W * value_h / float(VALUE_ICON_H)))
+        tbs.dur_combo.setIconSize(QSize(value_w, value_h))
+        self._fill_dur_combo(tbs.dur_combo)
+        for i in range(tbs.hand_combo.count()):
+            tbs.hand_combo.setItemIcon(i, hand_icon(i))
+        self._refresh_type_icons(tbs)
+        # 量寬度時要把圖示算進去，不然文字會被擠掉
+        for combo, floor in ((tbs.type_combo, 120), (tbs.hand_combo, 56)):
+            self._fit_combo(combo, floor + icon_w + 6)
+
+        # 下拉框本身的文字是選項，快捷鍵寫進提示
+        self._label_shortcut(tbs.dur_combo, '', tbs.dur_combo.toolTip(),
+                             ('_shortcut_dur_shorter', '_shortcut_dur_longer'), 'tooltip')
+        self._label_shortcut(tbs.hand_combo, '', tbs.hand_combo.toolTip(),
+                             '_shortcut_toggle_hand', 'tooltip')
+
+        # 格線配置：不屬於放置參數（沒開放置模式也能看格線），所以不放進變灰的那組
+        tbs.grid_btn = QToolButton(tbs.root)
+        tbs.grid_btn.setText('格線 ▾')
+        tbs.grid_btn.setPopupMode(QToolButton.InstantPopup)
+        tbs.grid_btn.setToolTip('格線配置：跟著放置時值，或自己搭幾層（例如 4 分＋16 分），'
+                                '也可以加自訂 N 分音符')
+        grid_menu = QMenu(tbs.grid_btn)
+        grid_menu.aboutToShow.connect(lambda m=grid_menu: self._fill_grid_menu(m))
+        tbs.grid_btn.setMenu(grid_menu)
 
         # 放置模式沒開時參數變灰（不隱藏，免得每次切換整條工具列跳位）
         tbs.note_input_group = [
@@ -1593,6 +1842,10 @@ class MainWindow(QMainWindow):
         tbs.pattern_step_combo = make_combo(
             [label for label, _v in self._pattern_steps], 92,
             self._pat_step_idx, '每音間隔', self._on_pattern_step_changed)
+        tbs.pattern_step_combo.setIconSize(tbs.dur_combo.iconSize())
+        for i, (_label, beats) in enumerate(self._pattern_steps):
+            tbs.pattern_step_combo.setItemIcon(i, note_value_icon(beats))
+        self._fit_combo(tbs.pattern_step_combo, 92 + tbs.dur_combo.iconSize().width() + 6)
         tbs.pattern_key_combo = make_combo(
             [label for label, _v in self._pattern_keys], 96,
             self._pat_key_idx, '調性（自動＝從譜面音高偵測）',
@@ -1607,7 +1860,8 @@ class MainWindow(QMainWindow):
         self._on_pattern_key_changed(self._pat_key_idx)
 
         auto_sort = self._tab_action(
-            tbs, t('tb_auto_sort'), lambda: self.view.start_alloc_section())
+            tbs, t('tb_auto_sort'), lambda: self.view.start_alloc_section(),
+            keys='start_alloc_section')
 
         # ── 手別篩選：只編一隻手，另一手變成參考影子 ──────────────
         tbs.hand_filter_combo = make_combo(
@@ -1622,6 +1876,7 @@ class MainWindow(QMainWindow):
             None,
             self._tab_button(tbs.note_input_act),
             tbs.dur_combo, tbs.hand_combo, tbs.width_combo, tbs.type_combo,
+            tbs.grid_btn,
             None,
             self._tab_button(tbs.pattern_act),
             tbs.pattern_kind_combo, tbs.pattern_dir_combo,
@@ -1648,10 +1903,9 @@ class MainWindow(QMainWindow):
         tbs.hit_act.setChecked(bool(self._hit_sound_persistent))
         tbs.hit_act.blockSignals(False)
 
+        # 「開頭空白」取代舊的播放偏移：直接加／減音訊開頭的靜音（見 audio_lead_in）
         offset_act = self._tab_action(
-            tbs, t('tb_offset'), self._show_offset_dialog, tip=t('tb_offset_tip'))
-        tbs.offset_label = QLabel(self._offset_label_text(), tbs.root)
-        tbs.offset_label.setStyleSheet('font-size: 11px; margin: 0 4px;')
+            tbs, t('tb_offset'), self._show_lead_in_dialog, tip=t('tb_offset_tip'))
 
         return self._tab_page([
             self._tab_button(act_play_full),
@@ -1662,7 +1916,6 @@ class MainWindow(QMainWindow):
             self._tab_button(tbs.hit_act),
             None,
             self._tab_button(offset_act),
-            tbs.offset_label,
         ])
 
     # ── 分頁：小節 ────────────────────────────────────────────────────
@@ -1673,7 +1926,7 @@ class MainWindow(QMainWindow):
         entries = self._measure_entries()
         widgets = []
         for i, (label, slot, tip) in enumerate(entries):
-            if i == 2:
+            if i in (2, 5):
                 widgets.append(None)
             widgets.append(self._tab_button(
                 self._tab_action(tbs, label, slot, tip=tip)))
@@ -1696,6 +1949,8 @@ class MainWindow(QMainWindow):
         for item_label, slot in entries:
             act = menu.addAction(item_label)
             act.triggered.connect(self._bind(tbs, slot, forward=False))
+            self._register_pan_gated(act, slot)
+            self._label_shortcut(act, item_label, '', slot, 'menu')
         btn.setMenu(menu)
         # QToolButton 不持有 menu 的所有權，menu 被 GC 掉按鈕就變成點不開
         tbs.tool_menus.append(menu)
@@ -1714,17 +1969,15 @@ class MainWindow(QMainWindow):
 
     def _build_tab_view(self, tbs: ToolbarSet) -> QWidget:
         split_block = self._build_split_block(tbs)
-        act_zoom_out = self._tab_action(tbs, t('tb_zoom_out'), lambda: self.view.zoom(2.0))
-        act_zoom_in  = self._tab_action(tbs, t('tb_zoom_in'),  lambda: self.view.zoom(0.5))
+        act_zoom_out = self._tab_action(tbs, t('tb_zoom_out'), lambda: self.view.zoom(2.0),
+                                        keys='zoom_out')
+        act_zoom_in  = self._tab_action(tbs, t('tb_zoom_in'),  lambda: self.view.zoom(0.5),
+                                        keys='zoom_in')
 
-        try:
-            tip_text = t('tb_preview_tip') + ' (Tab)'
-        except Exception:
-            tip_text = t('tb_preview_tip')
         tbs.preview_act = self._tab_action(
-            tbs, t('tb_preview') + ' (Tab)',
+            tbs, t('tb_preview'),
             lambda checked: self.view.toggle_preview_mode(checked),
-            tip=tip_text, checkable=True)
+            tip=t('tb_preview_tip'), checkable=True, keys='toggle_preview')
 
         tbs.view_mode_act = self._tab_action(
             tbs, t('tb_time_uniform_measure'), self._cycle_view_mode,
@@ -1865,7 +2118,19 @@ class MainWindow(QMainWindow):
             callback(val)
         slider.valueChanged.connect(_on_change)
 
-        if action is None:
+        mirror = None
+        if action is not None:
+            # 共用的開關（MIDI 鋼琴）另外給喇叭一個自己的 QAction，兩邊互相跟隨。
+            # 直接 setDefaultAction 共用的話，兩顆按鈕只能顯示同一段文字：不是
+            # 分頁上的「MIDI 鋼琴」變成 🔊，就是這顆 26px 的喇叭被擠成「MIDI」。
+            mirror = action
+            action = QAction(tbs.root, checkable=True)
+            action.blockSignals(True)
+            action.setChecked(mirror.isChecked())
+            action.blockSignals(False)
+            action.toggled.connect(
+                lambda on, src=mirror: src.isChecked() != on and src.setChecked(on))
+        else:
             action = QAction(tbs.root, checkable=True)
             action.blockSignals(True)
             action.setChecked(bool(self._vol_enabled.get(key, True)))
@@ -1888,6 +2153,7 @@ class MainWindow(QMainWindow):
         hbox.addWidget(button)
         tbs.vol[key] = {
             'label': lbl, 'slider': slider, 'action': action, 'text': label_text,
+            'mirror': mirror,
         }
         return row
 
@@ -1942,6 +2208,11 @@ class MainWindow(QMainWindow):
                 if ent is None:
                     continue
                 action = ent['action']
+                mirror = ent.get('mirror')
+                if mirror is not None and action.isChecked() != mirror.isChecked():
+                    action.blockSignals(True)
+                    action.setChecked(mirror.isChecked())
+                    action.blockSignals(False)
                 usable = available[key]
                 on = bool(action.isChecked()) and usable
                 action.setText('🔊' if on else '🔇')
@@ -2007,7 +2278,8 @@ class MainWindow(QMainWindow):
         m = self.view.model
         fname = os.path.basename(m.current_file) if m.current_file else t('wnd_no_file')
         dirty = ' *' if m.dirty else ''
-        self.setWindowTitle(f"{t('wnd_title')}  —  {fname}{dirty}")
+        mode = '　[XML・PAN 相容模式]' if getattr(m, 'pan_xml', False) else ''
+        self.setWindowTitle(f"{t('wnd_title')}  —  {fname}{dirty}{mode}")
 
     def _set_pitch_numbering(self, use_midi: bool, save: bool = True) -> None:
         """切換音高數字要顯示遊戲編號還是 MIDI 編號（只影響標籤，不動內部值）。"""
@@ -2055,12 +2327,27 @@ class MainWindow(QMainWindow):
         src = self.sender()
         if isinstance(src, ChartView) and src not in self._panes:
             return
+        self._sync_place_grid_peers()
         self._sync_toolbars()
+
+    def _sync_place_grid_peers(self) -> None:
+        """放置格線要在兩格都畫出來。
+
+        放置模式本身是單格的（工具列固定操作某一格），但格線是給眼睛看的
+        參考線——另一格顯示同一段音樂時也該看得到落點。這裡只把「有人在放置」
+        傳過去，不打開另一格的放置模式，免得點下去誤放音符。
+        """
+        any_placing = any(getattr(v, '_note_input_mode', False)
+                          for v in self._panes)
+        for v in self._panes:
+            v.set_peer_placement(
+                any_placing and not getattr(v, '_note_input_mode', False))
 
     def _set_note_input_mode(self, on: bool) -> None:
         """程式內部（載入譜面等）切換放置模式，不經過工具列按鈕的 toggled。"""
         for v in self._panes:
             v.set_note_input_mode(bool(on))
+        self._sync_place_grid_peers()
         self._sync_toolbars()
 
     def _apply_note_input_settings(self, v: ChartView) -> None:
@@ -2088,8 +2375,202 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(idx)
             combo.blockSignals(False)
 
+    #: 自訂 N 分音符最多記幾個（最近用的留著）
+    _MAX_CUSTOM_DIVISIONS = 8
+    _CUSTOM_DUR_LABEL = '自訂…'
+
+    def _insert_custom_duration(self, division) -> Optional[int]:
+        """把「N 分音符」加進時值清單（照長短排好），回傳它的位置。已經有就回傳那一項。"""
+        try:
+            n = int(division)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= n <= 256:
+            return None
+        beats = 4.0 / n
+        for i, (_name, value) in enumerate(self._note_dur_items):
+            if abs(value - beats) < 1e-9:
+                return i
+        name = '%d分音符' % n
+        pos = next((i for i, (_nm, value) in enumerate(self._note_dur_items) if value < beats),
+                   len(self._note_dur_items))
+        self._note_dur_items.insert(pos, (name, beats))
+        power = 1
+        while power * 2 <= n:
+            power *= 2
+        base = {1: '全音符', 2: '二分音符', 4: '四分音符', 8: '八分音符'}.get(power, '%d分音符' % power)
+        odd = n
+        while odd % 2 == 0:
+            odd //= 2
+        if odd == 1:
+            tip = '自訂：一個全音符分成 %d 份' % n
+        else:
+            space = 1
+            while space * 2 <= odd:
+                space *= 2
+            tip = '自訂：一個全音符分成 %d 份（%s的 %d 連音：%d 顆佔 %d 顆的長度）' % (
+                n, base, odd, odd, space)
+        self._note_dur_tips[name] = tip
+        return pos
+
+    def _fill_dur_combo(self, combo) -> None:
+        """照 `_note_dur_items` 重建時值下拉：名稱、音符圖示、說明，最後接「自訂…」。"""
+        from .note_icons import note_value_icon
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for name, beats in self._note_dur_items:
+                combo.addItem(note_value_icon(beats), name)
+                tip = self._note_dur_tips.get(name)
+                if tip:
+                    combo.setItemData(combo.count() - 1, tip, Qt.ToolTipRole)
+            combo.addItem(self._CUSTOM_DUR_LABEL)
+            combo.setItemData(combo.count() - 1,
+                              '輸入一個數字 N：一個全音符分成 N 份（例如 20 = 五連 16 分音符）',
+                              Qt.ToolTipRole)
+            combo.setCurrentIndex(max(0, min(self._ni_dur_idx, len(self._note_dur_items) - 1)))
+        finally:
+            combo.blockSignals(False)
+        self._fit_combo(combo, 88 + combo.iconSize().width() + 6)
+
+    def _ask_custom_duration(self) -> None:
+        """選了「自訂…」：問 N，加進清單並選它；取消就回到原本那一項。"""
+        n, ok = QInputDialog.getInt(
+            self, '自訂音符時值',
+            '一個全音符分成幾份？\n\n'
+            '例：5 = 五連四分音符、20 = 五連 16 分音符、96 = 64 分三連音',
+            16, 1, 256, 1)
+        if not ok:
+            for tbs in self._toolbars:
+                combo = getattr(tbs, 'dur_combo', None)
+                if combo is not None:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(self._ni_dur_idx)
+                    combo.blockSignals(False)
+            return
+        self._select_custom_duration(n)
+
+    def _select_custom_duration(self, n: int) -> None:
+        current_beats = self._note_dur_items[self._ni_dur_idx][1]
+        pos = self._insert_custom_duration(n)
+        if pos is None:
+            return
+        beats = self._note_dur_items[pos][1]
+        # 插入一項之後，原本選的那一項位置可能往後移了
+        self._ni_dur_idx = next(i for i, (_nm, v) in enumerate(self._note_dur_items)
+                                if abs(v - current_beats) < 1e-9)
+        standard = {4.0 / d for d in (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64)}
+        if not any(abs(beats - s) < 1e-9 for s in standard):
+            saved = [int(x) for x in settings.get('custom_note_divisions', []) or []
+                     if int(x) != int(n)]
+            saved = (saved + [int(n)])[-self._MAX_CUSTOM_DIVISIONS:]
+            settings.set('custom_note_divisions', saved)
+        for tbs in self._toolbars:
+            combo = getattr(tbs, 'dur_combo', None)
+            if combo is not None:
+                self._fill_dur_combo(combo)
+        self._on_dur_combo_changed(pos)
+        self.statusBar().showMessage('放置時值：%s' % self._note_dur_items[pos][0], 2000)
+
+    # ── 格線配置 ─────────────────────────────────────────────────────
+
+    #: 格線選單列出的 N 分音符（和放置時值同一套），自訂的另外接在後面
+    _GRID_STANDARD = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64)
+    _GRID_NAMES = {1: '全音符', 2: '二分音符', 4: '四分音符', 6: '6分音符（四分三連）',
+                   8: '八分音符', 12: '12分音符（八分三連）', 16: '16分音符',
+                   24: '24分音符（16分三連）', 32: '32分音符', 48: '48分音符', 64: '64分音符'}
+    _GRID_MODES = (('placement', '只在放置模式時顯示'), ('always', '一直顯示'),
+                   ('never', '不顯示'))
+
+    def _grid_divisions(self) -> List[int]:
+        out = []
+        for n in settings.get('grid_divisions', []) or []:
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= n <= 256 and n not in out:
+                out.append(n)
+        return out
+
+    def _fill_grid_menu(self, menu: QMenu) -> None:
+        """每次打開才重建：勾選狀態、自訂的 N 分音符都是當下的設定。"""
+        from .note_icons import note_value_icon
+        menu.clear()
+        follow = menu.addAction('跟著放置時值')
+        follow.setCheckable(True)
+        follow.setChecked(bool(settings.get('grid_follow_placement', True)))
+        follow.setToolTip('放置模式選幾分音符，就多畫那一層（原本的放置格線）')
+        follow.toggled.connect(lambda on: self._set_grid_follow(on))
+        menu.addSeparator()
+
+        chosen = self._grid_divisions()
+        extra = sorted({int(n) for n in (settings.get('custom_note_divisions', []) or [])
+                        if str(n).isdigit()} | set(chosen) - set(self._GRID_STANDARD))
+        for n in list(self._GRID_STANDARD) + extra:
+            act = menu.addAction(note_value_icon(4.0 / n),
+                                 self._GRID_NAMES.get(n, '%d分音符' % n))
+            act.setCheckable(True)
+            act.setChecked(n in chosen)
+            act.toggled.connect(lambda on, value=n: self._toggle_grid_division(value, on))
+        menu.addSeparator()
+        menu.addAction('自訂 N 分音符…', self._ask_grid_division)
+        clear = menu.addAction('清除自己勾的格線', self._clear_grid_divisions)
+        clear.setEnabled(bool(chosen))
+        menu.addSeparator()
+
+        from PyQt5.QtWidgets import QActionGroup
+        current = str(settings.get('place_grid_mode', 'placement'))
+        group = QActionGroup(menu)
+        for value, label in self._GRID_MODES:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(current == value)
+            group.addAction(act)
+            act.triggered.connect(lambda _c=False, v=value: self._set_grid_mode(v))
+
+    def _refresh_grid(self) -> None:
+        for view in self._panes:
+            view.update()
+
+    def _set_grid_follow(self, on: bool) -> None:
+        settings.set('grid_follow_placement', bool(on))
+        self._refresh_grid()
+
+    def _set_grid_mode(self, mode: str) -> None:
+        settings.set('place_grid_mode', mode)
+        self._refresh_grid()
+
+    def _toggle_grid_division(self, n: int, on: bool) -> None:
+        chosen = [d for d in self._grid_divisions() if d != int(n)]
+        if on:
+            chosen.append(int(n))
+        chosen.sort()
+        settings.set('grid_divisions', chosen)
+        # 自己勾了格線卻因為「只在放置模式時顯示」而看不到，會以為沒作用
+        if on and str(settings.get('place_grid_mode', 'placement')) == 'placement' \
+                and not any(getattr(v, '_note_input_mode', False) for v in self._panes):
+            settings.set('place_grid_mode', 'always')
+            self.statusBar().showMessage('格線改成一直顯示（不用開放置模式也看得到）', 3000)
+        self._refresh_grid()
+
+    def _ask_grid_division(self) -> None:
+        n, ok = QInputDialog.getInt(
+            self, '自訂格線',
+            '一個全音符分成幾份？\n\n例：5 = 五連四分音符、20 = 五連 16 分音符、96 = 64 分三連音',
+            16, 1, 256, 1)
+        if ok:
+            self._toggle_grid_division(int(n), True)
+
+    def _clear_grid_divisions(self) -> None:
+        settings.set('grid_divisions', [])
+        self._refresh_grid()
+
     def _on_dur_combo_changed(self, idx: int) -> None:
         """音符時值下拉選單改變。"""
+        if idx == len(self._note_dur_items):
+            self._ask_custom_duration()
+            return
         if 0 <= idx < len(self._note_dur_items):
             self._ni_dur_idx = idx
             self._mirror_combos('dur_combo', idx)
@@ -2104,6 +2585,18 @@ class MainWindow(QMainWindow):
             self._mirror_combos('hand_combo', idx)
             for v in self._panes:
                 v.set_note_input_hand(idx)
+            for tbs in getattr(self, '_toolbars', ()):
+                self._refresh_type_icons(tbs)
+
+    def _refresh_type_icons(self, tbs) -> None:
+        """類型選單的圖示換成目前這隻手的顏色（右紅、左藍）。"""
+        combo = getattr(tbs, 'type_combo', None)
+        values = getattr(self, '_type_combo_values', None)
+        if combo is None or not values:
+            return
+        from .note_icons import note_type_icon
+        for i, nt in enumerate(values[:combo.count()]):
+            combo.setItemIcon(i, note_type_icon(nt, self._ni_hand_idx))
 
     def _on_width_combo_changed(self, idx: int) -> None:
         """放置寬度下拉選單改變。"""
@@ -2229,7 +2722,7 @@ class MainWindow(QMainWindow):
         m.push_history()
         try:
             if not m.insert_measure(measure_idx, bpm):
-                m.undo_stack.pop()
+                m.discard_last_history()
                 m.dirty = was_dirty
                 QMessageBox.warning(self, t('dlg_warn'), '無法插入小節。')
                 return
@@ -2388,6 +2881,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
 
+    # 「同 BPM」的容許誤差：實際量出來的每小節 BPM 會抖大約 0.5
+    _SAME_BPM_TOLERANCE = 0.5
+
     def change_measures_bpm_dialog(self) -> None:
         """設定多個小節的 BPM（指定起始小節與結束小節，以 1-based 輸入）。"""
         m = self.view.model
@@ -2397,7 +2893,7 @@ class MainWindow(QMainWindow):
         total_measures = max(1, m.count_measures())
         from PyQt5.QtWidgets import (
             QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QDialogButtonBox,
-            QVBoxLayout, QHBoxLayout, QRadioButton, QLabel, QCheckBox
+            QVBoxLayout, QHBoxLayout, QRadioButton, QLabel, QCheckBox, QPushButton
         )
 
         dlg = QDialog(self)
@@ -2413,6 +2909,33 @@ class MainWindow(QMainWindow):
         end_spin.setValue(min(1 + 4, total_measures))
         form.addRow('起始小節 (1-based):', start_spin)
         form.addRow('結束小節 (1-based):', end_spin)
+        end_row = QHBoxLayout()
+        to_last_btn = QPushButton('到最後一小節')
+        to_last_btn.setToolTip(f'結束小節設為第 {total_measures} 小節')
+        same_bpm_btn = QPushButton('到同 BPM 的最後一小節')
+        same_bpm_btn.setToolTip(
+            f'從起始小節往後找，整段 BPM 都落在同一個 ±{self._SAME_BPM_TOLERANCE:g} 範圍內就算同一段'
+            '（實際 BPM 會小幅抖動）')
+        end_row.addWidget(to_last_btn)
+        end_row.addWidget(same_bpm_btn)
+        end_row.addStretch(1)
+        form.addRow('', end_row)
+        run_label = QLabel('')
+        run_label.setStyleSheet('color: gray;')
+        form.addRow('', run_label)
+
+        def jump_to_last() -> None:
+            end_spin.setValue(total_measures)
+            run_label.setText('')
+
+        def jump_to_same_bpm() -> None:
+            first = int(start_spin.value())
+            last_idx, mean = m.same_bpm_run(first - 1, self._SAME_BPM_TOLERANCE)
+            end_spin.setValue(last_idx + 1)
+            run_label.setText(f'第 {first}–{last_idx + 1} 小節，平均 BPM {mean:.2f}')
+
+        to_last_btn.clicked.connect(lambda _checked=False: jump_to_last())
+        same_bpm_btn.clicked.connect(lambda _checked=False: jump_to_same_bpm())
 
         bpm_spin = QDoubleSpinBox()
         cur_bpm = m.bpm if getattr(m, 'bpm', 0) else 120.0
@@ -2452,6 +2975,18 @@ class MainWindow(QMainWindow):
         note_group = QButtonGroup(dlg)
         note_group.addButton(rb_adjust_notes)
         note_group.addButton(rb_keep_notes)
+        # 不調整音符時：從段落開頭做很小的縮放，讓音符對上新的小節線（見 bpm_snap）
+        snap_chk = QCheckBox('吸附小節線')
+        snap_chk.setToolTip(
+            '音符保持原本的速度，只做很小的縮放（最多 ±8%）去對上新的小節線：\n'
+            '・先找讓音符最貼合新拍格的比例（適合 BPM 原本設錯的情況）\n'
+            '・找不到的話，至少讓這段結尾剛好落在整數小節上\n'
+            '不會像「調整音符」那樣整段變慢／變快。')
+        snap_row = QHBoxLayout()
+        snap_row.addSpacing(24)
+        snap_row.addWidget(snap_chk)
+        snap_row.addStretch(1)
+        vbox.addLayout(snap_row)
 
         rearrange_label = QLabel('小節內音符重排方式（拍號變更時）：')
         vbox.addWidget(rearrange_label)
@@ -2485,6 +3020,7 @@ class MainWindow(QMainWindow):
                 wdg.setVisible(show)
                 wdg.setEnabled(on)
             ts_hint.setVisible(not on)
+            snap_chk.setVisible(not show)
         apply_ts_chk.toggled.connect(sync_ts_enabled)
         rb_adjust_notes.toggled.connect(sync_ts_enabled)
         sync_ts_enabled()
@@ -2510,9 +3046,14 @@ class MainWindow(QMainWindow):
         new_den = int(den_spin.value())
         uniform_choice = bool(rb_uniform.isChecked())
         adjust_notes = bool(rb_adjust_notes.isChecked())
+        snap_bars = (not adjust_notes) and bool(snap_chk.isChecked())
 
         s_idx = start - 1
         e_idx = end - 1
+        # 吸附要用「改之前」這段的起點與長度
+        anchor_ms, _unused = m.get_measure_time_range(s_idx)
+        _unused, old_end_ms = m.get_measure_time_range(e_idx)
+        snap_text = ''
         try:
             m.push_history()
             for mi in range(s_idx, e_idx + 1):
@@ -2527,12 +3068,17 @@ class MainWindow(QMainWindow):
                                                      time_uniform=bool(self.view.time_uniform))
                     except Exception:
                         continue
+            if snap_bars and anchor_ms is not None and old_end_ms is not None:
+                from . import bpm_snap
+                result = bpm_snap.snap(m, s_idx, e_idx, float(anchor_ms), float(old_end_ms))
+                m.rebuild_display_cache()
+                snap_text = '\n\n' + bpm_snap.describe(result)
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.update()
             self._rebuild_hit_times()
             self.view.note_edited.emit()
-            QMessageBox.information(self, '完成', f'已將第 {start} 到第 {end} 小節的 BPM 設為 {bpm:.2f}' + (f'，並修改拍號為 {new_num}/{new_den}' if apply_ts else ''))
+            QMessageBox.information(self, '完成', f'已將第 {start} 到第 {end} 小節的 BPM 設為 {bpm:.2f}' + (f'，並修改拍號為 {new_num}/{new_den}' if apply_ts else '') + snap_text)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
 
@@ -2672,6 +3218,47 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '完成', f'已移除 {before - after} 個重複音符。')
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
+
+    def unhide_all_dialog(self) -> None:
+        """把整份譜面的隱藏音符全部取消隱藏，變回正常音符。
+
+        右鍵已經有針對選取範圍的版本，但隱藏音符**在多數檢視模式下畫不出來**
+        （只有音高模式看得到），要一顆一顆選根本選不到。整份處理才實用。
+
+        取消之後它們會變成真的、要打的音符，譜面的音符數會增加——所以先把
+        數量講清楚再問。
+        """
+        m = self.view.model
+        hidden = [n for n in m.notes_tree if getattr(n, 'hidden', False)]
+        if not hidden:
+            QMessageBox.information(self, '取消隱藏', '這份譜面沒有隱藏音符。')
+            return
+
+        visible = len(m.notes_tree) - len(hidden)
+        reply = QMessageBox.question(
+            self, '取消隱藏',
+            '這份譜面有 %d 顆隱藏音符。\n\n'
+            '取消隱藏之後它們會變成正常音符，玩家要打——'
+            '可打的音符數會從 %d 變成 %d。\n\n要繼續嗎？'
+            % (len(hidden), visible, len(m.notes_tree)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            m.push_history()
+            for note in hidden:
+                note.hidden = False
+            m.rebuild_display_cache()
+            self.view.update()
+            self._rebuild_hit_times()
+            self.view.note_edited.emit()
+            QMessageBox.information(
+                self, '完成', '已取消 %d 顆音符的隱藏。' % len(hidden))
+        except Exception as exc:                # noqa: BLE001
+            logging.exception('unhide_all_dialog failed')
+            QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
 
     # ==================================================================
     # 檔案操作
@@ -2910,8 +3497,134 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
 
+    def transcribe_audio_ai(self) -> None:
+        """音檔 → AI 鋼琴轉譜成 MIDI → 設 BPM／吸附小節線 → 走一般的開 MIDI 流程。
+
+        轉出來的 MIDI 時間軸是音檔本身的時間（固定 120 BPM、沒有拍子資訊）。
+        設了 BPM 的話改寫成 `歌名.ai.<BPM>bpm.mid`，音檔開頭補靜音（`_lead+N.wav`）
+        讓第一小節落在小節線上；mp3 等格式轉譜時已順便解碼成同名 WAV。
+        載入後把那份 WAV 掛成背景音樂，一開就對得上。
+        """
+        from . import ai_transcribe as AT
+        from .ai_transcribe_dialog import ensure_installed, run_transcribe
+
+        if not ensure_installed(self):
+            return
+        start_dir = os.path.dirname(getattr(self.audio, 'audio_path', '') or
+                                    self.view.model.current_file or '')
+        path, _ = QFileDialog.getOpenFileName(
+            self, '選擇要轉譜的音檔', start_dir,
+            '音檔 (*.wav *.flac *.ogg *.mp3);;All files (*)')
+        if not path:
+            return
+        if os.path.isfile(path) and os.path.getsize(path) == 0:
+            QMessageBox.warning(
+                self, 'AI 轉譜',
+                '這個音檔是空的（0 位元組），多半是下載沒有成功，請重新下載：\n\n%s' % path)
+            return
+
+        # 模型只認獨奏鋼琴：挑了整首混音、旁邊卻有鋼琴分軌時建議改用分軌
+        stem, ext = os.path.splitext(path)
+        piano_stem = stem + '_piano' + ext
+        if not stem.lower().endswith('_piano') and os.path.isfile(piano_stem):
+            reply = QMessageBox.question(
+                self, 'AI 轉譜',
+                '同一個資料夾裡有鋼琴分軌：\n\n　%s\n\n模型只認獨奏鋼琴，用分軌轉出來會乾淨很多。'
+                '要改用分軌嗎？' % os.path.basename(piano_stem),
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Yes:
+                path = piano_stem
+
+        out = AT.default_output_path(path)
+        reuse = False
+        if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+            box = QMessageBox(self)
+            box.setWindowTitle('AI 轉譜')
+            box.setText('這個音檔已經轉過了：\n\n　%s\n\n要直接用上次的結果，還是重新轉譜？'
+                        % os.path.basename(out))
+            use_btn = box.addButton('用上次的', QMessageBox.AcceptRole)
+            redo_btn = box.addButton('重新轉譜', QMessageBox.AcceptRole)
+            box.addButton(t('dlg_cancel'), QMessageBox.RejectRole)
+            box.setDefaultButton(use_btn)
+            box.exec_()
+            if box.clickedButton() not in (use_btn, redo_btn):
+                return
+            reuse = box.clickedButton() is use_btn
+
+        summary = ''
+        if not reuse:
+            try:
+                result = run_transcribe(self, path, out)
+            except OSError as exc:              # 音檔旁邊寫不進去之類
+                QMessageBox.critical(self, 'AI 轉譜失敗', str(exc))
+                return
+            if not result:
+                return
+            if not result.get('notes'):
+                QMessageBox.information(self, 'AI 轉譜', '沒有轉出任何音符（音檔裡可能沒有鋼琴聲）。')
+                return
+            summary = '轉出 %d 顆音、%d 段踏板（%s，%.0f 秒）' % (
+                result['notes'], result.get('pedals', 0),
+                'GPU' if result.get('device') == 'cuda' else 'CPU', result.get('elapsed', 0))
+
+        # BPM 與小節線：改寫成指定 BPM 的 MIDI，音檔開頭補靜音讓第一小節對上小節線
+        from . import ai_grid as G
+        from .ai_grid_dialog import AiGridDialog
+
+        grid_dlg = AiGridDialog(self, G.onsets_for_detection(out), os.path.basename(path),
+                                division=int(settings.get('ai_grid_division', 4) or 0))
+        if grid_dlg.exec_() != QDialog.Accepted:
+            return
+        wav = AT.wav_path_for(path)
+        audio_for_editor = wav if os.path.isfile(wav) else ''
+        load_path = out
+        if grid_dlg.enabled():
+            grid = grid_dlg.settings()
+            settings.set('ai_grid_division', grid.division)
+            load_path = G.output_path(out, grid.bpm)
+            stats = G.build(out, load_path, grid)
+            if audio_for_editor and stats.pad_ms:
+                from .audio_lead_in import apply_lead_in
+                audio_for_editor = apply_lead_in(audio_for_editor, stats.pad_ms).path
+            summary = '　'.join(filter(None, [
+                summary, '%.2f BPM，開頭補 %d ms' % (grid.bpm, stats.pad_ms),
+                ('吸附後合併 %d 顆同格同音' % stats.merged) if stats.merged else '']))
+
+        self._load_path(load_path)
+        if os.path.normcase(self.view.model.current_file or '') != os.path.normcase(load_path):
+            return                              # 使用者在排譜詢問那裡取消了
+        if audio_for_editor and self.audio.load_wav(audio_for_editor):
+            self._refresh_vol_rows()
+            self._lbl_audio.setText(t('status_audio_loaded', os.path.basename(audio_for_editor)))
+        if summary:
+            if self.statusBar().isVisible():
+                self.statusBar().showMessage(summary, 15000)
+            else:
+                QMessageBox.information(self, 'AI 轉譜', summary)
+
+    def _manage_ai_transcribe(self) -> None:
+        from .ai_transcribe_dialog import manage_environment
+        manage_environment(self)
+
     def _load_path(self, path: str) -> None:
         ext = os.path.splitext(path)[1].lower()
+        # 這個檔案有比它還新的自動備份：多半是上次改到一半當掉了。
+        try:
+            backup = autosave.find_backup(path)
+        except Exception:                       # noqa: BLE001
+            backup = None
+        if backup is not None:
+            reply = QMessageBox.question(
+                self, '找到自動備份',
+                '這個檔案有一份比較新的自動備份，可能是上次沒存檔就關掉或當掉了：'
+                '\n\n　%s\n\n要還原那份備份嗎？（選「否」就開原本的檔案）'
+                % autosave.describe(backup),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply == QMessageBox.Yes:
+                self._open_backup(backup)
+                return
         try:
             model = NoteModel()
             if ext == '.json':
@@ -2922,7 +3635,15 @@ class MainWindow(QMainWindow):
                     return
             else:
                 model.load_xml(path)
+            self._install_loaded_model(model, path)
+        except Exception as e:
+            QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
+
+    def _install_loaded_model(self, model: NoteModel, path: str) -> None:
+        """把讀好的 model 裝進所有格子並把相關狀態收拾好（開檔與還原備份共用）。"""
+        try:
             self._load_model_all(model)
+            oplog.session(path, model)
             # 選了「不轉換」的 MIDI：直接進音高模式，其他檢視要先轉譜
             if getattr(model, 'midi_unarranged', False):
                 for pane in self._panes:
@@ -2946,35 +3667,65 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._rebuild_hit_times()
+            self._convert_loaded_xml(model)
             self._refresh_title()
         except Exception as e:
             QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
 
+    def _convert_loaded_xml(self, model: NoteModel) -> None:
+        """開的是 XML（PAN 模式），裡面卻有 PAN 沒有的東西（舊版編輯器存的）。
+
+        直接轉換並告訴使用者——留著的話畫面和 PAN 實際讀到的不一樣，例如
+        Staccato 在 PAN 裡是長押。轉換可以復原，也還沒寫回檔案。
+        """
+        if not getattr(model, 'pan_xml', False):
+            return
+        preview = model.pan_conversion_preview()
+        if not preview:
+            return
+        model.push_history()
+        model.convert_to_pan()
+        for pane in self._panes:
+            pane.update()
+        self._apply_format_mode()
+        QMessageBox.information(
+            self, 'XML 相容模式',
+            '這份 XML 裡有 PAN 沒有的東西（多半是舊版編輯器存的），已經先轉換：\n\n%s'
+            '\n\n還沒寫回檔案，不要的話可以按「復原」。想保留完整內容請另存成 JSON。'
+            % '\n'.join('・%s：%d' % item for item in preview.items()))
+
     def save_file(self) -> None:
-        if not self.view.model.current_file:
+        current = self.view.model.current_file
+        # MIDI 存不下鍵道：開 MIDI 進來的譜按 Ctrl+S 走另存新檔（預設 JSON）
+        if not current or current.lower().endswith(('.mid', '.midi')):
             self.save_file_as()
             return
-        self._do_save(self.view.model.current_file)
+        self._do_save(current)
 
     def save_file_as(self) -> None:
+        """另存新檔。預設存 JSON——JSON 是原始檔，XML 是給 PAN 的相容輸出。"""
         m = self.view.model
-        default = m.current_file or ''
-        if not default and hasattr(m, '_song_name') and m._song_name:
-            default = m._song_name + '.xml'
+        current = m.current_file or ''
+        if current.lower().endswith(('.json', '.xml')):
+            default = current
+        elif current:
+            default = os.path.splitext(current)[0] + '.json'
+        else:
+            default = (m._song_name + '.json') if getattr(m, '_song_name', '') else ''
         path, _ = QFileDialog.getSaveFileName(
             self, t('dlg_save_as_title'),
             default,
-            'MIDI (*.mid *.midi);;XML (*.xml);;JSON (*.json)',
+            'JSON（原始檔，完整） (*.json);;XML（PAN 相容） (*.xml);;MIDI (*.mid *.midi)',
         )
         if path:
             if not os.path.splitext(path)[1]:
                 selected_filter = _.lower()
                 if 'midi' in selected_filter:
                     path += '.mid'
-                elif 'json' in selected_filter:
-                    path += '.json'
-                else:
+                elif 'xml' in selected_filter:
                     path += '.xml'
+                else:
+                    path += '.json'
             self._do_save(path)
 
     def save_as_json(self) -> None:
@@ -3041,53 +3792,340 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
 
-    def apply_midi_expression(self) -> None:
-        """拿原始 MIDI 把力度與延音踏板補回目前譜面，排譜成果原封不動。
+    def restore_from_midi_dialog(self) -> None:
+        """從同一份 MIDI 一次把音高和表情（力度／踏板）都還原回來。
 
-        轉譜時被丟掉的就是這兩樣：力度綁在音符上，靠和「套用音高」同一套
-        時間比對抄回來；踏板是 CC64 時間軸事件，整份覆蓋。
+        以前是兩個指令、各選一次檔案。但它們的來源永遠是同一份 MIDI，前提
+        也一樣——音高對不上就別談力度了——分開只是讓人多選一次檔案，還可能
+        不小心選到兩份不同的。
+
+        沒有音高的譜面在「無背景音樂」模式下整首都不會發出聲音（keysound 是
+        照音高發的）；力度和 CC64 延音踏板則是轉譜時被丟掉的兩樣東西。
+
+        兩種偏移都會回報：譜面開頭補過空白造成的**時間平移**，以及 MIDI 是
+        移調版造成的**音高偏移**。後者要特別講出來——照樣覆蓋下去等於把整首
+        移調，畫面上看不出來，只有玩的時候才會發現整首走音。
         """
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            t('dlg_apply_midi_expression_title'),
-            '',
-            'MIDI (*.mid *.midi)',
-        )
+            self, '從 MIDI 還原音高與表情', '', 'MIDI (*.mid *.midi)')
         if not path:
             return
+        model = self.view.model
         try:
+            # 先試算：對不上就什麼都不要動，也不要留一個空的 undo 步驟。
+            preview = model.restore_pitches_from_midi(path, apply=False)
+        except Exception as e:                      # noqa: BLE001
+            logging.exception('restore pitches failed')
+            QMessageBox.critical(self, t('dlg_load_fail_title'),
+                                 t('dlg_load_fail_msg', e))
+            return
+
+        # 用 acceptable 不是 applied：試算永遠沒有寫下去，applied 一定是 False。
+        if not preview.acceptable:
+            QMessageBox.warning(
+                self, '還原音高與表情',
+                '這份 MIDI 和譜面對不起來，沒有做任何改動。\n\n'
+                '對得上的發音點只有 %.0f%%，其中和弦顆數也一致的只有 %.0f%%'
+                '（同一首曲子應該接近 100%%）。\n\n'
+                '確認一下是不是選錯檔案了。'
+                % (preview.match_ratio * 100, preview.chord_agreement * 100))
+            return
+
+        detail = []
+        if preview.by_ordinal:
+            detail.append(
+                '這份 MIDI 和譜面的**時間軸不同**（譜面是固定 BPM、MIDI 有速度圖），\n'
+                '所以改用「發音順序」配對：第 n 個發音點配第 n 個。\n'
+                '兩邊的發音點數差 %.1f%%。'
+                % abs(100.0 - preview.match_ratio * 100))
+        if preview.offset_ms:
+            detail.append('譜面比 MIDI 晚了 %+d ms（開頭補過空白），已自動扣掉。'
+                          % preview.offset_ms)
+        if preview.semitones:
+            direction = '高' if preview.semitones > 0 else '低'
+            gap = abs(preview.semitones)
+            if preview.base_mismatch:
+                # 差超過一個八度不是移調，是音高基準對不上——而譜面那一側
+                # 才是壞的（這個工具本來就是來修它的）。照樣勸退的話，需要
+                # 修的譜面反而永遠修不成。
+                detail.append(
+                    'MIDI 比譜面%s %d 個半音——超過一個八度，那不是移調，是'
+                    '音高基準對不上。\n'
+                    '    譜面現有音高的中位是 %d、MIDI 是 %d；聽起來合理的'
+                    '那一側才是對的，\n'
+                    '    通常就是 MIDI（譜面的音高壞掉正是你要修的東西）。'
+                    % (direction, gap, preview.chart_median,
+                       preview.midi_median))
+            else:
+                detail.append(
+                    '⚠ 這份 MIDI 比譜面%s %d 個半音——是移調版。\n'
+                    '    照樣還原會把整首歌移調，畫面上看不出來，只有實際聽'
+                    '才會發現走音。' % (direction, gap))
+        detail.append('%d 顆音符的音高會被覆蓋，%d 顆配不到參考音符。'
+                      % (preview.changed, preview.unmatched))
+        detail.append('接著會用同一份 MIDI 把力度與延音踏板一起補回來。')
+        answer = QMessageBox.question(
+            self, '還原音高與表情', '\n'.join(detail) + '\n\n要套用嗎？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+            if preview.semitones and not preview.base_mismatch
+            else QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            return
+
+        # 兩步共用一個還原點：使用者眼中這是一個動作，undo 要一次全退。
+        model.push_history()
+        try:
+            result = model.restore_pitches_from_midi(path)
             source_model = NoteModel()
             # 刻意不排譜：力度靠音高配對，鍵道用不到，而排譜正是 MIDI 匯入
             # 裡唯一會跑到數十秒的部分。
             source_model.load_midi(path, auto_arrange=False)
-            current_model = self.view.model
-            current_model.push_history()
-            stats = current_model.apply_midi_expression_from_source(
+            stats = model.apply_midi_expression_from_source(
                 source_model.notes_tree,
                 source_model.pedal_spans,
             )
-            self.view.update()
-            self.view.note_edited.emit()
-            self._refresh_title()
-            pedal_line = (
-                t('dlg_apply_midi_expression_pedal', stats.get('pedal_after', 0))
-                if stats.get('pedal_source', 0)
-                else t('dlg_apply_midi_expression_no_pedal')
-            )
+        except Exception as e:                      # noqa: BLE001
+            logging.exception('restore from midi failed')
+            QMessageBox.critical(self, t('dlg_load_fail_title'),
+                                 t('dlg_load_fail_msg', e))
+            return
+
+        model.rebuild_display_cache()
+        for pane in self._panes:
+            pane.update()
+        self.view.note_edited.emit()
+        self._refresh_title()
+        pedal_line = (
+            t('dlg_apply_midi_expression_pedal', stats.get('pedal_after', 0))
+            if stats.get('pedal_source', 0)
+            else t('dlg_apply_midi_expression_no_pedal')
+        )
+        QMessageBox.information(
+            self, t('dlg_save_ok_title'),
+            '從 %s：\n'
+            '· 音高還原 %d 顆，%d 顆配不到。\n'
+            '· 力度還原 %d 顆（配對到 %d / %d 顆）。\n'
+            '· %s'
+            % (os.path.basename(path), result.changed, result.unmatched,
+               stats.get('velocity_applied', 0), stats.get('matched_notes', 0),
+               stats.get('total_notes', 0), pedal_line))
+
+    def generate_difficulties_dialog(self) -> None:
+        """從目前這份譜面生出 normal / hard / extreme 三份檔案。
+
+        目前這份當成來源（相當於官方的 real）。生成不會刪音符——沒被選中的
+        折進鄰近可見音符的 `sub_note_data`，和官方譜同一套機制，所以三個難度
+        的音訊事件集和來源完全相同。細節見 `difficulty.py`。
+
+        寫成獨立檔案而不是就地改：一次要產三份，而且使用者要拿它們互相比對。
+        """
+        from .difficulty import DIFFICULTIES, generate
+        from .difficulty_dialog import DifficultyDialog
+
+        model = self.view.model
+        if not model.notes_tree:
+            QMessageBox.information(self, '生成難度', '這份譜面沒有音符。')
+            return
+        if not any(n.pitch is not None for n in model.notes_tree):
             QMessageBox.information(
-                self,
-                t('dlg_save_ok_title'),
-                t(
-                    'dlg_apply_midi_expression_done',
-                    os.path.basename(path),
-                    stats.get('velocity_applied', 0),
-                    stats.get('matched_notes', 0),
-                    stats.get('total_notes', 0),
-                    pedal_line,
-                ),
-            )
-        except Exception as e:
-            QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
+                self, '生成難度',
+                '這份譜面沒有音高，排譜器沒有東西可以依據。\n\n'
+                '請先用「工具 → 以 MIDI 修復 → 從 MIDI 還原音高與表情」補回來。')
+            return
+
+        source = _model_path(model)
+        dlg = DifficultyDialog(self, source_path=source,
+                               chart_name=str(getattr(model, 'title', '') or ''))
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        wanted = dlg.chosen()
+        if not wanted:
+            return
+        out_dir, stem = dlg.out_dir(), dlg.stem()
+        if not os.path.isdir(out_dir):
+            QMessageBox.warning(self, '生成難度', '輸出資料夾不存在：%s' % out_dir)
+            return
+
+        targets = [(name, os.path.join(out_dir, '%s_%s.xml' % (stem, name)))
+                   for name in wanted]
+        clashes = [p for _n, p in targets if os.path.exists(p)]
+        if clashes:
+            reply = QMessageBox.question(
+                self, '生成難度',
+                '這些檔案已經存在，要覆蓋嗎？\n\n%s'
+                % '\n'.join(os.path.basename(p) for p in clashes),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+        self._run_difficulty_generation(model, targets)
+
+    def generate_into_song_folder(self) -> None:
+        """從目前開著的這份譜，直接生出其他難度寫進**它所在的樂曲資料夾**。
+
+        和「生成成獨立檔案」的差別是寫出去的版面：這條路照遊戲讀得懂的結構
+        寫（`<難度>/<譜名>.json` 加一份 `source/<譜名>.xml`），而且會把等級
+        併回 `register.json`，所以生完直接進遊戲就看得到。
+
+        使用者手寫的同名難度一律不覆蓋——判準是它旁邊有沒有 `source/` 那份
+        XML，那是自動生成時才會留下的記號。
+        """
+        model = self.view.model
+        if not model.notes_tree:
+            QMessageBox.information(self, '生成難度', '這份譜面沒有音符。')
+            return
+        if not any(n.pitch is not None for n in model.notes_tree):
+            QMessageBox.information(
+                self, '生成難度',
+                '這份譜面沒有音高，排譜器沒有東西可以依據。\n\n'
+                '請先用「工具 → 以 MIDI 修復 → 從 MIDI 還原音高與表情」補回來。')
+            return
+
+        chart_path = _model_path(model)
+        if not chart_path or not os.path.exists(chart_path):
+            QMessageBox.information(
+                self, '生成難度',
+                '請先把這份譜面存檔——要有檔案路徑才知道它屬於哪一首曲子。')
+            return
+
+        from .difficulty_dialog import SongFolderDialog
+        from .song_folder import find_song_folder
+
+        # 自動偵測只是**預設值**：剛從 MIDI 轉好的譜還在暫存目錄裡，不屬於
+        # 任何曲目，那時候要由使用者自己指定寫到哪一首。
+        detected = find_song_folder(chart_path) or ''
+        dlg = SongFolderDialog(self, chart_path=chart_path, song_dir=detected)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        plan_obj = dlg.plan()
+        picked = dlg.chosen()
+        if plan_obj is None or not picked:
+            return
+        plan_obj.wanted = picked
+
+        targets = [(key, plan_obj.paths_for(key)[0]) for key in plan_obj.wanted]
+        self._run_difficulty_generation(model, targets, plan_obj)
+
+    def fill_library_difficulties(self) -> None:
+        """掃整個曲庫，把每一首缺少的難度一次補齊。
+
+        一首一首開檔案生太慢了——曲庫有八十幾首。這條路只問一次「曲庫在
+        哪」，其餘照每首自己的 register 決定來源與要補的難度。
+        """
+        from .difficulty_dialog import LibraryFillDialog
+
+        root = ''
+        here = _model_path(self.view.model)
+        if here:
+            # 預設帶入目前這份譜所在的曲庫（<曲庫>/<曲名>/…）
+            from .song_folder import find_song_folder
+            song_dir = find_song_folder(here)
+            if song_dir:
+                root = os.path.dirname(song_dir)
+
+        dlg = LibraryFillDialog(self, root=root)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        rows = dlg.ready_rows()
+        if not rows:
+            return
+        self._run_library_fill(rows)
+
+    def _run_library_fill(self, rows) -> None:
+        """背景跑整庫補齊。實作在 library_tools，曲庫管理用的是同一份。"""
+        from .library_tools import run_fill
+        run_fill(self, rows)
+
+    def _run_difficulty_generation(self, model, targets, plan_obj=None) -> None:
+        """在背景執行緒跑生成，主執行緒只顯示進度。
+
+        extreme 的排譜在鬼火那種密度要跑 45 秒左右，三個加起來一分半——
+        不開執行緒的話整個視窗會沒有回應，看起來像當掉。
+        """
+        from PyQt5.QtCore import QThread, pyqtSignal as _sig
+        from PyQt5.QtWidgets import QProgressDialog
+        from .difficulty import generate
+        from .song_folder import commit, write_difficulty
+
+        # 每個難度都從**來源檔**重新讀一份：生成是就地改的，共用同一個 model
+        # 的話第二個難度會拿到第一個的結果（音符已經被隱藏過一輪了）。
+        source_path = _model_path(model)
+        if not source_path or not os.path.exists(source_path):
+            # 還沒存過檔的譜面沒有來源檔可以重讀，先落地到暫存檔。
+            import tempfile
+            # 用 JSON 落地：XML 是 PAN 相容格式，踏板、強弱、Soft／Staccato 都存不下
+            handle, source_path = tempfile.mkstemp(suffix='.json')
+            os.close(handle)
+            saved = (model.current_file, model.dirty, model.file_format, model.pan_xml)
+            try:
+                model.save_json(source_path)
+            finally:
+                (model.current_file, model.dirty,
+                 model.file_format, model.pan_xml) = saved
+
+        class _Worker(QThread):
+            step = _sig(str)
+            done = _sig(list, str)
+
+            def run(self):
+                rows, records, error = [], [], ''
+                try:
+                    for name, path in targets:
+                        self.step.emit(name)
+                        copy = NoteModel()
+                        if source_path.lower().endswith('.json'):
+                            copy.load_json(source_path)
+                        else:
+                            copy.load_xml(source_path)
+                        result = generate(copy, name)
+                        if plan_obj is None:
+                            copy.save_xml(path)
+                        else:
+                            # 樂曲資料夾版面：json 給遊戲、source/xml 留著給
+                            # 制譜器回頭改，順便當「這是生成的」的記號。
+                            records.append(
+                                write_difficulty(plan_obj, name, copy, result))
+                        rows.append((result, path))
+                    if plan_obj is not None and records:
+                        commit(plan_obj, records)
+                except Exception as e:                  # noqa: BLE001
+                    logging.exception('difficulty generation failed')
+                    error = str(e)
+                self.done.emit(rows, error)
+
+        progress = QProgressDialog('正在生成難度…', '', 0, len(targets), self)
+        # modal：底下是一個 processEvents() 的迴圈，不擋住輸入的話，使用者可以
+        # 在生成跑到一半時再按一次同一個選單，兩條執行緒會對同一批檔案各寫各的。
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowTitle('生成難度')
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        state = {'rows': [], 'error': ''}
+        worker = _Worker()
+
+        def on_step(name):
+            progress.setLabelText('正在生成 %s…（排譜要跑幾十秒）' % name.upper())
+
+        def on_done(rows, error):
+            state['rows'], state['error'] = rows, error
+
+        worker.step.connect(on_step)
+        worker.done.connect(on_done)
+        worker.start()
+        while not worker.isFinished():
+            QApplication.processEvents()
+            worker.wait(50)
+        worker.wait()
+        progress.setValue(len(targets))
+        progress.close()
+
+        if state['error']:
+            QMessageBox.critical(self, '生成難度', state['error'])
+            return
+        QMessageBox.information(self, '生成難度', _difficulty_report(state['rows']))
 
     def generate_pedal_dialog(self) -> None:
         """替沒有踏板的譜面依和聲生成一份。
@@ -3106,7 +4144,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, '生成踏板',
                 '這份譜面沒有音高，無法判斷和聲。\n\n'
-                '請先用「工具 → 以 MIDI 重建修復 → 從 MIDI 還原力度與踏板」把音高補回來。')
+                '請先用「工具 → 以 MIDI 修復 → 從 MIDI 還原音高與表情」把音高補回來。')
             return
 
         existing = len(model.pedal_spans)
@@ -3216,7 +4254,7 @@ class MainWindow(QMainWindow):
                     + chr(10) + chr(10)
                     + '序位配對要求「每一組的音符數都相同」。'
                       '兩份只是同一首歌的不同難度時本來就對不上——'
-                      '那種情況請用「以 MIDI 重建修復」。')
+                      '那種情況請用「以 MIDI 修復」。')
                 return
 
             if not any(n.pitch is not None for n in source.notes_tree):
@@ -3304,12 +4342,48 @@ class MainWindow(QMainWindow):
             t('dlg_unassigned_msg', total, int(note.start)))
         return True
 
+    def _confirm_pan_conversion(self, path: str) -> bool:
+        """存成 XML 之前：列出 PAN 沒有、會被換掉或拿掉的東西，同意才轉換。
+
+        轉換會真的改動畫面上的譜（可以復原），這樣存完看到的就是檔案裡的樣子。
+        """
+        m = self.view.model
+        preview = m.pan_conversion_preview()
+        switching = not getattr(m, 'pan_xml', False)
+        if not preview and not (switching and m.time_sig_changes):
+            return True
+        lines = ['存成 XML（PAN 相容格式）時，PAN 沒有的東西會被換掉或拿掉：', '']
+        lines += ['・%s：%d' % (label, count) for label, count in preview.items()]
+        if switching and m.time_sig_changes:
+            lines.append('・拍號變化（PAN 沒有拍號；拍子照樣寫入，重新開 XML 時小節以 4/4 顯示）')
+        source = m.current_file or ''
+        if switching and source and os.path.abspath(source) != os.path.abspath(path):
+            lines += ['', '原本的 %s 不會被改動。之後在 XML 上做的修改不會回到它。'
+                      % os.path.basename(source)]
+        lines += ['', '要轉換並存檔嗎？（轉換可以用「復原」還原）']
+        reply = QMessageBox.question(self, '轉成 PAN 相容 XML', '\n'.join(lines),
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply != QMessageBox.Yes:
+            return False
+        if preview:
+            m.push_history()
+            m.convert_to_pan()
+            for pane in self._panes:
+                pane.update()
+            self.view.note_edited.emit()
+        return True
+
     def _do_save(self, path: str, use_midi_restore: bool = False) -> None:
         if self._block_on_unassigned():
             return
         ext = os.path.splitext(path)[1].lower()
+        if ext not in ('.json', '.mid', '.midi') and not use_midi_restore:
+            if not self._confirm_pan_conversion(path):
+                return
+        validation = None
         try:
             m = self.view.model
+            previous_source = m.current_file
             if ext == '.json':
                 m.save_json(path)
                 actual = path
@@ -3319,8 +4393,27 @@ class MainWindow(QMainWindow):
             else:
                 m.save_xml(path, use_midi_restore=use_midi_restore)
                 actual = path
-            self._refresh_title()
-            QMessageBox.information(self, t('dlg_save_ok_title'), t('dlg_save_ok_msg', actual))
+                from .pan_format import validate
+                validation = validate(path)
+            self._notify_game_if_in_library(actual)
+            oplog.flush(m)
+            oplog.mark('save', path=os.path.basename(actual),
+                       profile=oplog_profile(m))
+            # 正式存進去了，備份就沒用了。另存新檔時舊路徑（或新譜的工作階段）
+            # 那一份也一起清掉，不然下次開舊檔會被問要不要還原一份過時的備份。
+            self._discard_autosave(previous_source, actual)
+            self._autosave_pending = False
+            self._apply_format_mode()
+            if validation is not None and not validation.ok:
+                QMessageBox.warning(
+                    self, 'XML 已存檔，但沒通過 PAN 檢查',
+                    '檔案已經寫出：%s\n\n照 PAN 的讀檔規則檢查，還有這些問題：\n\n%s'
+                    % (actual, validation.summary()))
+            else:
+                msg = t('dlg_save_ok_msg', actual)
+                if validation is not None:
+                    msg += '\n\n已照 PAN 讀檔規則檢查，沒有問題。'
+                QMessageBox.information(self, t('dlg_save_ok_title'), msg)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), t('dlg_save_fail_msg', e))
 
@@ -3412,27 +4505,11 @@ class MainWindow(QMainWindow):
         視窗跟著走的時候才代表當下時刻。"""
         # 沒有 WAV 也可以播——鋼琴音是另外合成的，不靠音訊檔。
         if not self.audio.is_loaded():
-            box = QMessageBox(self)
-            box.setWindowTitle(t('dlg_no_audio_title'))
-            box.setText(t('dlg_no_audio_msg'))
-            load = box.addButton(t('dlg_no_audio_load'), QMessageBox.AcceptRole)
-            midi_only = box.addButton(t('dlg_no_audio_midi'), QMessageBox.ActionRole)
-            box.addButton(t('dlg_cancel'), QMessageBox.RejectRole)
-            box.setDefaultButton(midi_only)
-            box.exec_()
-            clicked = box.clickedButton()
-            if clicked is load:
-                self.load_wav()
-                if not self.audio.is_loaded():
-                    return
-            elif clicked is midi_only:
-                # 沒有音訊檔時，打擊音是靠 PCM overlay 疊在音樂上的，沒有
-                # 底層音訊就疊不上去、會退回 Tap.wav。改走鋼琴合成那條路，
-                # 它自己 render 自己播，不需要載入任何音訊檔。
-                self.play_midi_range(start_ms, end_ms)
-                return
-            else:
-                return
+            # 沒有音源是正常的（純鋼琴曲、還沒配樂），不再每次跳窗問要不要載入：
+            # 直接用鋼琴合成播。打擊音靠 PCM overlay 疊在音樂上，沒有底層音訊
+            # 就疊不上去、會退回 Tap.wav，所以走合成那條路（自己 render 自己播）。
+            self.play_midi_range(start_ms, end_ms)
+            return
         # 播放前重建唯一 startTime 清單（含蓋 up/down 移動後的變更）
         self._rebuild_hit_times()
         self._play_start_ms = start_ms
@@ -3569,19 +4646,69 @@ class MainWindow(QMainWindow):
         else:
             self.pause_audio()
 
+    #: 暫停後畫面被捲動超過這麼多毫秒，就算「去看了別的地方」。只是用來吃掉
+    #: 浮點誤差——真的捲動一格滾輪都是幾十毫秒起跳。
+    _RESUME_FROM_VIEW_TOLERANCE_MS = 1.0
+
     def pause_audio(self) -> None:
         if self._is_playing:
             self.audio.pause()
             self._judge_timer.stop()
             self._set_pause_text('tb_resume')
+            self._autosave_if_pending()
+            # 記下暫停當下每一格停在哪一刻，繼續時才分得出使用者有沒有捲走。
+            self._paused_view_ms = {
+                id(pane): pane.judge_line_view_ms()
+                for pane in self._visible_panes()
+            }
+
+    def _viewed_elsewhere_ms(self) -> Optional[float]:
+        """暫停後使用者若捲去看了別的地方，回傳判定線現在對到的那一刻。
+
+        沒動過就回傳 None，照原本的暫停點續播。分割畫面時哪一格動了就以那一格
+        為準（作用中的那一格優先）。
+        """
+        before = getattr(self, '_paused_view_ms', None) or {}
+        panes = [self.view] + [p for p in self._visible_panes() if p is not self.view]
+        for pane in panes:
+            if id(pane) not in before:
+                continue
+            now = pane.judge_line_view_ms()
+            if abs(now - before[id(pane)]) > self._RESUME_FROM_VIEW_TOLERANCE_MS:
+                return max(0.0, now)
+        return None
 
     def resume_audio(self) -> None:
+        viewed = (self._viewed_elsewhere_ms()
+                  if settings.get('resume_from_view', True) else None)
+        self._paused_view_ms = None
+        if viewed is not None:
+            self._resume_from(viewed)
+            return
         # audio.resume() 內部呼叫 play()→stop()，會觸發 playback_stopped 信號
         # 導致 _is_playing=False，需要在 resume 之後重新設為 True
         self.audio.resume()
         self._is_playing = True
         self._judge_timer.start()
         self._set_pause_text('tb_pause')
+
+    def _resume_from(self, start_ms: float) -> None:
+        """從畫面上正在看的那一刻繼續播，而不是回到暫停點。
+
+        直接重新起播而不是改暫停點：打擊音指標、鋼琴預覽的疊加音都是照起播
+        範圍準備的，捲到範圍外（例如捲回開頭之前）時沿用舊的會缺聲音。
+
+        原本是播一段範圍（例如選取的音符）時，看的地方還在範圍內就播到範圍結
+        束；捲到範圍之後，就一路播到曲末。
+        """
+        end_ms = float(self._play_end_ms)
+        if start_ms >= end_ms - 1.0:
+            end_ms = self._audio_total_ms()
+        if self.audio.is_pcm_playback():
+            # 只播 MIDI 的那種：重新合成這一段鋼琴音
+            self.play_midi_range(start_ms, end_ms)
+        else:
+            self._play_range(start_ms, end_ms)
 
     def stop_audio(self) -> None:
         self.audio.stop()
@@ -3655,7 +4782,6 @@ class MainWindow(QMainWindow):
 
     def _on_hit_toggle(self, checked: bool) -> None:
         self._hit_sound_persistent = bool(checked)
-        self._refresh_vol_rows()
         acts = [getattr(self, '_act_hit', None)]
         acts += [tbs.hit_act for tbs in self._toolbars]
         for action in acts:
@@ -3663,6 +4789,8 @@ class MainWindow(QMainWindow):
                 previous = action.blockSignals(True)
                 action.setChecked(bool(checked))
                 action.blockSignals(previous)
+        # 開關都對齊之後再畫喇叭，兩條工具列的喇叭才會一起換
+        self._refresh_vol_rows()
 
         if not checked:
             self._midi_preview_active = False
@@ -3724,18 +4852,17 @@ class MainWindow(QMainWindow):
             if act is None:
                 continue
             mode = getattr(self._pane_of(tbs), 'view_mode', 'measure')
-            act.setText(t({
+            self._set_labeled_text(act, t({
                 'measure': 'tb_time_uniform_measure',
                 'time': 'tb_time_uniform_time',
                 'pitch': 'tb_time_uniform_pitch',
-            }.get(mode, 'tb_time_uniform_measure')))
-            act.setToolTip(t('tb_time_uniform_tip'))
+            }.get(mode, 'tb_time_uniform_measure')), t('tb_time_uniform_tip'))
 
     def _set_pause_text(self, key: str) -> None:
         """暫停／繼續按鈕的文字（兩條工具列都要跟著換）。"""
         for tbs in self._toolbars:
             if tbs.pause_act is not None:
-                tbs.pause_act.setText(t(key))
+                self._set_labeled_text(tbs.pause_act, t(key))
 
     def _offset_label_text(self) -> str:
         return (t('status_offset_none') if self._playback_offset_ms == 0
@@ -3748,12 +4875,17 @@ class MainWindow(QMainWindow):
                 tbs.offset_label.setText(text)
 
     def _on_note_placed(self, note) -> None:
-        """播放中放下的音符要立刻聽得到。
+        """放下音符時用內建鋼琴音彈出那一顆，讓你當場聽得出音高對不對。
 
-        主要的 MIDI 播放是「一次把整段 render 成 PCM」，所以播到一半新增的
-        音符不會出現在那段音訊裡。這裡補一顆即時的單音，讓放置當下就有回饋。
+        播放中一定要有：主播放是「一次把整段 render 成 PCM」，播到一半新增的
+        音符不在那段音訊裡，沒有這個就完全沒有回饋。停著編輯時也響，是偏好
+        設定「放置時發聲」控制的（預設開）。
+
+        走 `play_oneshot_pcm`，不會打斷正在播的音訊。
         """
-        if not self._is_playing or note is None or note.pitch is None:
+        if note is None or note.pitch is None:
+            return
+        if not settings.get('place_note_sound', True):
             return
         try:
             rate = self.audio.audio_rate if self.audio.audio_rate > 0 else 44100
@@ -3794,13 +4926,19 @@ class MainWindow(QMainWindow):
         位置，用小節/時間檢視看到的是暫時排開的假位置。所以這裡攔下來問，
         願意轉就當場排譜，不轉就留在音高模式。
         """
-        model = getattr(self, 'model', None)
+        # getattr(self, 'model') 永遠是 None——MainWindow 根本沒有這個屬性，
+        # 所以這個守門以前是**永遠放行**：對話框從來沒跳出來過，切換檢視
+        # 只是默默地彈回音高模式，看起來像沒反應。
+        model = self.view.model
         if not getattr(model, 'midi_unarranged', False):
             return True
         from PyQt5.QtWidgets import QMessageBox
         reply = QMessageBox.question(
             self, t('dlg_midi_arrange_title'), t('dlg_midi_need_arrange'),
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            QMessageBox.Yes | QMessageBox.No,
+            # 預設 No：這個框是切換檢視時自動跳的（快捷鍵一按就會碰到），
+            # 而排譜會重寫整份譜面。預設停在 Yes 等於 Enter 一下就排下去。
+            QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return False
@@ -3811,7 +4949,12 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QThread, pyqtSignal as _sig
         from PyQt5.QtWidgets import QProgressDialog, QMessageBox
 
-        model = self.model
+        model = self.view.model
+        # 自動排譜會重寫每一顆音符的鍵道，還會先裁掉踏板殘響造成的長音——
+        # 這是整份譜面級別的改動，沒有 push_history 就**完全救不回來**。
+        # 觸發它的又是切換檢視時跳出來的那個問句（快捷鍵一按就會碰到），
+        # 誤觸的代價太高。
+        model.push_history()
 
         class _Worker(QThread):
             done = _sig(bool, str)
@@ -3864,10 +5007,6 @@ class MainWindow(QMainWindow):
         self.view.cycle_view_mode()
         self._refresh_view_mode_action()
 
-    def _on_time_uniform_toggle(self, checked: bool) -> None:
-        self.view.toggle_time_uniform(checked)
-        self._refresh_view_mode_action()
-
     def _rebuild_hit_times(self) -> None:
         """從目前 model 建立排序的唯一 startTime 清單（輕量）。"""
         # Build candidate times from note starts and beat timings, but only
@@ -3905,6 +5044,7 @@ class MainWindow(QMainWindow):
     def _on_playback_stopped(self) -> None:
         self._is_playing = False
         self._judge_timer.stop()
+        self._autosave_if_pending()
         try:
             self._set_judge_line_all(None)
             self._set_pause_text('tb_pause')
@@ -4057,6 +5197,87 @@ class MainWindow(QMainWindow):
     # 播放偏移
     # ==================================================================
 
+    def _show_lead_in_dialog(self) -> None:
+        """開頭空白：給音訊加／減開頭靜音，可選擇音符與小節線一起移。取代播放偏移。"""
+        from .audio_lead_in import apply_lead_in, describe, leading_silence_ms, split_lead_name
+        from .audio_lead_in_dialog import AudioLeadInDialog
+
+        m = self.view.model
+        path = getattr(self.audio, 'audio_path', '') or ''
+        loaded = bool(path) and os.path.isfile(path) and self.audio.is_loaded()
+        total = split_lead_name(path)[1] if loaded else 0
+        silence = 0
+        if loaded:
+            try:
+                silence = leading_silence_ms(path)
+            except Exception:                            # noqa: BLE001
+                silence = 0
+        dlg = AudioLeadInDialog(
+            self, bpm=m.bpm if m.bpm > 0 else 120.0, audio_path=path if loaded else '',
+            current_total_ms=total, leading_silence_ms=silence,
+            earliest_note_ms=int(m.earliest_time_ms() or 0),
+            latency_ms=self.audio.output_latency_ms())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self.audio.set_output_latency_ms(dlg.latency_ms())
+        settings.set('audio_latency_ms', int(dlg.latency_ms()))
+        delta = dlg.delta_ms()
+        move = dlg.moves_notes()
+        if delta == 0 or (not loaded and not move):
+            return
+        self.stop_audio()
+
+        messages = []
+        audio_delta = delta
+        moved_notes = False
+        if move:
+            m.push_history()
+            m.shift_all_time(delta)
+            audio_delta = int(getattr(m, 'last_shift_ms', delta))
+            moved_notes = audio_delta != 0
+            if audio_delta != delta:
+                messages.append('音符最多只能往前移 %d ms' % -audio_delta)
+            if moved_notes:
+                messages.append('音符與小節線 %+d ms' % audio_delta)
+
+        if loaded and audio_delta:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                result = apply_lead_in(path, audio_delta)
+                second = getattr(self.audio, 'audio2_path', None)
+                second_path = apply_lead_in(second, result.applied_ms).path if second else None
+            except Exception as exc:                     # noqa: BLE001
+                QApplication.restoreOverrideCursor()
+                if moved_notes:
+                    m.undo()                             # 音訊沒改成功，音符也退回去，不要錯開
+                QMessageBox.warning(self, '開頭空白', '處理音訊失敗：%s' % exc)
+                return
+            QApplication.restoreOverrideCursor()
+            if moved_notes and result.applied_ms != audio_delta:
+                # 音訊能剪的比音符移的少（音訊太短）：音符補回差額，兩邊才會對齊
+                m.shift_all_time(result.applied_ms - audio_delta)
+            ok = (self.audio.load_wavs([result.path, second_path]) if second_path
+                  else self.audio.load_wav(result.path))
+            if not ok:
+                QMessageBox.warning(self, t('dlg_warn'), t('dlg_wav_fail_msg', result.path))
+                return
+            self._refresh_vol_rows()
+            self._lbl_audio.setText(t('status_audio_loaded', os.path.basename(result.path)))
+            messages.append('音訊 %+d ms（%s）' % (
+                result.applied_ms, describe(result.total_ms) or '回到原檔'))
+            if result.cut_sound_ms:
+                messages.append('剪到 %d ms 有聲音的部分' % result.cut_sound_ms)
+
+        if moved_notes:
+            m.rebuild_display_cache()
+            self.view.rebuild_mapper()
+            self.view._update_unit_bounds()
+            self.view.note_edited.emit()
+            self._rebuild_hit_times()
+        self.view.update()
+        if messages:
+            self.statusBar().showMessage('開頭空白：' + '、'.join(messages), 8000)
+
     def _show_offset_dialog(self) -> None:
         """開啟播放延遲/提前設定對話框。"""
         bpm = self.view.model.bpm if self.view.model.bpm > 0 else 120.0
@@ -4143,6 +5364,243 @@ class MainWindow(QMainWindow):
     # 匯出完整曲目
     # ==================================================================
 
+    @staticmethod
+    def _write_silent_wav(path: str, duration_ms: float,
+                          rate: int = 8000) -> None:
+        """寫一段無聲的 WAV。
+
+        給「無背景音樂」用：遊戲的 `audioResourcePath` 是必填的，留空會驗證
+        失敗，所以放一段和譜面等長的無聲音訊，聲音就只剩玩家打出來的 keysound。
+
+        單聲道 8kHz 就夠——這個檔案唯一的用途是給遊戲一個正確長度的時間軸，
+        沒有任何內容。207 秒只要 3.3MB，用 44.1kHz 立體聲會是 36MB。
+        """
+        import wave
+
+        frames = max(1, int(round(max(0.0, float(duration_ms)) / 1000.0 * rate)))
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with wave.open(path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(rate))
+            wf.writeframes(bytes(2 * frames))   # 2 bytes/frame，全 0 = 無聲
+
+    def _warn_if_no_pitch_data(self, m) -> bool:
+        """「無背景音樂」的譜面必須有音高，否則遊戲裡會**完全沒有聲音**。
+
+        遊戲的 keysound 是 `PianoVisualLayout.ResolveMidiPitch` 決定要彈哪個
+        音的；沒有 pitch / scale_piano 就回 -1，那顆音不發聲。背景又是無聲的，
+        結果就是整首靜音——實測 no45 那首就是這樣，譜面只有鍵道沒有音高。
+
+        回傳 False 表示使用者選擇取消匯出。
+        """
+        notes = list(getattr(m, 'notes_tree', ()) or ())
+        if not notes:
+            return True
+        have = sum(1 for n in notes if n.pitch is not None)
+        if have >= len(notes) * 0.99:
+            return True
+        answer = QMessageBox.warning(
+            self, '無背景音樂',
+            '這份譜面有 %d / %d 顆音符沒有音高資料。\n\n'
+            '「無背景音樂」是靠玩家打出的 keysound 發聲的，沒有音高的音符在'
+            '遊戲裡不會發出任何聲音——背景又是無聲的，整首歌會完全沒有聲音。\n\n'
+            '建議先用「從 MIDI 還原音高」把音高補回來再匯出。\n'
+            '仍要繼續嗎？' % (len(notes) - have, len(notes)),
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        return answer == QMessageBox.Yes
+
+    @staticmethod
+    def _pad_wav_tail(path: str, min_duration_ms: float) -> float:
+        """把 WAV 的尾巴補靜音到至少 `min_duration_ms`，回傳補了幾毫秒。
+
+        「樂曲總資訊」的整體位移把整首往後推之後，音訊**不會**跟著變長：
+        前面塞進去的空白等於把最後那幾秒擠出音檔之外。遊戲是讀譜面的
+        `music_finish_time_msec` 收歌的，所以歌照跑，只是後面沒有聲音。
+        前面補了多少，後面就要補回來。
+
+        只加不減——比譜面長的音檔原封不動，不會去裁掉尾奏。
+        """
+        import wave
+
+        if not os.path.isfile(path):
+            return 0.0
+        with wave.open(path, 'rb') as wf:
+            params = wf.getparams()
+            frames = wf.readframes(params.nframes)
+        want = int(round(max(0.0, float(min_duration_ms)) / 1000.0 * params.framerate))
+        if params.nframes >= want:
+            return 0.0
+        extra = want - params.nframes
+        with wave.open(path, 'wb') as wf:
+            wf.setparams(params)
+            wf.writeframes(frames)
+            wf.writeframes(bytes(extra * params.nchannels * params.sampwidth))
+        return extra / float(params.framerate) * 1000.0
+
+    def _write_song_category(self, root: str, folder_name: str,
+                             category: str) -> None:
+        """把這首歌的分類寫進 `<匯出根目錄>/library.json`。
+
+        遊戲端 `ExternalSongLibrary` 的分類不在 register.json 裡，而是在索引檔
+        library.json：每首歌一筆 `folderName` + `category` + `categories`，另外
+        還有一份全域 `categories` 清單供選歌畫面列頁籤。這裡兩邊都補上，沒有
+        檔案就建一份，其他歌的資料原封不動。
+        """
+        import json
+
+        category = (category or 'Other').strip() or 'Other'
+        path = os.path.join(root, 'library.json')
+        data = {}
+        try:
+            if os.path.isfile(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f) or {}
+        except Exception:                       # noqa: BLE001
+            logging.exception('library.json 讀取失敗，改寫成新的')
+            data = {}
+        songs = data.get('songs')
+        if not isinstance(songs, list):
+            songs = []
+        entry = None
+        for song in songs:
+            if isinstance(song, dict) and str(song.get('folderName') or '') == folder_name:
+                entry = song
+                break
+        if entry is None:
+            entry = {'id': 'portable:%s' % folder_name, 'folderName': folder_name}
+            songs.append(entry)
+        entry['category'] = category
+        existing = [c for c in (entry.get('categories') or []) if c]
+        if category not in existing:
+            existing.insert(0, category)
+        entry['categories'] = existing
+        data['songs'] = songs
+        names = [c for c in (data.get('categories') or []) if c]
+        if category not in names and category.upper() != 'ALL':
+            names.append(category)
+        data['categories'] = names
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logging.debug('library.json updated: %s -> %s', folder_name, category)
+        except Exception:                       # noqa: BLE001
+            logging.exception('library.json 寫入失敗')
+
+    def enter_editor(self) -> None:
+        """顯示並帶到最前面（啟動器叫開譜時也走這裡）。第一次顯示時才問要不要還原自動備份。"""
+        if not self.isVisible():
+            self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if not getattr(self, '_recovery_offered', False):
+            self._recovery_offered = True
+            QTimer.singleShot(300, self.offer_crash_recovery)
+
+    def open_chart_from_library(self, path: str) -> None:
+        """曲庫管理雙擊難度：打開那份譜（目前的譜沒存會先問）。"""
+        m = self.view.model
+        if m.dirty:
+            reply = QMessageBox.question(
+                self, t('dlg_unsaved_title'), t('dlg_unsaved_msg'),
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Save:
+                self.save_file()
+                if self.view.model.dirty:
+                    return
+        self._load_path(path)
+        self.enter_editor()
+        self.activateWindow()
+
+    def _notify_game_if_in_library(self, path: str) -> None:
+        """存到曲庫裡的譜：通知遊戲重整（下次開這首就是新的譜）。"""
+        try:
+            from .song_folder import find_song_folder
+            from .song_library import INDEX_FILE, SongLibrary
+            song_dir = find_song_folder(path)
+            if not song_dir:
+                return
+            root = os.path.dirname(song_dir)
+            if not os.path.isfile(os.path.join(root, INDEX_FILE)):
+                return
+            SongLibrary(root).notify_game(os.path.basename(song_dir))
+        except Exception:                               # noqa: BLE001
+            logging.exception('notify game failed')
+
+    def export_hiraeth_packages(self) -> None:
+        """輸出 Hiraeth（PAN 歌曲管理版）用的歌曲包 ZIP。"""
+        from .hiraeth_export_dialog import MODE_CHART, HiraethExportDialog
+        from .song_folder import find_song_folder
+
+        m = self.view.model
+        song_dir = find_song_folder(m.current_file or '')
+        library = settings.get('export_songs_root') or SONGS_ROOT
+        if song_dir:
+            library = os.path.dirname(song_dir)
+        dlg = HiraethExportDialog(self, song_dir, library, m,
+                                  audio_path=getattr(self.audio, 'audio_path', '') or '')
+        if dlg.exec_() != HiraethExportDialog.Accepted:
+            return
+        if dlg.mode() == MODE_CHART:
+            if not m.notes_tree:
+                QMessageBox.warning(self, t('dlg_warn'), t('dlg_export_no_chart'))
+                return
+        elif m.dirty and song_dir:
+            reply = QMessageBox.question(
+                self, '輸出 Hiraeth 歌曲包',
+                '目前譜面有還沒存檔的修改。樂曲資料夾／曲庫模式讀的是磁碟上的檔案，'
+                '要先存檔嗎？',
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Yes:
+                self.save_file()
+        plans, skipped = dlg.plans()
+        out_dir = dlg.out_edit.text().strip()
+        if not plans:
+            QMessageBox.information(self, '輸出 Hiraeth 歌曲包',
+                                    '沒有可以輸出的譜面。\n\n' + '\n'.join(skipped[:20]))
+            return
+
+        self._run_hiraeth_export(plans, skipped, out_dir, dlg.hold_gap_ms())
+
+    def _run_hiraeth_export(self, plans, skipped, out_dir: str, hold_gap_ms: int) -> None:
+        from .hiraeth_export_dialog import run_export
+        run_export(self, plans, skipped, out_dir, hold_gap_ms)
+
+    @staticmethod
+    def _existing_audio_resource(dlg) -> str:
+        """追加難度時，這首歌原本的背景音樂（不是無聲的那種）；沒有就空字串。"""
+        if not dlg.is_append_mode():
+            return ''
+        for diff in (dlg.existing_register() or {}).get('difficulties', []) or []:
+            if diff.get('audioResourcePath') and not diff.get('noBackgroundMusic'):
+                return str(diff['audioResourcePath'])
+        return ''
+
+    @staticmethod
+    def _same_audio_file(a: str, b: str) -> bool:
+        import filecmp
+        try:
+            if os.path.samefile(a, b):
+                return True
+            return os.path.getsize(a) == os.path.getsize(b) and filecmp.cmp(a, b, shallow=False)
+        except OSError:
+            return False
+
+    def _game_library_root(self) -> str:
+        """遊戲的曲庫：製譜器放在遊戲資料夾裡就是旁邊的 UserSongs；否則上次管理的曲庫。
+
+        要有 library.json 才算（不然只是某個資料夾，讓使用者自己選位置）。
+        """
+        from .song_library import INDEX_FILE, default_root
+        root = default_root()
+        return root if root and os.path.isfile(os.path.join(root, INDEX_FILE)) else ''
+
     def export_song(self) -> None:
         """匯出完整曲目格式（register.json + 音源 + 譜面 + 曲繪）。"""
         if self._block_on_unassigned():
@@ -4158,18 +5616,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, t('dlg_warn'), t('dlg_export_no_chart'))
             return
 
+        # 沒有音源是正常情況（純鋼琴曲、先排譜之後才配樂），不擋也不問；
+        # 對話框上小字標註「以無背景音樂匯出」。
         wav_path = getattr(self.audio, 'audio_path', '') or ''
+        if wav_path and not os.path.isfile(wav_path):
+            wav_path = ''
         logging.debug('audio_path=%s', wav_path)
-        if not wav_path or not os.path.isfile(wav_path):
-            reply = QMessageBox.question(
-                self, t('dlg_no_audio_title'), t('dlg_export_no_audio'),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if reply == QMessageBox.Yes:
-                self.load_wav()
-                wav_path = getattr(self.audio, 'audio_path', '') or ''
-            if not wav_path or not os.path.isfile(wav_path):
-                return
 
         dlg = ExportSongDialog(
             self,
@@ -4177,14 +5629,23 @@ class MainWindow(QMainWindow):
             wav_path=wav_path,
             chart_json_path=m.current_file or '',
             default_root=settings.get('export_songs_root') or SONGS_ROOT,
+            game_root=self._game_library_root(),
         )
         if dlg.exec_() != ExportSongDialog.Accepted:
             logging.debug('export_song: dialog cancelled')
             return
 
+        # 沒有音源時照對話框選的：無背景音樂／用 MIDI 轉成音源／沿用這首原本的音樂
+        no_audio_mode = '' if wav_path else (getattr(dlg, 'no_audio_mode', lambda: 'silent')() or 'silent')
+        reused_audio_res = self._existing_audio_resource(dlg) if no_audio_mode == 'reuse' else ''
+        midi_audio = no_audio_mode == 'midi'
+        no_bgm = dlg.no_background_music() or no_audio_mode == 'silent' or \
+            (no_audio_mode == 'reuse' and not reused_audio_res)
+
         # 鋼琴音軌：用內建音源把譜面算成 WAV，寫進 register 的
         # pianoAudioResourcePath。遊戲有這個欄位就能放「只有鋼琴」的版本。
-        want_piano = QMessageBox.question(
+        # 無背景音樂時不輸出（見下面），就不用問。
+        want_piano = (not no_bgm) and (not midi_audio) and QMessageBox.question(
             self, '鋼琴音軌',
             '要不要一併輸出 MIDI 鋼琴音軌？\n\n'
             '用內建音源把整份譜面算成 WAV（含力度、表情與延音踏板），'
@@ -4194,7 +5655,7 @@ class MainWindow(QMainWindow):
 
         # 使用者選定的匯出根目錄（空 → 回退到自動偵測的 SONGS_ROOT）；並記住供下次使用
         export_root = dlg.export_root() or SONGS_ROOT
-        if export_root and os.path.isdir(export_root):
+        if export_root and os.path.isdir(export_root) and not dlg.exports_to_game():
             settings.set('export_songs_root', export_root)
 
         logging.debug('export_song: dialog accepted')
@@ -4277,9 +5738,34 @@ class MainWindow(QMainWindow):
                     except Exception:
                         logging.exception('export_song: midi copy failed')
             logging.debug('source backup: %s', backed_up)
+            # 備份的存檔會把「目前檔案」換成備份那一份（XML 還會切成 PAN 相容模式）。
+            # 匯出之後接著編的是剛匯出的 JSON，把狀態擺回那裡，Ctrl+S 才不會存進
+            # source/ 備份資料夾。
+            m.current_file = chart_path
+            m.file_format = 'json'
+            m.pan_xml = False
+            m.dirty = False
+            self._apply_format_mode()
 
             # ── 處理音源 ──────────────────────────────────────────
             src_wav = Path(wav_path)
+
+            # ── 無背景音樂：輸出等長的無聲音訊 ────────────────────
+            # 遊戲端 audioResourcePath 是必填的（ExternalSongLibrary.RequireAsset），
+            # 留空會驗證失敗，所以放一段無聲的。加上不輸出鋼琴音軌，遊戲裡就
+            # 只剩玩家打出來的 keysound。
+            if (no_bgm or midi_audio) and not self._warn_if_no_pitch_data(m):
+                return
+            if no_bgm:
+                end_ms = max(
+                    float(getattr(m, 'music_end_ms', 0.0) or 0.0),
+                    max((float(n.end) for n in m.notes_tree), default=0.0) + 2000.0,
+                )
+                audio_dest = os.path.join(song_folder, safe_name + '.wav')
+                self._write_silent_wav(audio_dest, end_ms)
+                audio_res_suffix = safe_name
+                logging.debug('silent backing track written: %s (%.1f s)',
+                              audio_dest, end_ms / 1000.0)
             offset = self._playback_offset_ms
             # rip.py 的 process_audio: 正值=前面加靜音，負值=裁剪前面
             # 我們的偏移語意：正=提前（音訊要從更前面開始→砍前面 = 負 ms）
@@ -4288,7 +5774,23 @@ class MainWindow(QMainWindow):
 
             audio_in_song_root = os.path.join(song_folder, safe_name + '.wav')
             logging.debug('processing audio with rip_ms=%s', rip_ms)
-            if rip_ms == 0:
+            if midi_audio:
+                # 純粹用 MIDI 轉音源：內建鋼琴把譜面算成背景音樂
+                audio_dest = os.path.join(song_folder, safe_name + '.wav')
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    rendered = self.render_piano_wav(audio_dest)
+                finally:
+                    QApplication.restoreOverrideCursor()
+                if not rendered:
+                    QMessageBox.warning(self, t('dlg_export_title'), t('dlg_export_midi_audio_failed'))
+                    return
+                audio_res_suffix = safe_name
+            elif no_bgm:
+                pass                      # 上面已經寫好無聲音訊
+            elif reused_audio_res:
+                audio_res_suffix = ''     # 沿用原本的音樂，不動檔案
+            elif rip_ms == 0:
                 # 無偏移：若曲目資料夾已有同名 wav → 直接沿用，不複製
                 # Check user settings: auto-process audio on export (parse filename offset)
                 auto_proc = bool(settings.get('export_auto_process_audio', True))
@@ -4315,40 +5817,54 @@ class MainWindow(QMainWindow):
                         processed = None
 
                 if processed is None:
-                    if os.path.isfile(audio_in_song_root):
-                        audio_dest = audio_in_song_root
-                    else:
+                    if not os.path.isfile(audio_in_song_root):
                         audio_dest = audio_in_song_root
                         shutil.copy2(str(src_wav), audio_dest)
-                    audio_res_suffix = safe_name          # 資源路徑用曲名 (放在曲目根)
+                        audio_res_suffix = safe_name      # 資源路徑用曲名 (放在曲目根)
+                    elif self._same_audio_file(str(src_wav), audio_in_song_root):
+                        audio_dest = audio_in_song_root
+                        audio_res_suffix = safe_name
+                    else:
+                        # 曲目資料夾已經有一份**不一樣**的同名音訊（例如這次加了開頭
+                        # 空白）。以前直接沿用舊的，新音訊永遠匯不出去。蓋掉會讓其他
+                        # 難度錯開，所以放進這個難度自己的子資料夾。
+                        wav_name = os.path.basename(str(src_wav))
+                        audio_dest = os.path.join(diff_folder, wav_name)
+                        shutil.copy2(str(src_wav), audio_dest)
+                        audio_res_suffix = f'{safe_diff}/{Path(wav_name).stem}'
             else:
                 # 有偏移：處理音源後放入難度子資料夾，檔名標註偏移量
                 sign = '+' if offset > 0 else ''
                 offset_tag = f'{sign}{offset}ms'
                 wav_name = f'{safe_name}_{offset_tag}.wav'
                 audio_dest = os.path.join(diff_folder, wav_name)
+                # 以前這裡是 `from rip import process_audio`，但 **rip.py 根本
+                # 不存在**（不在原始碼、也不在打包 spec 裡），所以 ImportError
+                # 每次都成立、然後 `processed = src_wav` 把未處理的原檔複製過去
+                # ——檔名標著 `-1043ms`，內容卻原封不動。這條路從來沒有真的處理
+                # 過音訊。改用套件內的 wav_process，正負號語意完全一樣
+                # （正 = 前面補靜音 = 延後）。
                 try:
-                    import sys as _sys2
-                    _rip_dir = os.path.join(os.path.dirname(__file__), '..')
-                    if _rip_dir not in _sys2.path:
-                        _sys2.path.insert(0, _rip_dir)
-                    from rip import process_audio
-                    processed = process_audio(src_wav, rip_ms)
-                except ImportError:
-                    processed = src_wav
-                if os.path.normpath(str(processed)) != os.path.normpath(audio_dest):
-                    shutil.copy2(str(processed), audio_dest)
-                # 清理 process_audio 產生的中間檔案
-                if str(processed) != str(src_wav) and \
-                   os.path.normpath(str(processed)) != os.path.normpath(audio_dest):
-                    try:
-                        os.remove(str(processed))
-                    except Exception:
-                        pass
+                    from .wav_process import process_wav
+                    process_wav(str(src_wav), audio_dest, offset_ms=int(rip_ms),
+                                trim_end_ms=int(settings.get('export_trim_end_ms', 0)))
+                except Exception:
+                    logging.exception('export_song: audio offset failed')
+                    # 靜靜複製原檔，使用者會拿到一份「檔名說有偏移、實際沒有」
+                    # 的音訊，而且要到進遊戲才會發現。寧可講出來。
+                    shutil.copy2(str(src_wav), audio_dest)
+                    QMessageBox.warning(
+                        self, '音訊偏移',
+                        '音訊偏移 %+d ms 套用失敗，匯出的是**未處理**的原始音訊。'
+                        % offset)
                 audio_res_suffix = f'{safe_diff}/{Path(wav_name).stem}'  # 資源路徑含難度子資料夾
-                logging.debug('audio processed to %s (audio_dest=%s)', processed, audio_dest)
+                logging.debug('audio offset %+d ms applied -> %s', rip_ms, audio_dest)
 
             # ── 鋼琴音軌（選用）──────────────────────────────────
+            # 「無背景音樂」時完全不輸出：留著的話，玩家如果沒開合成鋼琴模式，
+            # 遊戲會把錄好的鋼琴層疊在 keysound 底下，等於又有一台鋼琴在彈。
+            if no_bgm:
+                want_piano = False
             if want_piano:
                 piano_name = f'{safe_name}_piano.wav'
                 piano_dest = os.path.join(song_folder, piano_name)
@@ -4368,6 +5884,24 @@ class MainWindow(QMainWindow):
                         '其餘內容照常匯出。')
             else:
                 piano_res_suffix = ''
+
+            # ── 讓音訊蓋過譜面的結尾 ──────────────────────────────
+            # 見 _pad_wav_tail：整體位移只搬譜面，音檔長度不會跟著長。
+            chart_end_ms = max(
+                float(getattr(m, 'music_end_ms', 0.0) or 0.0),
+                max((float(n.end) for n in m.notes_tree), default=0.0),
+            )
+            for _suffix in (audio_res_suffix, piano_res_suffix):
+                if not _suffix:
+                    continue
+                _wav = os.path.join(song_folder,
+                                    _suffix.replace('/', os.sep) + '.wav')
+                try:
+                    _added = self._pad_wav_tail(_wav, chart_end_ms)
+                    if _added:
+                        logging.debug('padded tail of %s by %.0f ms', _wav, _added)
+                except Exception:
+                    logging.exception('export_song: tail padding failed: %s', _wav)
 
             # ── 處理曲繪 ──────────────────────────────────────────
             cover_dest = ''
@@ -4389,7 +5923,7 @@ class MainWindow(QMainWindow):
             else:
                 _res_rel = f'songs/{folder_name}'
             chart_res  = f'{_res_rel}/{safe_diff}/{chart_basename}'
-            audio_res  = f'{_res_rel}/{audio_res_suffix}'
+            audio_res  = reused_audio_res or f'{_res_rel}/{audio_res_suffix}'
             cover_res  = f'{_res_rel}/{safe_name}' if cover_dest else ''
 
             # 追加模式且曲繪已存在時，沿用原有 coverResourcePath（不複製檔案）
@@ -4407,8 +5941,36 @@ class MainWindow(QMainWindow):
                 'audioResourcePath': audio_res,
                 'coverResourcePath': cover_res,
             }
+            if no_bgm:
+                # 遊戲端讀到這個旗標就會強制開合成鋼琴（見 SettingsManager
+                # .SongForcesSynthesisedPiano）：不然玩家若停在「遊戲錄音」
+                # 音源模式，這首歌會整首沒有聲音。
+                new_diff['noBackgroundMusic'] = True
+
+            # ── 背景影片（選填）───────────────────────────────
+            # 遊戲端 ExternalSongLibrary 會把 videoPath 當成 songs/<資料夾>/<名稱>
+            # 去找 .mp4 / .webm / .mov，和曲繪同一套規則，所以這裡也不寫副檔名。
+            video_src = dlg.video_path()
+            if video_src and os.path.isfile(video_src):
+                video_ext = os.path.splitext(video_src)[1].lower() or '.mp4'
+                video_dest = os.path.join(song_folder, safe_name + video_ext)
+                if os.path.abspath(video_src) != os.path.abspath(video_dest):
+                    shutil.copy2(video_src, video_dest)
+                new_diff['videoPath'] = f'{_res_rel}/{safe_name}'
+                new_diff['videostartTime'] = float(dlg.video_start_sec())
+                logging.debug('video copied to %s', video_dest)
+            elif is_append:
+                # 追加難度時沒指定影片 → 沿用同一首歌既有的那一份
+                existing_reg = dlg.existing_register()
+                for d in (existing_reg or {}).get('difficulties', []):
+                    if d.get('videoPath'):
+                        new_diff['videoPath'] = d['videoPath']
+                        new_diff['videostartTime'] = d.get('videostartTime', 0.0)
+                        break
             if piano_res_suffix:
                 new_diff['pianoAudioResourcePath'] = f'{_res_rel}/{piano_res_suffix}'
+            elif no_bgm:
+                pass          # 無背景音樂：連沿用舊鋼琴音軌都不要
             elif is_append:
                 # 追加難度時沒重算鋼琴音軌 → 沿用原本那一份，不要把欄位弄丟
                 existing_reg = dlg.existing_register()
@@ -4444,8 +6006,18 @@ class MainWindow(QMainWindow):
                 json.dump(reg, f, ensure_ascii=False, indent=2)
             logging.debug('register.json written')
 
-            QMessageBox.information(
-                self, t('dlg_export_ok_title'), t('dlg_export_ok_msg', song_folder))
+            # ── 分類（寫在匯出根目錄的 library.json，不是 register.json）──
+            self._write_song_category(
+                os.path.dirname(song_folder), folder_name, dlg.category())
+
+            if dlg.exports_to_game():
+                # 通知遊戲重整選曲並停在這首
+                self._notify_game_if_in_library(chart_path)
+                QMessageBox.information(
+                    self, t('dlg_export_ok_title'), t('dlg_export_ok_game', song_folder))
+            else:
+                QMessageBox.information(
+                    self, t('dlg_export_ok_title'), t('dlg_export_ok_msg', song_folder))
 
         except Exception as e:
             logging.exception('export failed')
@@ -4486,10 +6058,10 @@ class MainWindow(QMainWindow):
         cb_step = QCheckBox('同手下一顆沒有重疊到就留出間隔')
         cb_step.setChecked(True)
         cb_step.setToolTip(
-            '同手的下一顆和這條長押**時間上沒有重疊** = 前後關係，' + '\\n' +
-            '即使手按得住也該把間隔留出來。' + '\\n' +
-            '有重疊的就是分解和弦，一律不動。' + '\\n' + '\\n' +
-            '不勾的話只裁真的按不出來的（同一個鍵、超過五指、超過手的跨度），' + '\\n' +
+            '同手的下一顆和這條長押**時間上沒有重疊** = 前後關係，' + '\n' +
+            '即使手按得住也該把間隔留出來。' + '\n' +
+            '有重疊的就是分解和弦，一律不動。' + '\n' + '\n' +
+            '不勾的話只裁真的按不出來的（同一個鍵、超過五指、超過手的跨度），' + '\n' +
             '那條規則在整個曲庫只會動到 14% 的長押，尾巴貼著下一顆也不管。')
         vbox.addLayout(form)
         vbox.addWidget(cb_step)
@@ -4533,6 +6105,10 @@ class MainWindow(QMainWindow):
         gap = int(sp_gap.value())
         m = self.view.model
         was_dirty = m.dirty
+        # 這幾個旋鈕就是要調的東西——記下來才知道哪組設定的結果被使用者改回去
+        oplog.params(gap_ms=gap, only_conflicts=not cb_all.isChecked(),
+                     sequential_gap=cb_step.isChecked(),
+                     max_ring_notes=int(sp_ring.value()) if cb_ring.isChecked() else 0)
         m.push_history()
         changed = m.resolve_hold_tail_overlaps(
             gap,
@@ -4544,7 +6120,7 @@ class MainWindow(QMainWindow):
             self.view.update()
             self.view.note_edited.emit()
         else:
-            m.undo_stack.pop()
+            m.discard_last_history()
             m.dirty = was_dirty
             QMessageBox.information(self, t('dlg_no_overlaps_title'), t('dlg_no_overlaps_msg'))
 
@@ -4594,7 +6170,7 @@ class MainWindow(QMainWindow):
                 msg += '；有 %d 處兩側都塞不下，未處理' % report['unresolved']
             self.statusBar().showMessage(msg, 8000)
         else:
-            m.undo_stack.pop()
+            m.discard_last_history()
             m.dirty = was_dirty
             if report['unresolved']:
                 QMessageBox.warning(
@@ -4652,7 +6228,7 @@ class MainWindow(QMainWindow):
         m.push_history()
         added = m.repair_missing_beat_entries()
         if not added:
-            m.undo_stack.pop()
+            m.discard_last_history()
             return
         self.view.rebuild_mapper()
         self.view.update()
@@ -4666,7 +6242,7 @@ class MainWindow(QMainWindow):
         from .quantize_dialog import QuantizeDialog
 
         view = self.view
-        if view.alloc_active or not self.model.notes_tree:
+        if view.alloc_active or not view.model.notes_tree:
             QMessageBox.information(self, '量化', '譜面沒有音符。')
             return
         dlg = QuantizeDialog(
@@ -4675,6 +6251,8 @@ class MainWindow(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         params = dlg.params()
+        oplog.params(**{k: v for k, v in params.items()
+                       if isinstance(v, (int, float, str, bool))})
         moved = view.quantize_notes(**params)
         if not moved:
             QMessageBox.information(self, '量化', '沒有音符需要移動（本來就在格線上）。')
@@ -4705,6 +6283,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
             if answer != QMessageBox.Yes:
                 return
+        oplog.params(key=key.name(), confidence=round(float(
+            getattr(key, 'confidence', 1.0)), 3),
+            selection=len(view.selected))
         moved = view.snap_selected_to_key(key)
         if not moved:
             QMessageBox.information(
@@ -4784,10 +6365,12 @@ class MainWindow(QMainWindow):
         sp_off.setValue(0)
         sp_off.setSuffix(' ms')
         sp_off.setToolTip(
-            '把全部音符往後（正）或往前（負）移。0 = 不動。\n'
+            '把整個時間軸往後（正）或往前（負）移，**小節線一起搬**。0 = 不動。\n'
+            '往後移會在最前面留下一段不屬於任何小節的空白（遊戲顯示的 BPM 取自第一小節，平移不影響它）。\n'
+            '往前移碰到 0 會夾住。\n'
             '這是改譜面資料；只想調「播放時聽起來對不對齊」請用播放頁的偏移。'
         )
-        off_form.addRow('全部音符位移', sp_off)
+        off_form.addRow('整體位移（含小節線）', sp_off)
         vbox.addWidget(off_box)
 
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -4820,13 +6403,19 @@ class MainWindow(QMainWindow):
 
         if offset:
             m.push_history()
-            for n in m.notes_tree:
-                length = max(1, int(n.end) - int(n.start))
-                n.start = max(0, int(n.start) + offset)
-                n.end = n.start + length
-                n.gate = length
+            # 小節線要跟著搬，否則音符和小節的相對位置會跑掉。往後移會在最
+            # 前面留下一段不屬於任何小節的空白，那是刻意的。
+            m.shift_all_time(offset)
+            applied = int(getattr(m, 'last_shift_ms', offset))
             m.rebuild_display_cache()
-            changed.append('整體位移 %+d ms' % offset)
+            if applied != offset:
+                # 往前移最多只能移到最早的東西碰到 0，不然開頭幾筆會被壓成
+                # 同一個時間，小節長度歸零、BPM 變成天文數字。
+                changed.append('整體位移 %+d ms（含小節線；要求 %+d，'
+                               '前面只有 %d ms 可移）'
+                               % (applied, offset, -applied if applied else 0))
+            else:
+                changed.append('整體位移 %+d ms（含小節線）' % offset)
 
         if not changed:
             return
@@ -5043,7 +6632,242 @@ class MainWindow(QMainWindow):
         ('shortcut_play_full',  '從頭播放全曲', 'play_full'),
         ('shortcut_play_window', '播放目前視窗', 'play_window'),
         ('shortcut_stop',       '停止播放', 'stop_audio'),
+        ('shortcut_next_measure', '往後一小節', '_jump_next_measure'),
+        ('shortcut_prev_measure', '往前一小節', '_jump_prev_measure'),
+        ('shortcut_song_start', '跳到曲首', '_jump_song_start'),
+        ('shortcut_song_end',   '跳到最後一顆音符', '_jump_song_end'),
+        ('shortcut_dur_shorter', '放置時值：短一級', '_shortcut_dur_shorter'),
+        ('shortcut_dur_longer', '放置時值：長一級', '_shortcut_dur_longer'),
+        ('shortcut_toggle_hand', '放置手：左右切換', '_shortcut_toggle_hand'),
+        ('shortcut_toggle_tap_hold', '選取音符：點擊 / 長條切換', '_shortcut_toggle_tap_hold'),
+        ('shortcut_toggle_width', '選取音符：鍵寬 2 / 3 切換', '_shortcut_toggle_width'),
+        ('shortcut_measures_bpm', '多小節 BPM / 拍號…', 'change_measures_bpm_dialog'),
+        ('shortcut_events', '事件（速度／音效）…', 'edit_events_dialog'),
     )
+
+    # ── 快捷鍵：跳位置 ────────────────────────────────────────────────
+
+    #: 往前一小節時，離小節開頭超過這麼多就先回到本小節開頭（和播放器的
+    #: 「上一首」一樣），不然停在小節中間按一下會跳過半個小節。
+    _MEASURE_JUMP_SLACK_MS = 30.0
+
+    def _jump_to_ms(self, ms: float) -> None:
+        """把判定線移到某一刻。正在播就從那裡接著播，沒在播（含暫停）只捲畫面。
+
+        暫停時只捲畫面就好：「從查看的位置繼續」會在按繼續時接手。
+        """
+        ms = max(0.0, float(ms))
+        if getattr(self, '_is_playing', False) and not self.audio.is_paused():
+            self._resume_from(ms)
+            return
+        for pane in self._visible_panes() or [self.view]:
+            pane.follow_to_ms(ms)
+            pane.update()
+        self.view._emit_status()
+
+    def _jump_measure(self, step: int) -> None:
+        m = self.view.model
+        total = m.count_measures()
+        if total <= 0:
+            return
+        now = self.view.judge_line_view_ms()
+        cur = m.get_measure_at_ms(now)
+        start, _end = m.get_measure_time_range(cur)
+        if step < 0 and start is not None and now - start > self._MEASURE_JUMP_SLACK_MS:
+            target = cur
+        else:
+            target = cur + step
+        target = max(0, min(total - 1, target))
+        start, _end = m.get_measure_time_range(target)
+        if start is not None:
+            self._jump_to_ms(start)
+            self.statusBar().showMessage(f'第 {target + 1} / {total} 小節', 1500)
+
+    def _jump_next_measure(self) -> None:
+        self._jump_measure(1)
+
+    def _jump_prev_measure(self) -> None:
+        self._jump_measure(-1)
+
+    def _jump_song_start(self) -> None:
+        self._jump_to_ms(0.0)
+
+    def _jump_song_end(self) -> None:
+        notes = self.view.model.notes_tree
+        if notes:
+            self._jump_to_ms(max(float(n.start) for n in notes))
+
+    # ── 快捷鍵：放置參數 ──────────────────────────────────────────────
+
+    def _shortcut_step_duration(self, longer: bool) -> None:
+        """在時值選單裡往長或往短挪一格（照實際長度排，不照選單順序）。"""
+        items = self._note_dur_items
+        order = sorted(range(len(items)), key=lambda i: items[i][1])
+        pos = order.index(self._ni_dur_idx) if self._ni_dur_idx in order else 0
+        pos = max(0, min(len(order) - 1, pos + (1 if longer else -1)))
+        idx = order[pos]
+        self._on_dur_combo_changed(idx)
+        self.statusBar().showMessage(f'放置時值：{items[idx][0]}', 1500)
+
+    def _shortcut_dur_shorter(self) -> None:
+        self._shortcut_step_duration(longer=False)
+
+    def _shortcut_dur_longer(self) -> None:
+        self._shortcut_step_duration(longer=True)
+
+    def _shortcut_toggle_hand(self) -> None:
+        idx = 0 if self._ni_hand_idx == 1 else 1
+        self._on_hand_combo_changed(idx)
+        label = t('tb_note_hand_r') if idx == 0 else t('tb_note_hand_l')
+        self.statusBar().showMessage(f'放置手：{label}', 1500)
+
+    def _selection_pane(self):
+        """編輯快捷鍵要作用在哪個譜面：有焦點的那個，否則有選取的那個，否則主譜面。"""
+        panes = [p for p in (self._visible_panes() or []) if p is not None] or [self.view]
+        for pane in panes:
+            if pane.hasFocus():
+                return pane
+        for pane in panes:
+            if pane.selected:
+                return pane
+        return self.view
+
+    def _shortcut_toggle_tap_hold(self) -> None:
+        pane = self._selection_pane()
+        if not pane.selected:
+            self.statusBar().showMessage('先選取音符再切換點擊／長條', 1500)
+            return
+        target = pane.toggle_tap_hold_selected()
+        if target is not None:
+            self.statusBar().showMessage(
+                '%d 顆改成%s' % (len(pane.selected), '長條' if target == 2 else '點擊'), 1500)
+
+    def _shortcut_toggle_width(self) -> None:
+        pane = self._selection_pane()
+        if not pane.selected:
+            self.statusBar().showMessage('先選取音符再切換鍵寬', 1500)
+            return
+        target = pane.toggle_width_selected()
+        if target is not None:
+            self.statusBar().showMessage('%d 顆改成寬 %d' % (len(pane.selected), target), 1500)
+
+    #: 寫死在譜面鍵盤處理（ChartView.keyPressEvent）裡的鍵。只有譜面有焦點時
+    #: 才有效，但一樣是那顆按鈕的快捷鍵，要標出來。
+    _FIXED_SHORTCUTS = {
+        'play_full': ('Ctrl+P',),
+        'play_window': ('P',),
+        'play_selection': ('Shift+P',),
+        'stop_audio': ('S',),
+        'zoom_in': ('+',),
+        'zoom_out': ('-',),
+        'toggle_preview': ('Tab',),
+        'start_alloc_section': ('Shift+A',),
+    }
+
+    #: 按鈕接的函式和快捷鍵接的函式不是同一個，但做的是同一件事
+    _SHORTCUT_ALIASES = {
+        '_on_note_input_toggle': '_toggle_note_input_mode',
+        '_toggle_pause_resume': '_shortcut_play_pause',
+        'pause_audio': '_shortcut_play_pause',
+        'resume_audio': '_shortcut_play_pause',
+    }
+
+    def _shortcut_names(self, keys) -> Tuple[str, ...]:
+        """`keys` 可以是函式名稱、名稱清單，或直接給 slot（取它的函式名）。"""
+        if keys is None:
+            return ()
+        if isinstance(keys, str):
+            names = [keys]
+        elif isinstance(keys, (list, tuple)):
+            names = list(keys)
+        else:
+            name = getattr(keys, '__name__', '')
+            names = [name] if name and name != '<lambda>' else []
+        out = []
+        for name in names:
+            for n in (name, self._SHORTCUT_ALIASES.get(name)):
+                if n and n not in out:
+                    out.append(n)
+        return tuple(out)
+
+    def _shortcut_text(self, names, fixed: bool = True) -> str:
+        """這些動作目前綁了哪些鍵，排成「Space / P」這樣。沒綁就是空字串。"""
+        user = {method: key for key, _label, method in self._SHORTCUT_ACTIONS}
+        seqs = []
+        for name in names:
+            bound = str(settings.get(user[name], '') or '') if name in user else ''
+            if bound:
+                seqs.append(bound)
+            if fixed:
+                seqs.extend(self._FIXED_SHORTCUTS.get(name, ()))
+        shown = []
+        for seq in seqs:
+            text = QKeySequence(seq).toString(QKeySequence.NativeText) or seq
+            if text not in shown:
+                shown.append(text)
+        return ' / '.join(shown)
+
+    def _label_shortcut(self, target, text: str, tip: str, keys, style: str) -> None:
+        """登記一個要標快捷鍵的按鈕／選單項目／下拉框，並馬上畫一次。
+
+        style：'button' 文字後面加（鍵）；'menu' 用 Tab 分隔，Qt 會把它靠右
+        對齊在快捷鍵那一欄；'tooltip' 只寫進提示（下拉框的文字是選項，不能動）。
+        偏好設定改了快捷鍵之後 `_refresh_shortcut_labels` 會全部重畫。
+        """
+        # 只登記「可能有快捷鍵」的動作。沒有的不要碰它的文字：像 MIDI 鋼琴開關
+        # 和音量旁邊那顆喇叭共用同一個 QAction，文字由 `_refresh_vol_rows` 換成
+        # 🔊／🔇，這裡重畫一次就會把喇叭蓋成「MIDI 鋼琴」。
+        user = {method for _key, _label, method in self._SHORTCUT_ACTIONS}
+        names = tuple(n for n in self._shortcut_names(keys)
+                      if n in user or n in self._FIXED_SHORTCUTS)
+        if not names:
+            return
+        target.setProperty('sc_text', text)
+        target.setProperty('sc_tip', tip or '')
+        target.setProperty('sc_names', list(names))
+        target.setProperty('sc_style', style)
+        if not hasattr(self, '_shortcut_labeled'):
+            self._shortcut_labeled = []
+        if target not in self._shortcut_labeled:
+            self._shortcut_labeled.append(target)
+        self._render_shortcut_label(target)
+
+    def _set_labeled_text(self, target, text: str, tip: Optional[str] = None) -> None:
+        """換掉按鈕的文字（例如暫停↔繼續），快捷鍵標示保留。"""
+        if target.property('sc_names'):
+            target.setProperty('sc_text', text)
+            if tip is not None:
+                target.setProperty('sc_tip', tip)
+            self._render_shortcut_label(target)
+            return
+        target.setText(text)
+        if tip is not None:
+            target.setToolTip(tip)
+
+    def _render_shortcut_label(self, target) -> None:
+        text = target.property('sc_text') or ''
+        tip = target.property('sc_tip') or ''
+        style = target.property('sc_style')
+        names = target.property('sc_names') or []
+        # 選單的文字裡已經寫了固定鍵（例如「▶ 播放整首  Ctrl+P」），那邊只補可自訂的
+        keys = self._shortcut_text(names, fixed=(style != 'menu'))
+        if style == 'button':
+            target.setText(f'{text} ({keys})' if keys else text)
+        elif style == 'menu':
+            target.setText(f'{text}\t{keys}' if keys else text)
+        if style in ('button', 'tooltip'):
+            line = f'快捷鍵：{keys}' if keys else ''
+            target.setToolTip('\n'.join(x for x in (tip, line) if x) or text)
+
+    def _refresh_shortcut_labels(self) -> None:
+        from PyQt5 import sip
+        alive = []
+        for target in getattr(self, '_shortcut_labeled', ()):
+            if sip.isdeleted(target):
+                continue                      # 獨立視窗那條工具列被收掉了
+            self._render_shortcut_label(target)
+            alive.append(target)
+        self._shortcut_labeled = alive
 
     def _shortcut_play_pause(self) -> None:
         """一個鍵管播放與暫停：沒在播就從目前視窗開始，正在播就暫停/繼續。"""
@@ -5068,6 +6892,7 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ApplicationShortcut)
             sc.activated.connect(getattr(self, method))
             self._user_shortcuts.append(sc)
+        self._refresh_shortcut_labels()
 
     def _toggle_note_input_mode(self) -> None:
         """快捷鍵用：切換放置模式，並讓工具列按鈕跟著更新。"""
@@ -5084,6 +6909,10 @@ class MainWindow(QMainWindow):
             for v in self._panes:
                 v.scroll_invert = scroll_inv
             self._act_inv.setChecked(scroll_inv)
+            # 關掉操作紀錄的話，手上那個沒結算的動作就別留著了
+            self._flush_oplog()
+            oplog.configure(settings.get('oplog_enabled', True))
+            self._configure_autosave()
             self._sync_view_settings_ui()
             self.view._emit_status()
 
@@ -5096,7 +6925,6 @@ class MainWindow(QMainWindow):
         pairs = (
             ('_act_vel_num', 'pitch_velocity_numbers', True),
             ('_act_dyn_lane', 'pitch_dynamics_lane', True),
-            ('_act_scale_hl', 'pitch_scale_highlight', True),
             ('_act_scale_lock', 'pitch_scale_lock', False),
             ('_act_ghost', 'ghost_other_hand', True),
             ('_act_vel_shade', 'pitch_velocity_shading', True),
@@ -5111,6 +6939,13 @@ class MainWindow(QMainWindow):
                 act.blockSignals(True)
                 act.setChecked(want)
                 act.blockSignals(False)
+        act = getattr(self, '_act_scale_hl', None)
+        if act is not None:
+            want = str(settings.get('pitch_column_mode', 'blackwhite')) == 'scale'
+            if act.isChecked() != want:
+                act.blockSignals(True)
+                act.setChecked(want)
+                act.blockSignals(False)
         self.statusBar().setVisible(bool(settings.get('show_statusbar', False)))
         self._set_pitch_numbering(bool(settings.get('show_midi_pitch', False)),
                                   save=False)
@@ -5121,9 +6956,132 @@ class MainWindow(QMainWindow):
         for v in self._panes:
             v.update()
 
+    def _set_pitch_column_mode(self, mode: str) -> None:
+        """切換音高模式的欄位分色，馬上重畫。
+
+        選單和偏好設定的下拉是同一個設定的兩個入口，所以兩邊都走這裡。
+        """
+        settings.set('pitch_column_mode', mode)
+        for pane in self._panes:
+            pane.update()
+
+    # ── 自動儲存 ──────────────────────────────────────────────────────
+
+    def _configure_autosave(self) -> None:
+        """依偏好設定開關計時器。設定改完會即時呼叫。"""
+        minutes = int(settings.get('autosave_interval_min',
+                                   autosave.DEFAULT_INTERVAL_MIN) or 0)
+        if settings.get('autosave_enabled', True) and minutes > 0:
+            self._autosave_timer.start(max(1, minutes) * 60_000)
+        else:
+            self._autosave_timer.stop()
+
+    def _on_autosave_tick(self) -> None:
+        """時間到：有沒存的改動就寫一份備份。
+
+        三種時候先不存、下一輪再說：
+          * **播放中**——存 XML 要幾百毫秒，判定線會頓一下；停下來時補存。
+          * **有對話框開著**——工具可能正在背景執行緒改這份譜，存到一半的
+            狀態沒意義。
+          * **滑鼠按著**——正在拖曳音符，拖完再存。
+        """
+        if not settings.get('autosave_enabled', True):
+            return
+        model = self.view.model
+        if not getattr(model, 'dirty', False) or not model.notes_tree:
+            return
+        if (self._is_playing
+                or QApplication.activeModalWidget() is not None
+                or QApplication.mouseButtons() != Qt.NoButton):
+            self._autosave_pending = True
+            return
+        self._autosave_pending = False
+        try:
+            autosave.write_backup(model, self._autosave_session)
+        except Exception:                       # noqa: BLE001
+            logging.exception('autosave failed')
+            return
+        self.statusBar().showMessage(
+            '已自動備份（%s）' % time.strftime('%H:%M'), 4000)
+
+    def _autosave_if_pending(self) -> None:
+        """剛才因為播放而跳過的那一次，停下來就補上。"""
+        if self._autosave_pending:
+            QTimer.singleShot(0, self._on_autosave_tick)
+
+    def _discard_autosave(self, *sources: Optional[str]) -> None:
+        for source in sources or (self.view.model.current_file,):
+            try:
+                autosave.discard_backup(source, self._autosave_session)
+            except Exception:                   # noqa: BLE001
+                logging.exception('discard autosave failed')
+
+    def offer_crash_recovery(self) -> None:
+        """啟動時發現上次沒正常結束留下的備份，問要不要還原。"""
+        try:
+            backups = autosave.list_backups()
+        except Exception:                       # noqa: BLE001
+            logging.exception('list autosave failed')
+            return
+        if not backups:
+            return
+        lines = '\n'.join('　' + autosave.describe(b) for b in backups[:6])
+        more = '\n　…另外還有 %d 份' % (len(backups) - 6) if len(backups) > 6 else ''
+        box = QMessageBox(self)
+        box.setWindowTitle('找到自動備份')
+        box.setText('上次編輯器沒有正常關閉，留下了還沒存檔的備份：\n\n%s%s'
+                    % (lines, more))
+        restore = box.addButton('還原…', QMessageBox.AcceptRole)
+        delete = box.addButton('刪除這些備份', QMessageBox.DestructiveRole)
+        box.addButton('稍後再說', QMessageBox.RejectRole)
+        box.setDefaultButton(restore)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is delete:
+            for info in backups:
+                for path in (info.data_path, info.meta_path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            return
+        if clicked is not restore:
+            return
+        chosen = backups[0]
+        if len(backups) > 1:
+            labels = [autosave.describe(b) for b in backups]
+            label, ok = QInputDialog.getItem(
+                self, '找到自動備份', '要還原哪一份？', labels, 0, False)
+            if not ok:
+                return
+            chosen = backups[labels.index(label)]
+        self._open_backup(chosen)
+
+    def _open_backup(self, info) -> None:
+        try:
+            model = NoteModel()
+            autosave.load_backup(info, model)
+        except Exception as e:                  # noqa: BLE001
+            QMessageBox.critical(self, t('dlg_load_fail_title'),
+                                 t('dlg_load_fail_msg', e))
+            return
+        self._install_loaded_model(model, info.source or info.data_path)
+        self.statusBar().showMessage('已從自動備份還原，記得存檔', 6000)
+
+    def _flush_oplog(self) -> None:
+        """把還沒結算的那個動作寫出去（見 oplog.flush）。"""
+        if not oplog.enabled:
+            return
+        try:
+            oplog.flush(self.view.model)
+        except Exception:                       # noqa: BLE001
+            logging.exception('oplog flush failed')
+
     def closeEvent(self, event: QCloseEvent) -> None:
         self._judge_timer.stop()
         self._title_timer.stop()
+        self._oplog_timer.stop()
+        self._flush_oplog()
         if self.view.model.dirty:
             reply = QMessageBox.question(
                 self, t('dlg_unsaved_title'), t('dlg_unsaved_msg'),
@@ -5143,6 +7101,8 @@ class MainWindow(QMainWindow):
                     return
                 event.accept()
             elif reply == QMessageBox.Discard:
+                # 使用者明確選了不儲存：備份也要一起丟掉，下次開檔不再問
+                self._discard_autosave()
                 event.accept()
             else:
                 # 使用者取消：恢復計時器
@@ -5155,6 +7115,7 @@ class MainWindow(QMainWindow):
             self._is_playing = False
             event.accept()
         if event.isAccepted():
+            self._autosave_timer.stop()
             # 獨立視窗是頂層視窗，不關掉的話應用程式不會結束
             self._close_detached()
             if self._midi_preview_synth is not None:

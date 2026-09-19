@@ -68,12 +68,25 @@ def _pix(name: str) -> QPixmap:
 
 
 # ── 畫布 Widget ───────────────────────────────────────────────────────────────
+def _playable(notes: List[GNote]) -> List[GNote]:
+    """濾掉「遊戲譜面隱藏」的音符。
+
+    預覽的用途是「這在遊戲裡長怎樣」，而隱藏音符不佔按鍵、只發聲，玩家看不到
+    它們。主編輯畫面早就在非音高模式濾掉了（`chart_view._draw_notes`），預覽
+    這條路徑漏掉，於是預覽會多出一堆遊戲裡根本不存在的音符。
+
+    在入口濾一次就好：`paintEvent`、`_draw_slide_bands`、`_update_size` 都是
+    讀 `self.notes`，一個一個加判斷遲早會漏。
+    """
+    return [n for n in notes if not getattr(n, 'hidden', False)]
+
+
 class PreviewCanvas(QWidget):
     """實際繪製譜面的 QWidget，嵌入 QScrollArea 使用。"""
 
     def __init__(self, notes: List[GNote], px_per_ms: float = PX_PER_MS) -> None:
         super().__init__()
-        self.notes     = notes
+        self.notes     = _playable(notes)
         self.px_per_ms = px_per_ms
         self._update_size()
 
@@ -82,7 +95,7 @@ class PreviewCanvas(QWidget):
     # ------------------------------------------------------------------
 
     def set_notes(self, notes: List[GNote]) -> None:
-        self.notes = notes
+        self.notes = _playable(notes)
         self._update_size()
         self.update()
 

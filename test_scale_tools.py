@@ -36,7 +36,8 @@ def make_note(idx, start, pitch, hand=0, end=None):
 class ViewCase(unittest.TestCase):
     """每個測試都把三個開關恢復成預設，免得互相汙染。"""
 
-    DEFAULTS = {'pitch_scale_highlight': True,
+    # 調性分色現在是「音高欄位分色」的一個選項，不再是獨立的布林開關
+    DEFAULTS = {'pitch_column_mode': 'scale',
                 'pitch_scale_lock': False,
                 'ghost_other_hand': True}
 
@@ -91,7 +92,7 @@ class ScaleHighlightTests(ViewCase):
                          (0, 'major'))
 
     def test_the_setting_turns_it_off(self):
-        settings.set('pitch_scale_highlight', False)
+        settings.set('pitch_column_mode', 'blackwhite')
         self.assertFalse(self.view._scale_highlight_on())
 
     def test_it_only_applies_in_pitch_mode(self):
@@ -177,25 +178,25 @@ class KeyboardDimTests(ViewCase):
 
     def test_no_in_key_key_is_touched(self):
         # 舊做法（畫完再蓋一層灰）在這裡會弄髒 36 個調內黑鍵
-        settings.set('pitch_scale_highlight', False)
+        settings.set('pitch_column_mode', 'blackwhite')
         plain = self.render()
-        settings.set('pitch_scale_highlight', True)
+        settings.set('pitch_column_mode', 'scale')
         lit = self.render()
         self.assertEqual(self.dirtied(plain, lit, want_in_key=True), [],
                          '調內的鍵被旁邊調外鍵的暗色波及了')
 
     def test_out_of_key_keys_do_get_dimmed(self):
-        settings.set('pitch_scale_highlight', False)
+        settings.set('pitch_column_mode', 'blackwhite')
         plain = self.render()
-        settings.set('pitch_scale_highlight', True)
+        settings.set('pitch_column_mode', 'scale')
         lit = self.render()
         self.assertTrue(self.dirtied(plain, lit, want_in_key=False),
                         '調外的鍵本來就該變暗')
 
     def test_turning_it_off_restores_the_plain_keyboard(self):
-        settings.set('pitch_scale_highlight', True)
+        settings.set('pitch_column_mode', 'scale')
         self.render()
-        settings.set('pitch_scale_highlight', False)
+        settings.set('pitch_column_mode', 'blackwhite')
         off = self.render()
         again = self.render()
         self.assertEqual(self.dirtied(off, again, want_in_key=True), [])

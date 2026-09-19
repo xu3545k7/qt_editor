@@ -133,6 +133,72 @@ class UndoCorrectnessTests(unittest.TestCase):
         self.assertEqual(m.notes_tree[0].start, 0)
 
 
+class SharedSnapshotTests(unittest.TestCase):
+    """快照改成共用結構：沒改過的音符在各步之間共用同一份紀錄。
+
+    以前每一步都 deepcopy 整份 notes_tree（3357 顆一筆 1.46MB），39 筆就把
+    程式撐大 59MB；記憶體不夠的機器在 undo 那一刻被推過上限，Qt 下一次重繪
+    配置失敗，以「存取違規」崩潰（log 停在 `_draw_lane_keyboard`）。
+    """
+
+    def test_untouched_notes_share_one_record_across_steps(self):
+        m = chart(100)
+        m.push_history()
+        m.notes_tree[5].start += 10
+        m.push_history()
+        first, second = m.undo_stack[-2]['note_records'], m.undo_stack[-1]['note_records']
+        self.assertIs(second[0], first[0], '沒改過的音符要共用同一份紀錄')
+        self.assertIsNot(second[5], first[5], '改過的音符要有自己的紀錄')
+
+    def test_restored_notes_are_new_objects(self):
+        m = chart(10)
+        m.push_history()
+        old = m.notes_tree[0]
+        m.notes_tree[0].start = 5555
+        m.undo()
+        self.assertIsNot(m.notes_tree[0], old)
+        self.assertEqual(m.notes_tree[0].start, 0)
+
+    def test_editing_after_undo_does_not_change_the_history(self):
+        m = chart(10)
+        m.push_history()
+        m.push_history()
+        m.undo()
+        m.notes_tree[0].start = 7777          # 改還原出來的物件
+        m.undo()
+        self.assertEqual(m.notes_tree[0].start, 0, '還原出來的物件不能和快照共用可變狀態')
+
+    def test_links_between_notes_point_at_the_restored_notes(self):
+        """隱藏音的 `_sub_host` 指向同一份譜裡的寄主，還原後要指到新的那一顆。"""
+        m = chart(5)
+        m.notes_tree[3]._sub_host = m.notes_tree[1]
+        m.push_history()
+        m.undo()
+        self.assertIs(m.notes_tree[3]._sub_host, m.notes_tree[1])
+
+    def test_mutable_extra_attributes_are_not_shared(self):
+        m = chart(3)
+        m.notes_tree[0].custom = [1, 2]
+        m.push_history()
+        m.notes_tree[0].custom.append(3)
+        m.undo()
+        self.assertEqual(m.notes_tree[0].custom, [1, 2])
+
+    def test_sub_elems_restore_as_their_own_list(self):
+        import xml.etree.ElementTree as ET
+        m = chart(2)
+        element = ET.Element('sub_note')
+        m.notes_tree[0].sub_elems = [element]
+        m.push_history()
+        m.undo()
+        restored = m.notes_tree[0].sub_elems
+        self.assertIsInstance(restored, list)
+        self.assertIs(restored[0], element, '元素本身照舊共用')
+        restored.append(ET.Element('sub_note'))
+        m.push_history()
+        self.assertEqual(len(m.undo_stack[-1]['note_records'][0][15]), 2)
+
+
 @unittest.skipUnless(OFFICIAL, '找不到官方譜面')
 class OfficialUndoRoundTripTests(unittest.TestCase):
     """官方 XML：undo 之後存出來的檔案要和沒編輯過**逐字元相同**。

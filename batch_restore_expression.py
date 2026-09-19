@@ -421,8 +421,14 @@ def transfer_from_sibling(target: NoteModel, source: NoteModel) -> Dict[str, int
     return stats
 
 
-def run_sibling_transfer(songs_root: Path, apply: bool) -> int:
-    """替「完全沒有音高、但同曲有結構相同的來源」的譜面搬表情。"""
+def run_sibling_transfer(songs_root: Path, apply: bool,
+                        chart_filter: Optional[List[str]] = None) -> int:
+    """替「完全沒有音高、但同曲有結構相同的來源」的譜面搬表情。
+
+    chart_filter 只縮小**要寫入的目標**，來源仍然從整個曲庫找——不然指名一份
+    譜面就會連它的來源一起被濾掉。沒有這個過濾時 --chart 在這條路徑上是無效的，
+    --apply 會把備份資料夾裡的譜面也一起改掉。
+    """
     charts = [p for p in find_charts(songs_root) if p.suffix.lower() == '.json']
     loaded: Dict[Path, NoteModel] = {}
     for path in charts:
@@ -433,6 +439,8 @@ def run_sibling_transfer(songs_root: Path, apply: bool) -> int:
     jobs = []
     for path, model in loaded.items():
         if chart_has_pitch(model):
+            continue
+        if chart_filter and not any(p in str(path.relative_to(songs_root)) for p in chart_filter):
             continue
         song = path.relative_to(songs_root).parts[0]
         for other, source in loaded.items():
@@ -511,7 +519,7 @@ def main(argv: Sequence[str]) -> int:
 
     songs_root = Path(args.songs)
     if args.from_sibling:
-        return run_sibling_transfer(songs_root, args.apply)
+        return run_sibling_transfer(songs_root, args.apply, args.chart)
     midi_roots = [Path(p) for p in (args.midi_dir or [])]
     if not midi_roots:
         midi_roots = [Path(os.path.expanduser("~")) / "Downloads", songs_root]

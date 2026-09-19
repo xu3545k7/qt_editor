@@ -11,6 +11,10 @@ build/
 build_tmp/
 *.spec
 !NostalgiaChartEditor.spec
+!NosMania.spec
+dist_build/
+build_tmp*/
+build_tmp_log.txt
 
 # VSCode
 .vscode/
@@ -59,3 +63,6 @@ PianoSamples*/
 # 測試產生的暫存輸出
 test_midi_conv.xml
 test_tmp.xml
+
+# 操作紀錄（本機分析用，見 qt_editor/oplog.py）
+qt_editor/logs/

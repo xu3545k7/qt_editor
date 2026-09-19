@@ -29,28 +29,43 @@ from PyQt5.QtWidgets import (
 
 
 # 音符值 → 拍數（以四分音符 = 1 拍計；x/4 拍號）。
+# 名稱和工具列「音符時值」下拉同一套：一個全音符切 N 份就叫 N 分音符。
 _NOTE_VALUES = [
-    ('1/1（全音符・4 拍）', 4.0),
-    ('1/2（2 拍）',        2.0),
-    ('1/4（1 拍）',        1.0),
-    ('1/8',               0.5),
-    ('1/8T 三連',         1.0 / 3.0),
-    ('1/16',              0.25),
-    ('1/16T 三連',        1.0 / 6.0),
-    ('1/32',              0.125),
+    ('全音符（4 拍）',          4.0),
+    ('二分音符（2 拍）',        2.0),
+    ('四分音符（1 拍）',        1.0),
+    ('6分音符（四分三連）',     2.0 / 3.0),
+    ('八分音符',               0.5),
+    ('12分音符（八分三連）',    1.0 / 3.0),
+    ('16分音符',              0.25),
+    ('24分音符（16分三連）',    1.0 / 6.0),
+    ('32分音符',              0.125),
+    ('48分音符（32分三連）',    1.0 / 12.0),
 ]
 
 
-def _note_value_combo(default_beats: float) -> QComboBox:
-    cb = QComboBox()
-    for label, beats in _NOTE_VALUES:
-        cb.addItem(label, float(beats))
+#: 上次按「確定」時的參數存在設定檔的這個鍵底下，下次開窗直接帶回來。
+_SETTINGS_KEY = 'hold_length_fix'
+
+
+def _select_beats(cb: QComboBox, beats: float) -> None:
+    """選最接近 `beats` 的那一項（存檔的值可能是舊版的浮點數）。"""
     best_i, best_d = 0, None
     for i in range(cb.count()):
-        d = abs(float(cb.itemData(i)) - float(default_beats))
+        d = abs(float(cb.itemData(i)) - float(beats))
         if best_d is None or d < best_d:
             best_d, best_i = d, i
     cb.setCurrentIndex(best_i)
+
+
+def _note_value_combo(default_beats: float) -> QComboBox:
+    from PyQt5.QtCore import QSize
+    from .note_icons import VALUE_ICON_H, VALUE_ICON_W, note_value_icon
+    cb = QComboBox()
+    cb.setIconSize(QSize(int(round(VALUE_ICON_W * 20 / float(VALUE_ICON_H))), 20))
+    for label, beats in _NOTE_VALUES:
+        cb.addItem(note_value_icon(beats), label, float(beats))
+    _select_beats(cb, default_beats)
     return cb
 
 
@@ -158,6 +173,44 @@ class HoldLengthDialog(QDialog):
         bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
         root.addWidget(bbox)
+
+        self._restore()
+
+    # ── 記住上次的設定 ───────────────────────────────────────────
+    def _restore(self) -> None:
+        """帶回上次按「確定」時的參數；沒存過就維持上面的預設值。
+
+        範圍（選取／整個譜面）不記：它取決於這次開窗時有沒有選取音符。
+        """
+        from .settings import settings
+        saved = settings.get(_SETTINGS_KEY) or {}
+        if not isinstance(saved, dict):
+            return
+        try:
+            if 'tap_th_beats' in saved:
+                _select_beats(self._cb_tap_th, float(saved['tap_th_beats']))
+            if 'hold_th_beats' in saved:
+                _select_beats(self._cb_hold_th, float(saved['hold_th_beats']))
+            if 'short_ratio' in saved:
+                self._sp_ratio.setValue(int(round(float(saved['short_ratio']) * 100)))
+            if 'long_advance_ms' in saved:
+                self._sp_advance.setValue(int(saved['long_advance_ms']))
+            if 'tail_gap_ms' in saved:
+                self._sp_tail_gap.setValue(int(saved['tail_gap_ms']))
+            if 'tail_only_conflicts' in saved:
+                if bool(saved['tail_only_conflicts']):
+                    self._rb_gap_conflict.setChecked(True)
+                else:
+                    self._rb_gap_next.setChecked(True)
+        except (TypeError, ValueError):
+            pass                            # 設定檔被手改壞了，就用預設值
+
+    def accept(self) -> None:
+        # 只在「確定」時存；按取消代表這次的調整不算數。
+        from .settings import settings
+        saved = {k: v for k, v in self.params().items() if k != 'scope'}
+        settings.set(_SETTINGS_KEY, saved)
+        super().accept()
 
     # ── 結果 ─────────────────────────────────────────────────────
     def params(self) -> Dict[str, object]:

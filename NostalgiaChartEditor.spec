@@ -16,6 +16,9 @@ datas = [
     ('qt_editor/icon.ico', 'qt_editor'),
     ('qt_editor/Tap.wav', 'qt_editor'),
     ('qt_editor/settings.json', 'qt_editor'),
+    # AI 轉譜的工作程序：不在製譜器裡執行，是複製到另外裝的轉譜環境去跑的，
+    # 所以要當資料檔帶著（打包進 PYZ 的話就拿不到原始碼了）。
+    ('qt_editor/ai_transcribe_worker.py', 'qt_editor'),
     # 主音源。遊戲端的取樣庫是用同一份的「Bright Steinway」preset 烤的，
     # 換掉這裡就要重跑 render_piano_samples.py，否則兩邊音色會不一樣。
     ('soundfonts/Nice-Steinway-v3.8.sf2', 'soundfonts'),
@@ -33,6 +36,8 @@ hiddenimports = collect_submodules('mido')
 # 「工具 → 延音踏板 → 依和聲生成踏板」是在函式裡才 import 的（避免啟動時就把
 # 批次工具拉進來），PyInstaller 的靜態分析看不到，不明講就會漏打包。
 hiddenimports += ['generate_pedal', 'batch_restore_expression']
+hiddenimports += ['qt_editor.ai_transcribe', 'qt_editor.ai_transcribe_dialog',
+                  'qt_editor.ai_grid', 'qt_editor.ai_grid_dialog', 'qt_editor.beat_detect']
 
 a = Analysis(
     ['qt_editor/app.py'],

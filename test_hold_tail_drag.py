@@ -199,7 +199,9 @@ class HoldTailDragTests(unittest.TestCase):
         note = self.model.notes_tree[0]
         self.move(self.tail_point(note), held=False)
         r = self.rect_of(note)
-        self.move(QPoint(int(r.right()) + 60, int(r.center().y())), held=False)
+        # 移到譜面上（這顆音符的位置在鍵盤那一塊，鍵盤上不能放音符、游標是箭頭）
+        y = min(int(r.center().y()), v._keyboard_top_py() - 40)
+        self.move(QPoint(int(r.right()) + 60, y), held=False)
         self.assertEqual(v.cursor().shape(), Qt.CrossCursor)
 
 
@@ -297,7 +299,7 @@ class ShortcutSettingTests(unittest.TestCase):
         return False
 
     def test_the_defaults_include_one_two_and_space(self):
-        self.assertEqual(self.keys(), ['1', '2', 'Space'])
+        self.assertTrue({'1', '2', 'Space'} <= set(self.keys()))
 
     def test_one_cycles_the_view_mode(self):
         before = self.win.view.view_mode
@@ -453,9 +455,11 @@ class PreferencesTests(unittest.TestCase):
     def test_the_menu_only_settings_are_exposed(self):
         dlg = self.dialog()
         for key in ('pitch_velocity_numbers', 'pitch_dynamics_lane',
-                    'pitch_scale_highlight', 'ghost_other_hand',
-                    'show_statusbar', 'show_midi_pitch', 'pitch_scale_lock'):
+                    'ghost_other_hand', 'show_statusbar',
+                    'show_midi_pitch', 'pitch_scale_lock'):
             self.assertIn(key, dlg._toggles, key)
+        # 調性高亮已經變成「音高欄位分色」下拉的一個選項，不是勾選了
+        self.assertEqual(dlg._pitch_column_combo.currentData(), 'blackwhite')
 
     def test_the_toggles_persist(self):
         dlg = self.dialog()

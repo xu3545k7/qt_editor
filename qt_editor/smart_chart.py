@@ -67,11 +67,21 @@ class SmartChartSettings:
     pitch_consistency_reach: int = 6
     pitch_consistency_passes: int = 4
     # 「前後同音同軌」：直接對齊前一次出現，而不是視窗中位數
+    # 吸附不得把「相鄰的不同音高」壓到同一個右緣。0 = 關閉。
+    # 吸附是整隻手剛體平移，會把旁邊不相干的音一起拖過去：實測 3 半音的壓平率
+    # 因此從 0.0% 衝到 8.3%（Eather 的譜是 3.0%），而且一眼就看得出來
+    # —— 使用者的原話是「68 到 73 完全沒有階梯」「44 和 49 一直共用同軌」。
+    # 門檻設 3：半音和全音壓平是他自己也在做的（1 半音 20.2%、2 半音 5.0%），
+    # 那種本來就不需要各佔一軌。
+    snap_flat_min_semitones: int = 0
     snap_repeat_window_ms: int = 4000
     snap_repeat_reach: int = 6
     snap_repeat_passes: int = 3
     # 吸附是否排在所有搬動音符的通道之後再收一次（= 同音同軌的最高優先）
     snap_repeat_final: bool = True
+    #: 同音吸附移動單手整塊時，整塊離同音錨點的總距離最多可以增加多少格。
+    #: None = 不限制（舊行為，會一個接一個把整段拖走）
+    snap_block_drift_slack: Optional[float] = None
     # 前置約束：擺放前先把同音高的目標位置錨定在一起
     pitch_anchor_weight: float = 0.85
     pitch_anchor_window_ms: int = 4000
@@ -114,6 +124,20 @@ class SmartChartSettings:
     chord_pair_close_lanes: float = 3.0
     chord_pair_mid_semitones: int = 7
     chord_pair_mid_lanes: float = 4.0
+    # 上面那張表是**官方語料**量的，兩種風格本來共用。Eather 的譜量出來邊界
+    # 不一樣（92 份、35252 組同手同時兩顆，寬度組合 80~96% 都是 3x3，可比）：
+    #   半音差      2~4   5~7   8~9   10~12   13~21   22~24
+    #   官方空格     0     1     2      2       2       2
+    #   Eather      0     0     1      2       3      1.5
+    #   樣本       5984  6743  2741  19235    265      52
+    # 也就是他到五度為止都是貼合的（官方 5 半音就開始留空格）、八九度只留 1。
+    # 13 半音以上他量出來是 3，但那一段只有 265 組（0.75%），而且撐開大跨度
+    # 正是「鍵道不夠用」的來源，所以沒有採用 —— 見 settings_for_style。
+    # 這兩個欄位是為了讓階梯能表達第四階而留的，預設不會踩到。
+    chord_pair_far_semitones: int = 99
+    chord_pair_far_gap: int = 2
+    chord_pair_wide_semitones: int = 999
+    chord_pair_wide_gap: int = 2
     # 同手同時 3 顆以上就完全「貼合」，不再照音程留空隙。官方 real 的 k=3
     # 外圍中心距固定 6 格 —— 外圍音程從 5 半音到 24 半音全部都是 6，而且
     # 中間那顆固定落在正中央（音程比例 0.25/0.50/0.75 通通對應鍵道比例 0.50）。
@@ -136,6 +160,39 @@ class SmartChartSettings:
     # 整組移不動時，允不允許單獨移最高音那一顆（會犧牲一點和絃貼合）
     # 整組移不動時，允不允許單獨移最高音那一顆（會犧牲一點和絃貼合）
     top_step_strict_solo: bool = True
+    # 旋律斜率（_repair_melody_slope）：每隻手前後相接的兩組，冠音與低音的鍵道
+    # 步伐往「幾個半音 → 幾格」的實測曲線拉。0 = 不跑。
+    # 2026-09-18 掃描（15 首官方 Real／25 份手寫譜的一部分）：每音程平均格數與原譜的
+    # 加權差距，官方 0.224→0.154、手寫 0.283→0.189（冠音），同音同軌也同時變好。
+    # 整組兩手一起移（melody_slope_whole_group）幾乎沒幫助、官方還變差，預設關。
+    melody_slope_passes: int = 2
+    melody_slope_window_ms: int = 600
+    melody_slope_reach: int = 2
+    #: 低音那條線的權重（冠音是 1）
+    melody_slope_bottom_weight: float = 1.0
+    #: 同音高前後不在同一軌，每差一格的成本（避免和同音吸附互相拉扯）
+    melody_slope_repeat_weight: float = 3.0
+    #: 分數至少要降這麼多才搬（避免為了 0.1 格來回抖）
+    melody_slope_min_gain: float = 0.35
+    #: 較遠的同音（同手同音高，這個時間內的前後一次）不同軌，每差一格的成本
+    melody_slope_far_repeat_weight: float = 0.0
+    melody_slope_far_repeat_ms: int = 4000
+    #: 冠音前後差 1~2 個半音時，直接收成剛好 1 格（_repair_small_top_steps）
+    small_top_step_fix: bool = False
+    #: 修的時候另一側的步伐誤差最多可以變差多少格
+    small_top_step_side_slack: float = 0.5
+    #: 最多可以拆開幾組已經對齊的同音（0 = 一組都不准）
+    small_top_step_repeat_slack: int = 0
+    #: 排在最後那道同音吸附之後（吸附會把拉開的步伐吸回去）
+    melody_slope_after_snap: bool = True
+    #: 只移一隻手移不動時，改成整組（兩隻手）一起平移
+    melody_slope_whole_group: bool = False
+    #: 1~14 個半音的目標格數（鍵道中心的位移）。預設是官方 Real 全語料 424 份
+    #: 量的，見 settings_for_style。
+    melody_step_top: Tuple[float, ...] = (
+        1.10, 1.19, 1.94, 2.04, 2.55, 2.93, 3.36, 4.09, 4.32, 4.75, 4.77, 5.21, 5.46, 5.73)
+    melody_step_bottom: Tuple[float, ...] = (
+        1.09, 1.21, 1.93, 2.04, 2.53, 2.90, 3.24, 3.87, 4.10, 4.51, 4.41, 4.92, 5.34, 5.52)
     # 順序修復用整數位移搬音符時，「把同手和絃拆出空隙」要付的成本（每格）。
     # 沒有這一項的話 _discrete_final_order_repair 會把擺放時排好的貼合拆掉
     # ——實測它一個人就讓 k≥3 貼合率掉 159pp。
@@ -176,6 +233,12 @@ class SmartChartSettings:
     octave_lanes_edge: float = 2.5
     # 空間不夠時可以縮寬度，但最窄只能到 2（人工譜面沒有寬度 1 的音符）
     min_note_width: int = 2
+    #: 收窄的那一格從哪一邊拿：'right' = 收左緣（右緣不動，排序權威）；
+    #: 'left' = 收右緣（左緣不動）。使用者的風格要「寬度從左緣算」。
+    width_anchor: str = 'right'
+    #: 兩手距離「可以被弄差」多少格。失真容忍度最大的就是這一項：為了保住
+    #: 寬度、同手音程、旋律線，允許兩手之間先被擠掉這麼多（仍然不准重疊／交叉）。
+    cross_hand_slack_lanes: float = 0.0
     # 兩手交界處額外留的鍵道（官方 real 實測：同度數下跨手比同手多 2 格）
     hand_boundary_margin: float = 2.0
     # 跨手中心距的下限——官方小度數跨手也維持 5 格左右，不會貼在一起
@@ -246,6 +309,12 @@ def settings_for_style(
     """依風格產生一份設定。未知的風格名一律退回 Eather 風格。"""
     if normalise_style(style) == STYLE_OFFICIAL:
         base: Dict[str, Any] = dict(
+            # 兩手距離是最鬆的一項，官方語料也是：同一個音程下的相對離散
+            # （標準差÷平均）兩手之間 0.454、同手同時只有 0.243。放寬之後
+            # 8 首實測冠音差距 0.156→0.134、低音 0.150→0.126、順序違規 759→674。
+            cross_hand_slack_lanes=2.0,
+            # 同音吸附的連鎖拖移兩種風格都會發生；官方用 +2 大致持平、順序違規略降
+            snap_block_drift_slack=2.0,
             # 官方不用跨度收窄——只有「剛好單手同時 4 音」才收，其餘靠重疊。
             # 把跨度帶設成永遠不成立即可（min > max）。
             narrow_span_min=99,
@@ -264,10 +333,6 @@ def settings_for_style(
         )
     else:
         base = dict(
-            narrow_span_min=7,
-            narrow_span_max=11,
-            narrow_whole_span_min=7,
-            narrow_whole_span_max=11,
             close_chord_interval_semitones=3,
             # 表情記號一律由人判斷
             classify_slide=False,
@@ -275,6 +340,63 @@ def settings_for_style(
             classify_staccato=False,
             # 前後同音同軌是這個曲庫的最高優先項
             snap_repeat_final=True,
+            snap_flat_min_semitones=3,
+            # 旋律斜率目標：他的 25 份手寫譜（音高由 MIDI 還原，約 4 萬組）量的。
+            # 比官方收斂很多：半音 0.84 格（官方 1.10）、全音 1.02（1.19）。
+            melody_step_top=(
+                0.84, 1.02, 1.38, 1.69, 2.13, 2.77, 3.19, 3.87, 4.20, 4.65, 4.96, 5.05, 5.62, 5.91),
+            melody_step_bottom=(
+                0.81, 1.00, 1.37, 1.68, 2.13, 2.63, 3.02, 3.82, 4.20, 4.53, 4.91, 4.72, 5.47, 5.50),
+            # 兩手距離是最能忍受失真的一項（使用者指定）：為了保住寬度、同手
+            # 音程和旋律線，允許交界被擠掉 2 格。18 首實測：鍵道位置與參考譜的
+            # 差 1.47→1.34、順序違規 2143→2090、冠音違規 159→135，重疊沒增加。
+            cross_hand_slack_lanes=2.0,
+            # 斜率修補也看 4 秒內重複的同一個音：他手改的瑠璃の鳥同音同軌 78.3%，
+            # 排譜器只有 69.7%——斜率修補把同音吸附對齊好的音推開了。加 0.5 之後
+            # 79.8%，他改過的音符平均差 1.40→1.31；20 首獨立譜冠音差距
+            # 0.133→0.128、順序違規 2048→2006。官方風格加了反而變差，不開。
+            melody_slope_far_repeat_weight=0.5,
+            # 冠音差 1~2 個半音就走剛好 1 格：他手改的瑠璃の鳥 76% 是 1 格、只有 6% 走
+            # 2 格以上，排譜器是 61% / 22%（還有走 3、4 格的）。瑠璃の鳥冠音差距
+            # 0.263→0.215；20 首獨立譜 0.128→0.117，順序違規多 1.4%。官方風格開了變差。
+            small_top_step_fix=True,
+            # 同音吸附移動單手整塊時，整塊離同音錨點最多多 1 格。沒有這條，一顆
+            # 被對齊、同組其他音被拖走，下一次又各自對齊過去，整段一路被帶走
+            # （醉心 24~34 秒右手整段右移將近 3 格、貼到右牆）。瑠璃の鳥冠音差距
+            # 0.215→0.206、同音同軌 80.2→84.1%；12 首獨立譜冠音 0.119→0.100。
+            snap_block_drift_slack=1.0,
+            small_top_step_side_slack=1.0,
+            small_top_step_repeat_slack=1,
+            # 收窄的跨度帶 7~11 → 8~11：原本收窄率 21.3%，他自己的譜是 16.1%，
+            # 改完 15.1%，旋律步伐差距同時從 0.142/0.092 進步到 0.134/0.085。
+            # 跨度 7 拿掉、11 留著是照官方語料的收窄率（7 只有 4.0% 接近底噪、
+            # 8~10 是 5.0/5.8/9.5%、11 是最高的 16.5%、12 又掉回 1.9%）。
+            narrow_span_min=8,
+            narrow_span_max=11,
+            narrow_whole_span_min=8,
+            narrow_whole_span_max=11,
+            # 同手同時兩顆的空格階梯：到五度為止貼合、八九度留 1，其餘照舊。
+            # 見 chord_pair_close_semitones 那一段的實測表。
+            chord_pair_close_semitones=7,
+            chord_pair_mid_semitones=9,
+            # 跨手交界不額外加寬。量他的譜「左手最高音 → 右手最低音」的推進量
+            # （43336 組），每一個音程都比程式碼要求的少**剛好 2 格**：
+            #   半音差   1~6  7~11  12~16  17~21  22~26  27~33
+            #   他        3.0   4.0    6.0    8.0   10.0   12.0
+            #   程式碼    5.0   5.8    7.8    9.9   12.0   14.0
+            # 差值正好是 hand_boundary_margin=2.0；小度數那格則是
+            # hand_boundary_min_distance=5.0 撐起來的（他是 3.0）。
+            # 拿掉之後 interval*0.417 直接命中：3→3.0、9→3.75、14→5.83、
+            # 19→7.92、24→10.0、30→12.0（封頂）。
+            #
+            # 這 2 格是三個症狀的共同來源：右手被整體推右、鍵道白白少 2 格、
+            # 以及右手位置隨左手最高音浮動（同一個音高在不同和絃裡跳軌）。
+            hand_boundary_margin=0.0,
+            hand_boundary_min_distance=3.0,
+            # 13~21 半音他量出來是空格 3（官方是 2），但那一段只有 265 個樣本
+            # （佔 35252 的 0.75%），而且撐開大跨度正是「鍵道不夠用」的來源。
+            # 樣本不足以承擔那個代價，所以維持官方的 2，只改樣本充足的
+            # 5~7（6743 組）和 8~9（2741 組）。
         )
     base.update(overrides)
     return SmartChartSettings(**base)
@@ -316,6 +438,7 @@ class SmartChartStats:
     pitch_anchor_adjusted: int = 0
     chord_reflushed: int = 0
     hand_top_strict_repairs: int = 0
+    melody_slope_moves: int = 0
 
 
 def _start(note: Any) -> int:
@@ -2460,7 +2583,11 @@ def _chord_pair_gap(interval: int, settings: SmartChartSettings) -> int:
         return 0
     if interval <= int(settings.chord_pair_mid_semitones):
         return 1
-    return 2
+    if interval <= int(settings.chord_pair_far_semitones):
+        return 2
+    if interval <= int(settings.chord_pair_wide_semitones):
+        return int(settings.chord_pair_far_gap)
+    return int(settings.chord_pair_wide_gap)
 
 
 def _chord_pair_lanes(
@@ -2694,8 +2821,13 @@ def _place_hand(
     )
     starts: List[int] = []
     placed_widths: List[int] = []
+    # 'left'：收窄的音符左緣對齊滿寬時的左緣（收掉的是右邊那一格），
+    # 'right'（預設）：收窄的音符置中在目標位置上。
+    anchor_width = (max(1, int(settings.normal_width))
+                    if str(getattr(settings, 'width_anchor', 'right')) == 'left' else None)
     for note, width in ordered:
-        wanted = int(round(desired[id(note)][0] - (width - 1) / 2.0))
+        span = anchor_width if anchor_width is not None else width
+        wanted = int(round(desired[id(note)][0] - (span - 1) / 2.0))
         starts.append(max(lane_lo, min(lane_hi - width + 1, wanted)))
         placed_widths.append(width)
 
@@ -3489,6 +3621,38 @@ def _snap_repeated_pitch_lanes(
     reach = max(1, int(settings.snap_repeat_reach))
 
     anchors = _build_position_anchors(notes, settings)
+
+    # 每隻手的時間序列，用來擋「吸附把相鄰不同音高壓成同一軌」。
+    flat_min = int(getattr(settings, "snap_flat_min_semitones", 0))
+    hand_seq: Dict[int, List[Any]] = {}
+    seq_index: Dict[int, Tuple[int, int]] = {}
+    if flat_min > 0:
+        for note in sorted(notes, key=_start):
+            hand = int(getattr(note, "hand", 0))
+            seq = hand_seq.setdefault(hand, [])
+            seq_index[id(note)] = (hand, len(seq))
+            seq.append(note)
+
+    def flattens(movers: Sequence[Any]) -> bool:
+        """這次搬動會不會讓相鄰的不同音高落在同一個右緣。"""
+        if flat_min <= 0:
+            return False
+        for note in movers:
+            entry = seq_index.get(id(note))
+            if entry is None:
+                continue
+            hand, index = entry
+            seq = hand_seq[hand]
+            for other in (index - 1, index + 1):
+                if not (0 <= other < len(seq)):
+                    continue
+                mate = seq[other]
+                if abs(_pitch(mate) - _pitch(note)) < flat_min:
+                    continue
+                if int(mate.max_key) == int(note.max_key):
+                    return True
+        return False
+
     by_pitch: Dict[int, List[Any]] = {}
     for note in sorted(notes, key=_start):
         by_pitch.setdefault(_pitch(note), []).append(note)
@@ -3546,9 +3710,11 @@ def _snap_repeated_pitch_lanes(
             return False
         if _group_overlaps(group) or _pitch_order_violations(group):
             return False
-        if _cross_hand_deficit(group, settings) > deficit:
+        if _cross_hand_deficit(group, settings) > deficit + settings.cross_hand_slack_lanes:
             return False
         if _chord_spacing_deficit(group, settings) > spacing:
+            return False
+        if flattens(movers):
             return False
         if not _hold_corridor_clear(
             notes, hold_activity, hold_dependents, movers
@@ -3608,9 +3774,20 @@ def _snap_repeated_pitch_lanes(
                         _anchor_deviation(anchors, item, settings)
                         for item in movers
                     )
-                    # 整組平移會連帶動到另一隻手，所以要求「整體同音偏離不增加」
+                    # 整組平移會連帶動到另一隻手，所以要求「整體同音偏離不增加」。
+                    # 單手整塊移動也可能把同一組的其他音拖離它們自己的位置，下一次
+                    # 它們又各自被對齊過去——一個接一個，整段就被帶走了（醉心那首
+                    # 24~34 秒右手整段右移將近 3 格，全是這一步）。snap_block_drift_slack
+                    # 限制單手整塊移動時，整塊離錨點的總距離最多可以增加多少。
+                    block_drift_ok = (
+                        len(movers) <= 1
+                        or settings.snap_block_drift_slack is None
+                        or len(movers) > len(block)
+                        or drift_after <= drift_before + settings.snap_block_drift_slack
+                    )
                     if (valid(group, movers, deficit, spacing)
                             and top_order_bad(movers) <= top_before
+                            and block_drift_ok
                             and (len(movers) <= len(block)
                                  or drift_after <= drift_before)):
                         snapped += 1
@@ -4705,11 +4882,15 @@ def _clamp_note_widths(
     所以放在所有通道之後跑是安全的。
     """
     limit = max(1, int(settings.normal_width))
+    left_anchor = str(getattr(settings, 'width_anchor', 'right')) == 'left'
     clamped = 0
     for note in notes:
         if _width(note) <= limit:
             continue
-        note.min_key = int(note.max_key) - limit + 1
+        if left_anchor:
+            note.max_key = int(note.min_key) + limit - 1
+        else:
+            note.min_key = int(note.max_key) - limit + 1
         clamped += 1
     return clamped
 
@@ -5426,7 +5607,8 @@ def _reflush_hand_chords(
                         note.max_key = start + offset + width - 1
                     if _group_overlaps(group) or _pitch_order_violations(group):
                         continue
-                    if _cross_hand_deficit(group, settings) > deficit_before:
+                    if (_cross_hand_deficit(group, settings)
+                            > deficit_before + settings.cross_hand_slack_lanes):
                         continue
                     if sum(pair_bad(pair) for pair in watched) > bad_before:
                         continue
@@ -5464,6 +5646,318 @@ def _reflush_hand_chords(
                 for note, (start, end) in zip(items, saved):
                     note.min_key = start
                     note.max_key = end
+    return fixed
+
+
+def _repair_melody_slope(
+    notes: Sequence[Any],
+    groups: Sequence[Sequence[Any]],
+    settings: SmartChartSettings,
+) -> int:
+    """讓每隻手的冠音線與低音線，前後步伐貼近實測的「幾個半音 → 幾格」曲線。
+
+    量 15 首官方 Real 與 25 份手寫譜發現，排譜結果不是整體斜率偏小，而是
+    **兩頭都歪**：1~3 個半音多走 0.2~0.45 格、7~12 個半音少走 0.2~0.6 格。
+    每一道修補各自只貢獻一點（逐一關掉都只差 0.01~0.02 格），所以不在上游
+    調，改在收尾照目標曲線直接拉。
+
+    成本（每個事件看前後兩個鄰居，時間差在 `melody_slope_window_ms` 內）：
+      - 冠音、低音各自 |實際步伐 − 目標格數|（低音乘 `melody_slope_bottom_weight`）
+      - 同音高前後不同軌：每格 `melody_slope_repeat_weight`
+      - 冠音方向反了或同格：重罰（守住 _repair_hand_top_edge_strict 的結論）
+    搬法只有「這隻手在這一組的音符整塊平移」，和絃內部幾何不動；重疊、組內
+    音高順序、兩手交界、和絃間距、長押走廊都不准變差。分數至少降
+    `melody_slope_min_gain` 才搬。
+    """
+    if not groups:
+        return 0
+    activity = _build_hold_activity(groups, settings)
+    dependents = _build_hold_dependents(groups, activity)
+    window = max(1, int(settings.melody_slope_window_ms))
+    reach = max(1, int(settings.melody_slope_reach))
+    top_table = tuple(float(v) for v in settings.melody_step_top)
+    bottom_table = tuple(float(v) for v in settings.melody_step_bottom)
+    bottom_weight = float(settings.melody_slope_bottom_weight)
+    repeat_weight = float(settings.melody_slope_repeat_weight)
+    min_gain = float(settings.melody_slope_min_gain)
+    order_penalty = 6.0
+
+    # 每隻手的事件：(起音時間, 整組, 這隻手的音, 冠音, 低音)
+    hand_events: Dict[int, List[Tuple[int, Sequence[Any], List[Any], Any, Any]]] = {}
+    for group in groups:
+        by_hand: Dict[int, List[Any]] = {}
+        for note in group:
+            by_hand.setdefault(int(getattr(note, "hand", 0)), []).append(note)
+        for hand, members in by_hand.items():
+            top = max(members, key=lambda n: (_pitch(n), int(n.max_key)))
+            bottom = min(members, key=lambda n: (_pitch(n), -int(n.min_key)))
+            hand_events.setdefault(hand, []).append(
+                (min(_start(n) for n in members), group, members, top, bottom)
+            )
+    for events in hand_events.values():
+        events.sort(key=lambda item: item[0])
+
+    def center(note: Any) -> float:
+        return (int(note.min_key) + int(note.max_key)) / 2.0
+
+    def line_cost(first: Any, second: Any, table: Tuple[float, ...], weight: float,
+                  strict: bool) -> float:
+        pitch_delta = _pitch(second) - _pitch(first)
+        lane_delta = center(second) - center(first)
+        if pitch_delta == 0:
+            return repeat_weight * weight * abs(lane_delta)
+        interval = abs(pitch_delta)
+        signed = lane_delta if pitch_delta > 0 else -lane_delta
+        cost = 0.0
+        if interval <= len(table):
+            cost += weight * abs(signed - table[interval - 1])
+        if strict:
+            edge = int(second.max_key) - int(first.max_key)
+            if edge == 0 or edge * pitch_delta < 0:
+                cost += order_penalty
+        return cost
+
+    def pair_cost(first, second) -> float:
+        if second[0] - first[0] > window:
+            return 0.0
+        return (line_cost(first[3], second[3], top_table, 1.0, True)
+                + line_cost(first[4], second[4], bottom_table, bottom_weight, False))
+
+    # 較遠的同音：同一隻手、同一個音高，在 melody_slope_far_repeat_ms 內的前一次和
+    # 下一次出現。斜率只看 600ms 內的鄰居，看不到 1~4 秒外重複的音——沒有這一項，
+    # 它為了拉步伐移動一整組時，會順手把同音吸附剛對齊好的音推開（實測使用者手改的
+    # 瑠璃の鳥：同音同軌 81.1% → 69.7%）。
+    far_weight = float(settings.melody_slope_far_repeat_weight)
+    far_mates: Dict[int, List[Any]] = {}
+    if far_weight > 0:
+        far_window = max(1, int(settings.melody_slope_far_repeat_ms))
+        by_pitch: Dict[Tuple[int, int], List[Any]] = {}
+        for note in sorted(notes, key=_start):
+            by_pitch.setdefault((int(getattr(note, "hand", 0)), _pitch(note)), []).append(note)
+        for items in by_pitch.values():
+            for first, second in zip(items, items[1:]):
+                if _start(second) - _start(first) <= far_window:
+                    far_mates.setdefault(id(first), []).append(second)
+                    far_mates.setdefault(id(second), []).append(first)
+
+    def far_repeat_cost(members: Sequence[Any]) -> float:
+        if not far_mates:
+            return 0.0
+        inside = {id(note) for note in members}
+        cost = 0.0
+        for note in members:
+            for mate in far_mates.get(id(note), ()):
+                if id(mate) not in inside:
+                    cost += abs(int(note.max_key) - int(mate.max_key))
+        return far_weight * cost
+
+    def local_cost(events, index: int) -> float:
+        cost = far_repeat_cost(events[index][2])
+        if index > 0:
+            cost += pair_cost(events[index - 1], events[index])
+        if index + 1 < len(events):
+            cost += pair_cost(events[index], events[index + 1])
+        return cost
+
+    def shift(movers: Sequence[Any], delta: int) -> None:
+        for note in movers:
+            note.min_key = int(note.min_key) + delta
+            note.max_key = int(note.max_key) + delta
+
+    def legal(group: Sequence[Any], movers: Sequence[Any],
+              deficit: float, spacing: float) -> bool:
+        if any(int(n.min_key) < 0 or int(n.max_key) >= settings.total_lanes
+               for n in movers):
+            return False
+        if _group_overlaps(group) or _pitch_order_violations(group):
+            return False
+        if _cross_hand_deficit(group, settings) > deficit + settings.cross_hand_slack_lanes:
+            return False
+        if _chord_spacing_deficit(group, settings) > spacing:
+            return False
+        if not _hold_corridor_clear(notes, activity, dependents, movers):
+            return False
+        return all(
+            _range_avoids_hold(
+                notes, group, note, activity,
+                int(note.min_key), int(note.max_key),
+            )
+            for note in movers
+        )
+
+    # 整組（兩隻手）一起移時，另一隻手在同一組的事件成本也要算進去
+    event_at: Dict[Tuple[int, int], int] = {}
+    for hand, events in hand_events.items():
+        for index, event in enumerate(events):
+            event_at[(id(event[1]), hand)] = index
+
+    def group_cost(group: Sequence[Any]) -> float:
+        cost = 0.0
+        for hand, events in hand_events.items():
+            index = event_at.get((id(group), hand))
+            if index is not None:
+                cost += local_cost(events, index)
+        return cost
+
+    moves = 0
+    for _ in range(max(1, int(settings.melody_slope_passes))):
+        changed = 0
+        for events in hand_events.values():
+            for index in range(len(events)):
+                before = local_cost(events, index)
+                if before < min_gain:
+                    continue
+                _t, group, members, _top, _bottom = events[index]
+                deficit = _cross_hand_deficit(group, settings)
+                spacing = _chord_spacing_deficit(group, settings)
+                # 先試只移這隻手（和絃幾何不動），不行再整組移（兩手距離也不動）
+                attempts = [(members, local_cost, (events, index))]
+                if settings.melody_slope_whole_group and len(group) > len(members):
+                    attempts.append((list(group), lambda g: group_cost(g), (group,)))
+                for movers, cost_fn, args in attempts:
+                    base = cost_fn(*args)
+                    best_delta, best_cost = 0, base - min_gain
+                    for step in range(1, reach + 1):
+                        for delta in (step, -step):
+                            shift(movers, delta)
+                            cost = cost_fn(*args)
+                            if cost < best_cost and legal(group, movers, deficit, spacing):
+                                best_delta, best_cost = delta, cost
+                            shift(movers, -delta)
+                    if best_delta:
+                        shift(movers, best_delta)
+                        moves += 1
+                        changed += 1
+                        break
+        if not changed:
+            break
+    return moves
+
+
+def _repair_small_top_steps(
+    notes: Sequence[Any],
+    groups: Sequence[Sequence[Any]],
+    settings: SmartChartSettings,
+) -> int:
+    """冠音前後差 1~2 個半音，鍵道就走剛好 1 格。
+
+    使用者手改的瑠璃の鳥：1~2 半音走 1 格 76%、走 2 格以上 6%；排譜器是
+    61% 和 22%（還有 3% 走 3 格、3% 走 4 格），一眼看起來就像大跳。40 處裡
+    有 36 處移過去完全合法、另一側也不會變壞，斜率修補卻沒動——它比的是整組
+    加總的成本，一個和弦有好幾顆音，遠同音的代價就把這一步的好處抵掉了。
+
+    所以這裡不比加總成本，直接照規則修：整隻手在那一組的音一起移（先移後面
+    那組、不行再移前面那組），條件是硬性限制都過、冠音方向不反不同格、另一側
+    的步伐沒有變差、已經對齊的同音不會被拆開。
+    """
+    if not groups:
+        return 0
+    activity = _build_hold_activity(groups, settings)
+    dependents = _build_hold_dependents(groups, activity)
+    window = max(1, int(settings.melody_slope_window_ms))
+    table = tuple(float(v) for v in settings.melody_step_top)
+    repeat_window = max(1, int(settings.snap_repeat_window_ms))
+
+    hand_events: Dict[int, List[Tuple[int, Sequence[Any], List[Any], Any]]] = {}
+    for group in groups:
+        by_hand: Dict[int, List[Any]] = {}
+        for note in group:
+            by_hand.setdefault(int(getattr(note, "hand", 0)), []).append(note)
+        for hand, members in by_hand.items():
+            top = max(members, key=lambda n: (_pitch(n), int(n.max_key)))
+            hand_events.setdefault(hand, []).append(
+                (min(_start(n) for n in members), group, members, top))
+    for events in hand_events.values():
+        events.sort(key=lambda item: item[0])
+
+    mates: Dict[int, List[Any]] = {}
+    by_pitch: Dict[Tuple[int, int], List[Any]] = {}
+    for note in sorted(notes, key=_start):
+        by_pitch.setdefault((int(getattr(note, "hand", 0)), _pitch(note)), []).append(note)
+    for items in by_pitch.values():
+        for first, second in zip(items, items[1:]):
+            if _start(second) - _start(first) <= repeat_window:
+                mates.setdefault(id(first), []).append(second)
+                mates.setdefault(id(second), []).append(first)
+
+    def centre(note: Any) -> float:
+        return (int(note.min_key) + int(note.max_key)) / 2.0
+
+    def step(first: Any, second: Any) -> float:
+        sign = 1 if _pitch(second) > _pitch(first) else -1
+        return (centre(second) - centre(first)) * sign
+
+    def step_error(first: Any, second: Any) -> float:
+        interval = abs(_pitch(second) - _pitch(first))
+        if interval == 0:
+            return 2.0 * abs(int(second.max_key) - int(first.max_key))
+        if interval > len(table):
+            return 0.0
+        edge = int(second.max_key) - int(first.max_key)
+        if edge == 0 or edge * (_pitch(second) - _pitch(first)) < 0:
+            return 10.0
+        return abs(step(first, second) - table[interval - 1])
+
+    def aligned_repeats(members: Sequence[Any]) -> int:
+        inside = {id(n) for n in members}
+        return sum(1 for note in members for mate in mates.get(id(note), ())
+                   if id(mate) not in inside and int(mate.max_key) == int(note.max_key))
+
+    def shift(movers: Sequence[Any], delta: int) -> None:
+        for note in movers:
+            note.min_key = int(note.min_key) + delta
+            note.max_key = int(note.max_key) + delta
+
+    def legal(group: Sequence[Any], movers: Sequence[Any], deficit: float, spacing: float) -> bool:
+        if any(int(n.min_key) < 0 or int(n.max_key) >= settings.total_lanes for n in movers):
+            return False
+        if _group_overlaps(group) or _pitch_order_violations(group):
+            return False
+        if _cross_hand_deficit(group, settings) > deficit + settings.cross_hand_slack_lanes:
+            return False
+        if _chord_spacing_deficit(group, settings) > spacing:
+            return False
+        if not _hold_corridor_clear(notes, activity, dependents, movers):
+            return False
+        return all(_range_avoids_hold(notes, group, n, activity, int(n.min_key), int(n.max_key))
+                   for n in movers)
+
+    fixed = 0
+    for events in hand_events.values():
+        for index in range(len(events) - 1):
+            t0, g0, m0, a = events[index]
+            t1, g1, m1, b = events[index + 1]
+            if t1 - t0 > window:
+                continue
+            interval = abs(_pitch(b) - _pitch(a))
+            if not (1 <= interval <= 2):
+                continue
+            current = step(a, b)
+            if current < 1.5:
+                continue
+            need = int(round(current - 1.0))
+            sign = 1 if _pitch(b) > _pitch(a) else -1
+            # (動哪一組, 另一側的鄰居事件 index, 位移)
+            options = [(index + 1, index + 2, -sign * need), (index, index - 1, sign * need)]
+            for target, side, delta in options:
+                _t, group, members, top = events[target]
+                side_pair = None
+                if 0 <= side < len(events) and abs(events[side][0] - events[target][0]) <= window:
+                    side_pair = (events[min(side, target)][3], events[max(side, target)][3])
+                side_before = step_error(*side_pair) if side_pair else 0.0
+                repeats_before = aligned_repeats(members)
+                deficit = _cross_hand_deficit(group, settings)
+                spacing = _chord_spacing_deficit(group, settings)
+                shift(members, delta)
+                ok = (legal(group, members, deficit, spacing)
+                      and abs(step(a, b) - 1.0) < 0.75
+                      and (side_pair is None
+                           or step_error(*side_pair) <= side_before + settings.small_top_step_side_slack)
+                      and aligned_repeats(members) >= repeats_before - settings.small_top_step_repeat_slack)
+                if ok:
+                    fixed += 1
+                    break
+                shift(members, -delta)
     return fixed
 
 
@@ -5538,7 +6032,7 @@ def _repair_hand_top_edge_strict(
             return False
         if _group_overlaps(group) or _pitch_order_violations(group):
             return False
-        if _cross_hand_deficit(group, settings) > deficit:
+        if _cross_hand_deficit(group, settings) > deficit + settings.cross_hand_slack_lanes:
             return False
         if _chord_spacing_deficit(group, settings) > spacing:
             return False
@@ -5853,12 +6347,27 @@ def arrange_midi_notes(
     stats.hand_top_strict_repairs = _repair_hand_top_edge_strict(
         note_list, groups, config
     )
+    # 旋律斜率：前面的通道把小音程拉太開、大音程壓太扁（冠音與低音都是），
+    # 照實測的「幾個半音 → 幾格」曲線拉回來。成本裡含同音同軌與冠音嚴格順序，
+    # 所以不會推翻上面那道；最後的同音吸附照舊在它後面。
+    if config.melody_slope_passes > 0 and not config.melody_slope_after_snap:
+        stats.melody_slope_moves = _repair_melody_slope(
+            note_list, groups, config
+        )
     # 「前後同音同軌」是使用者指定的最高優先項，所以吸附排在所有搬動音符的
     # 通道之後再收一次 —— 中段那一次跑完，後面還有交界、貼合、最高音輪廓
     # 五道會把它推開（實測同軌率因此從 64.7% 掉到 59.4%）。這一次沒有人會
     # 再動它。搬法一樣是剛體：整隻手 → 整組 → 單顆。
     if config.snap_repeat_final:
         stats.pitch_consistency_moves += _snap_repeated_pitch_lanes(
+            note_list, groups, config
+        )
+    if config.melody_slope_passes > 0 and config.melody_slope_after_snap:
+        stats.melody_slope_moves = _repair_melody_slope(
+            note_list, groups, config
+        )
+    if config.small_top_step_fix:
+        stats.melody_slope_moves += _repair_small_top_steps(
             note_list, groups, config
         )
     # 寬度的不變量收尾：只收左緣，右緣（排序權威）不動，所以不會推翻上面任何

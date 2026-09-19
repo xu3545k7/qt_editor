@@ -30,9 +30,14 @@ def make_note(idx, start, pitch, velocity, hand=0):
 
 
 class RoundTripTests(unittest.TestCase):
-    """同一份資料存成 XML / JSON 再讀回來，力度、踏板、強弱記號都要一模一樣。"""
+    """同一份資料存成 JSON 再讀回來，力度、踏板、強弱記號都要一模一樣。
+
+    XML 現在是給 PAN 的相容輸出，只寫官方有的欄位：力度照樣在 sub_note 裡，
+    踏板和強弱記號 PAN 沒有，刻意不寫（見 test_pan_format）。
+    """
 
     FORMATS = (('xml', 'save_xml', 'load_xml'), ('json', 'save_json', 'load_json'))
+    JSON_ONLY = (('json', 'save_json', 'load_json'),)
 
     def _source(self):
         m = NoteModel.create_new('t', 120.0, 30.0, 4)
@@ -63,14 +68,14 @@ class RoundTripTests(unittest.TestCase):
 
     def test_rapid_pedal_changes_are_not_merged_away(self):
         src = self._source()
-        for ext, save, load in self.FORMATS:
+        for ext, save, load in self.JSON_ONLY:
             back = self._roundtrip(src, ext, save, load)
             self.assertEqual(len(back.pedal_spans), 3,
                              '%s：換踏被併掉了' % ext)
 
     def test_pedal_times_stay_within_a_millisecond(self):
         src = self._source()
-        for ext, save, load in self.FORMATS:
+        for ext, save, load in self.JSON_ONLY:
             back = self._roundtrip(src, ext, save, load)
             for before, after in zip(src.pedal_spans, back.pedal_spans):
                 self.assertAlmostEqual(after[0], before[0], delta=1.0, msg=ext)
@@ -78,19 +83,24 @@ class RoundTripTests(unittest.TestCase):
 
     def test_saving_twice_does_not_drift(self):
         src = self._source()
-        for ext, save, load in self.FORMATS:
+        for ext, save, load in self.JSON_ONLY:
             once = self._roundtrip(src, ext, save, load)
             twice = self._roundtrip(once, ext, save, load)
             self.assertEqual([list(s) for s in twice.pedal_spans],
                              [list(s) for s in once.pedal_spans], ext)
 
-    def test_dynamics_survive_in_both_formats(self):
+    def test_dynamics_survive_in_json(self):
         src = self._source()
-        for ext, save, load in self.FORMATS:
+        for ext, save, load in self.JSON_ONLY:
             back = self._roundtrip(src, ext, save, load)
             self.assertEqual(back.dynamics_marks(0),
                              [[0.0, 96.0, True], [2000.0, 48.0, False]], ext)
             self.assertEqual(back.dynamics_marks(1), [[500.0, 64.0, False]], ext)
+
+    def test_xml_leaves_out_what_pan_does_not_have(self):
+        back = self._roundtrip(self._source(), 'xml', 'save_xml', 'load_xml')
+        self.assertEqual(back.pedal_spans, [])
+        self.assertEqual(back.dynamics, {})
 
     def test_no_pedal_or_dynamics_means_no_extra_nodes(self):
         m = NoteModel.create_new('t', 120.0, 10.0, 4)

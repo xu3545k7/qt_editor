@@ -17,10 +17,12 @@ import copy
 import json
 import logging
 import math
+import sys
 import xml.etree.ElementTree as ET
 import xml.dom.minidom
 from bisect import bisect_left, bisect_right
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Dict, Iterable, List, NamedTuple, Optional,
+                    Sequence, Set, Tuple)
 
 try:
     import mido
@@ -70,6 +72,19 @@ def open_midi(path: str, **kwargs: Any):
     _tolerate_broken_key_signatures()
     kwargs.setdefault('clip', True)
     return mido.MidiFile(path, **kwargs)
+
+
+def _bpm_from_midi_tempo(tempo_us: int) -> float:
+    """MIDI 的速度是整數微秒／拍，161 BPM 存進去再讀出來是 160.99992。
+
+    換算值和某個小數兩位的 BPM 差距小於「速度差 1 微秒」造成的差距時，
+    就是那個 BPM 被捨入過，取回整齊的值（只影響顯示與存檔的 BPM，
+    拍子格線仍照 tick 與原始速度算）。
+    """
+    bpm = 60_000_000.0 / float(tempo_us)
+    tidy = round(bpm, 2)
+    resolution = bpm * bpm / 60_000_000.0       # 速度差 1 微秒時 BPM 差多少
+    return tidy if abs(bpm - tidy) <= resolution else bpm
 
 TOTAL_GAME_KEYS: int = 28
 INTERNAL_LANE_BASE: int = 0
@@ -207,6 +222,42 @@ def _k_nearest_samples_by_time(
         else:
             res.append(samples[hi]); hi += 1
     return res
+
+
+#: 完全沒有東西可學時的音符寬度。官方語料的眾數：real/extreme 是 3（97%／
+#: 99%），hard 4、normal 5。3 是最安全的預設。
+DEFAULT_NOTE_LANE_WIDTH = 3
+
+
+def _ordinal_shape_matches(chart_times: Sequence[int],
+                           ref_times: Sequence[int],
+                           tolerance: float = 0.006) -> bool:
+    """兩串發音點依序配之後，正規化的位置對不對得上。
+
+    把兩邊的時間軸各自壓到 [0,1]：同一首曲子的第 n 個發音點會落在幾乎一樣的
+    相對位置（速度圖不同只讓它前後晃一點），不同的曲子則整片散開。
+
+    這是「序位配對」唯一能用的把關——那條路正是因為絕對時間對不上才走的，
+    所以不能再拿時間或和絃顆數去驗。
+
+    門檻 0.006 是量出來的：broken-moon 的譜面對它自己的 MIDI 是 **0.0036**
+    （時間比 1.0293、非等速，但形狀一致），兩首無關的曲子是 **0.0113**，
+    自己對自己是 0。中間有 3 倍餘裕。
+    """
+    if len(chart_times) < 8 or len(ref_times) < 8:
+        return False
+    chart_span = float(chart_times[-1] - chart_times[0])
+    ref_span = float(ref_times[-1] - ref_times[0])
+    if chart_span <= 0 or ref_span <= 0:
+        return False
+    steps = max(1, len(chart_times) - 1)
+    reach = max(1, len(ref_times) - 1)
+    total = 0.0
+    for index, when in enumerate(chart_times):
+        mapped = int(round(index * reach / float(steps)))
+        total += abs((when - chart_times[0]) / chart_span
+                     - (ref_times[mapped] - ref_times[0]) / ref_span)
+    return (total / len(chart_times)) <= tolerance
 
 
 def _fit_local_lane(
@@ -625,6 +676,32 @@ def _trill_sub_from_note(n: 'GNote', hand: int) -> ET.Element:
     ac('src_velocity',  int(n.velocity) if n.velocity is not None else -1, 's32')
     ac('src_track',     int(n.track) if n.track is not None else -1, 's32')
     return se
+
+
+def chain_slide_notes(all_notes: Sequence['GNote'], chain: Sequence['GNote']) -> None:
+    """把 `chain`（同一隻手）設成滑鍵並依時間串成一條鏈。
+
+    param1 = 前一顆的 note_index、param2 = 下一顆，端點填 -1。缺 note_index 的指派
+    `all_notes` 裡沒用過的值（從 1 起：param2 == 0 在格式上代表「未設定」，index 0
+    會讓鏈結被誤判成未串鏈）。
+    """
+    notes = sorted(chain, key=lambda g: (int(g.start), int(g.min_key)))
+    if not notes:
+        return
+    used = {int(n.note_index) for n in all_notes if getattr(n, 'note_index', None) is not None}
+    next_idx = max(1, (max(used) + 1) if used else 1)
+    for n in notes:
+        n.note_type = SLIDE_NOTE_TYPE
+        if getattr(n, 'note_index', None) is None:
+            while next_idx in used:
+                next_idx += 1
+            n.note_index = next_idx
+            used.add(next_idx)
+            next_idx += 1
+    for i, n in enumerate(notes):
+        n.param1 = notes[i - 1].note_index if i > 0 else -1
+        n.param2 = notes[i + 1].note_index if i < len(notes) - 1 else -1
+        n.param3 = 0
 
 
 def make_trill_from_notes(src_notes: List['GNote'], hand: Optional[int] = None) -> Optional['GNote']:
@@ -1192,10 +1269,98 @@ def gm_program_name(program: Optional[int]) -> str:
     return ''
 
 
-#: 一筆 undo 快照每顆音符大約佔多少位元組（實測 400~500）
-_UNDO_BYTES_PER_NOTE = 500
+#: 一筆 undo 快照在**最壞情況**（每顆音符都改過）每顆佔多少位元組。
+#: 快照改成共用結構之後，沒改過的音符只多一個 8 bytes 的指標；這裡估的是
+#: 「排譜、生成」那種整份重寫的情形，拿來回推深度才不會低估。實測 3357 顆
+#: 每一步都改動全部音符時一筆 1.10MB，約每顆 330 bytes（紀錄本身之外，
+#: 改過的時間值也是新的 int 物件）。
+_UNDO_BYTES_PER_NOTE = 340
 #: 再大的譜面也至少留這麼多步可以復原
 _UNDO_MIN_DEPTH = 8
+
+#: 快照裡每顆音符存成一個 tuple：第一格是類別，接著照這個順序放欄位值，
+#: 最後一格是其他零星屬性。順序刻意和 `GNote.__init__` 一致，還原時照同樣
+#: 順序塞回 `__dict__`，CPython 的實例字典才會共用鍵表、不會一顆各佔一份。
+_NOTE_SNAPSHOT_FIELDS = (
+    'elem', 'idx', 'start', 'end', 'gate', 'min_key', 'max_key', 'note_type',
+    'hand', 'track', 'pitch', 'velocity', 'channel', 'off_velocity',
+    'sub_elems', 'hidden', 'note_index', 'param1', 'param2', 'param3',
+)
+_NOTE_SNAPSHOT_FIELD_SET = frozenset(_NOTE_SNAPSHOT_FIELDS)
+_SNAPSHOT_SCALARS = (int, float, str, bool, bytes, type(None))
+
+
+class _Missing:
+    """音符身上沒有這個欄位（例如用 `__new__` 建出來的）。"""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return '<missing>'
+
+
+_MISSING = _Missing()
+
+
+class _NoteRef:
+    """快照裡「指向同一份快照中第幾顆音符」的參照（例如隱藏音的 `_sub_host`）。
+
+    不能直接存 GNote：還原出來的是新物件，參照要改指到新的那一顆。
+    """
+
+    __slots__ = ('pos',)
+
+    def __init__(self, pos: int) -> None:
+        self.pos = int(pos)
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _NoteRef and other.pos == self.pos
+
+    def __hash__(self) -> int:
+        return hash(('note-ref', self.pos))
+
+
+class _DeepValue:
+    """可變的零星屬性：存一份深拷貝，還原時再拷貝一次，避免快照被改到。
+
+    故意不定義 `__eq__`：這種值很少見，每次都當成「變了」比較保險。
+    """
+
+    __slots__ = ('value',)
+
+    def __init__(self, value: Any) -> None:
+        self.value = copy.deepcopy(value)
+
+
+class PitchRestore(NamedTuple):
+    """`restore_pitches_from_midi` 的結果。
+
+    `applied=False` 代表**一顆都沒改**——對得上的比例太低（多半是選錯 MIDI），
+    寧可什麼都不做也不要把湊巧對到的那些寫成錯的。
+    """
+
+    changed: int            #: 實際改掉音高的音符數
+    unmatched: int          #: 配不到參考音符的音符數
+    offset_ms: int          #: 譜面比 MIDI 晚幾毫秒（開頭補空白造成）
+    semitones: int          #: MIDI 比譜面高幾個半音（移調版才不是 0）
+    match_ratio: float      #: 對得上的發音組比例
+    chord_agreement: float  #: 對上的組裡，顆數也一致的比例
+    by_ordinal: bool        #: 用「發音順序」配的（兩邊時間軸不同）
+    acceptable: bool        #: 檢查有沒有通過（＝「值得套用」）
+    applied: bool           #: 有沒有真的寫進去
+    chart_median: int = 0   #: 譜面既有音高的中位數（0 = 譜面本來就沒有音高）
+    midi_median: int = 0    #: 參考 MIDI 音高的中位數
+
+    @property
+    def base_mismatch(self) -> bool:
+        """偏移大於一個八度——那不是移調，是音高基準差了一截。
+
+        移調是換個調，最多也就幾個半音；差超過 12 個半音沒有音樂上的意義。
+        實測「彩云追月 Real 2.xml」對「人工修正.mid」差 20 個半音：譜面的
+        音域是 50~108、中位 93（108 已經是鋼琴最高鍵），MIDI 是 30~105、
+        中位 74——壞掉的是譜面那一側，正是這個工具要修的東西。
+        """
+        return abs(int(self.semitones)) > 12
 
 
 class NoteModel:
@@ -1216,6 +1381,17 @@ class NoteModel:
 
         # --- 通用後設資料
         self.file_format: str = 'xml'       # 'xml' | 'json' | 'midi'
+        # 目前這份是「PAN 相容 XML」：開 XML 檔或存成 XML 之後為真。這個模式下
+        # PAN 沒有的功能（Soft／Staccato、踏板、強弱記號）在介面上關掉。
+        # JSON 才是原始檔，什麼都存得下。
+        self.pan_xml: bool = False
+        # 記憶體裡的長押長度是不是「官方長度」：從官方格式 XML 讀進來的就是，
+        # JSON／MIDI／新譜不是。轉成官方格式時只有後者要縮（見 official_hold_scale），
+        # 不然開一份 XML 再存回 XML，每存一次就短一截。
+        self.hold_lengths_official: bool = False
+        # 譜面事件 [[ms, type, value], ...]，照時間排序。type 0 是速度（value =
+        # BPM × 100000），1～8 是音效參數，9 是區段標記，見 pan_format.EVENT_TYPES。
+        self.events: List[List[int]] = []
         # MIDI 匯入時選了「不轉換」——還沒排譜，只有音高檢視有意義
         self.midi_unarranged: bool = False
         # (track, channel) → 樂器名稱。只有從 MIDI 載入才有，XML/JSON 沒有
@@ -1249,7 +1425,10 @@ class NoteModel:
         self.notes: List[GNote] = []       # 排序後的顯示快取
 
         # --- Undo 歷史
-        self.undo_stack: List[List[GNote]] = []
+        self.undo_stack: List[Dict[str, Any]] = []
+        # 重做：undo 時把「退回之前」的狀態推進來，redo 再推回 undo_stack。
+        self.redo_stack: List[Dict[str, Any]] = []
+        self._redo_stash: Optional[List[Dict[str, Any]]] = None
         self.undo_limit: int = 50
 
         # --- 狀態旗標
@@ -1298,24 +1477,149 @@ class NoteModel:
     # ------------------------------------------------------------------
 
     def push_history(self) -> None:
-        # Snapshot a fuller model state so undo can revert beat timings and metadata too
-        snap: Dict[str, Any] = {
-            'notes_tree': copy.deepcopy(self.notes_tree),
-            'pedal_spans': copy.deepcopy(self.pedal_spans),
-            'dynamics': copy.deepcopy(self.dynamics),
-            'time_sig_changes': copy.deepcopy(self.time_sig_changes),
-            'json_meta': copy.deepcopy(self.json_meta),
+        # 操作紀錄：這裡是所有編輯的共同前置，掛在這一點就自動涵蓋全部的
+        # 呼叫端，不必去改每一個工具。動作名稱取呼叫端的函式名。
+        try:
+            from .oplog import oplog
+            if oplog.enabled:
+                oplog.on_edit(self, sys._getframe(1).f_code.co_name)
+        except Exception:                       # noqa: BLE001
+            pass
+        self.undo_stack.append(self._capture_snapshot(
+            self.undo_stack[-1] if self.undo_stack else None))
+        self._trim_history(self.undo_stack)
+        # 新的編輯讓「重做」失效。先藏起來而不是直接丟掉：很多操作是「先記一
+        # 筆、發現其實沒改就撤回」（點一下音符沒拖動、點一下踏板邊界之類），
+        # 那種情況走 `discard_last_history()` 把重做紀錄還回來——不然 undo
+        # 幾步之後隨手點一下，重做就整個不見了。
+        self._redo_stash = self.redo_stack
+        self.redo_stack = []
+        self.dirty = True
+
+    def discard_last_history(self) -> bool:
+        """撤回最近一次 `push_history`（結果什麼都沒改的時候用）。
+
+        和直接 `undo_stack.pop()` 的差別：push 時藏起來的重做紀錄會還回來。
+        """
+        if not self.undo_stack:
+            return False
+        self.undo_stack.pop()
+        if self._redo_stash is not None and not self.redo_stack:
+            self.redo_stack = self._redo_stash
+        self._redo_stash = None
+        return True
+
+    def _capture_snapshot(self, previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """把目前的譜面狀態拍成一筆快照。和 `previous` 相同的部分直接共用。"""
+
+        def shared(key: str, value: Any) -> Any:
+            """和上一筆一樣就直接共用那一份（它存進去之後就不會再被改）。"""
+            if previous is not None and key in previous and previous[key] == value:
+                return previous[key]
+            return copy.deepcopy(value)
+
+        return {
+            'note_records': self._note_records(),
+            'pedal_spans': shared('pedal_spans', self.pedal_spans),
+            'dynamics': shared('dynamics', self.dynamics),
+            'time_sig_changes': shared('time_sig_changes', self.time_sig_changes),
+            'json_meta': shared('json_meta', self.json_meta),
+            'events': shared('events', self.events),
             'music_end_ms': float(self.music_end_ms),
             'bpm': float(self.bpm),
             'beats_per_bar': int(self.beats_per_bar),
             'time_sig_denominator': int(self.time_sig_denominator),
             'xml_lane_index_base': int(self.xml_lane_index_base),
-            'root_xml': self._root_snapshot(),
+            # 排譜會把這個關掉（其他檢視解鎖）。不存的話，undo 之後音符
+            # 回到未排譜的暫時鍵道，程式卻還以為排過了——小節/時間檢視
+            # 會照著假位置畫。
+            'midi_unarranged': bool(self.midi_unarranged),
+            'root_xml': shared('root_xml', self._root_snapshot()),
         }
-        self.undo_stack.append(snap)
-        while len(self.undo_stack) > self._undo_depth_budget():
-            self.undo_stack.pop(0)
-        self.dirty = True
+
+    def _trim_history(self, stack: List[Dict[str, Any]]) -> None:
+        while len(stack) > self._undo_depth_budget():
+            stack.pop(0)
+
+    def clear_history(self) -> None:
+        """換了一份譜面：復原與重做都不再有意義。"""
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._redo_stash = None
+
+    # ── 快照的音符紀錄 ─────────────────────────────────────────
+    #
+    # 以前每一步都 `deepcopy(notes_tree)`：3357 顆的譜一筆 1.46MB、52ms，
+    # 39 筆歷史就把整個程式從 77MB 撐到 136MB。但一次編輯通常只動幾顆音
+    # 符，其餘幾千顆每一步都在重複存一模一樣的東西。
+    #
+    # 改成每顆音符存一個不可變的 tuple，而且**和上一筆相同就共用同一個
+    # tuple 物件**：沒改過的音符每多一步只多一個指標。
+
+    def _note_records(self) -> List[tuple]:
+        notes = self.notes_tree
+        positions = {id(note): i for i, note in enumerate(notes)}
+        cache = getattr(self, '_undo_record_cache', None) or {}
+        fresh: Dict[int, tuple] = {}
+        records: List[tuple] = []
+        for note in notes:
+            record = self._note_record(note, positions)
+            known = cache.get(id(note))
+            if known is not None and known == record:
+                record = known                  # 沒變：共用上一筆那一份
+            records.append(record)
+            fresh[id(note)] = record
+        self._undo_record_cache = fresh
+        return records
+
+    @staticmethod
+    def _note_record(note: Any, positions: Dict[int, int]) -> tuple:
+        attrs = note.__dict__
+        values: List[Any] = [type(note)]
+        for key in _NOTE_SNAPSHOT_FIELDS:
+            value = attrs.get(key, _MISSING)
+            if key == 'sub_elems' and value is not _MISSING:
+                # 元素本身共用（見 GNote.__deepcopy__），list 要自己的一份
+                value = tuple(value) if value else ()
+            values.append(value)
+        extras = []
+        for key, value in attrs.items():
+            if key in _NOTE_SNAPSHOT_FIELD_SET:
+                continue
+            if isinstance(value, GNote):
+                pos = positions.get(id(value))
+                value = _NoteRef(pos) if pos is not None else _DeepValue(value)
+            elif not isinstance(value, _SNAPSHOT_SCALARS):
+                value = _DeepValue(value)
+            extras.append((key, value))
+        extras.sort(key=lambda item: item[0])
+        values.append(tuple(extras))
+        return tuple(values)
+
+    def _notes_from_records(self, records: List[tuple]) -> List[Any]:
+        notes: List[Any] = []
+        links = []
+        for record in records:
+            cls = record[0]
+            note = cls.__new__(cls)
+            attrs = note.__dict__
+            for key, value in zip(_NOTE_SNAPSHOT_FIELDS, record[1:-1]):
+                if value is _MISSING:
+                    continue
+                attrs[key] = list(value) if key == 'sub_elems' else value
+            for key, value in record[-1]:
+                if isinstance(value, _NoteRef):
+                    links.append((attrs, key, value.pos))
+                elif isinstance(value, _DeepValue):
+                    attrs[key] = copy.deepcopy(value.value)
+                else:
+                    attrs[key] = value
+            notes.append(note)
+        for attrs, key, pos in links:
+            attrs[key] = notes[pos] if 0 <= pos < len(notes) else None
+        # 還原出來的是新物件、身分換了，快取要跟著換，下一筆才共用得到。
+        self._undo_record_cache = {id(n): r for n, r in zip(notes, records)}
+        return notes
 
     def _undo_depth_budget(self) -> int:
         """這份譜面能留幾筆歷史。
@@ -1363,19 +1667,60 @@ class NoteModel:
         """退回上一個快照；回傳是否成功。"""
         if not self.undo_stack:
             return False
+        try:
+            from .oplog import oplog
+            oplog.undone(self)
+        except Exception:                       # noqa: BLE001
+            pass
         snap = self.undo_stack.pop()
-        # restore notes
-        self.notes_tree = copy.deepcopy(snap.get('notes_tree', []))
+        self.redo_stack.append(self._capture_snapshot(snap))
+        self._trim_history(self.redo_stack)
+        self._redo_stash = None
+        self._restore_snapshot(snap)
+        return True
+
+    def redo(self) -> bool:
+        """重做剛才 undo 掉的那一步；回傳是否成功。"""
+        if not self.redo_stack:
+            return False
+        try:
+            from .oplog import oplog
+            oplog.undone(self, redo=True)
+        except Exception:                       # noqa: BLE001
+            pass
+        snap = self.redo_stack.pop()
+        self.undo_stack.append(self._capture_snapshot(snap))
+        self._trim_history(self.undo_stack)
+        self._redo_stash = None
+        self._restore_snapshot(snap)
+        return True
+
+    def _restore_snapshot(self, snap: Dict[str, Any]) -> None:
+        """把一筆快照套回譜面（undo 與 redo 共用）。
+
+        每一塊只還原一次。以前 notes_tree 在這裡會被 deepcopy 兩次（開頭
+        一次、後面判斷 XML 分支時又一次），pedal_spans／dynamics 也各兩次，
+        大譜面按一次 undo 的尖峰記憶體就是快照的兩倍。
+
+        notes_tree 才是權威狀態：XML 只反映載入時那份檔案，不含記憶體裡
+        新增／刪除的音符（那些要到存檔才寫回），所以不從 XML 重新解析。
+        """
+        records = snap.get('note_records')
+        if records is not None:
+            self.notes_tree = self._notes_from_records(records)
+        else:
+            self.notes_tree = copy.deepcopy(snap.get('notes_tree', []))
         self.pedal_spans = copy.deepcopy(snap.get('pedal_spans', []))
         self.dynamics = copy.deepcopy(snap.get('dynamics', {}))
-        # restore metadata
         self.time_sig_changes = copy.deepcopy(snap.get('time_sig_changes', []))
         self.json_meta = copy.deepcopy(snap.get('json_meta', {}))
+        self.events = copy.deepcopy(snap.get('events', []))
         self.music_end_ms = float(snap.get('music_end_ms', 0.0))
         self.bpm = float(snap.get('bpm', self.bpm))
         self.beats_per_bar = int(snap.get('beats_per_bar', self.beats_per_bar))
         self.time_sig_denominator = int(snap.get('time_sig_denominator', self.time_sig_denominator))
         self.xml_lane_index_base = int(snap.get('xml_lane_index_base', self.xml_lane_index_base))
+        self.midi_unarranged = bool(snap.get('midi_unarranged', self.midi_unarranged))
         root_xml = snap.get('root_xml')
         if root_xml is not None:
             try:
@@ -1388,70 +1733,8 @@ class NoteModel:
             self.root = None
             self.tree = None
 
-        # notes_tree 的深拷貝才是權威狀態。
-        #
-        # 舊版在還原 XML 之後，會改用 root 的 note_data 重新解析 notes_tree。
-        # 但 XML 只反映「載入時的那份檔案」，不包含記憶體裡新增/刪除的音符
-        # （那些要到存檔才寫回 XML）。結果是：放置一顆音符後按 undo，整份譜
-        # 會跳回檔案原狀、把這次工作階段新增的音符全部吃掉，而且之後再按
-        # undo 都沒有反應。改成優先用快照裡的深拷貝。
-        snap_notes = snap.get('notes_tree')
-        note_data_xml = snap.get('note_data_xml')
-        if snap_notes is not None:
-            self.notes_tree = copy.deepcopy(snap_notes)
-        elif self.root is not None and (self.root.find('note_data') is not None or note_data_xml is not None):
-            # prefer actual root's note_data; fall back to serialized note_data if needed
-            nd = self.root.find('note_data')
-            if nd is None and note_data_xml:
-                try:
-                    nd = ET.fromstring(note_data_xml)
-                except Exception:
-                    nd = None
-            if nd is not None:
-                notes_elems = nd.findall('note')
-                self.notes_tree = [GNote(elem, i) for i, elem in enumerate(notes_elems)]
-                lane_base = int(snap.get('xml_lane_index_base', self._guess_lane_index_base(self.notes_tree)))
-                self.xml_lane_index_base = lane_base
-                self._normalize_notes_to_internal(self.notes_tree, lane_base)
-                # try to preserve original keys/pitch by matching starts/ends from snapshot
-                if snap_notes:
-                    # build list of unmatched snapshot notes
-                    unmatched = [on for on in snap_notes]
-                    for n in self.notes_tree:
-                        best_idx = None
-                        best_score = None
-                        n_start = int(getattr(n, 'start', 0))
-                        n_end = int(getattr(n, 'end', 0))
-                        for i, on in enumerate(unmatched):
-                            try:
-                                o_start = int(getattr(on, 'start', 0))
-                                o_end = int(getattr(on, 'end', 0))
-                            except Exception:
-                                continue
-                            score = abs(o_start - n_start) + abs(o_end - n_end)
-                            if best_score is None or score < best_score:
-                                best_score = score
-                                best_idx = i
-                        # accept match if within small tolerance (e.g., 8 ms total difference)
-                        if best_idx is not None and best_score is not None and best_score <= 8:
-                            on = unmatched.pop(best_idx)
-                            try:
-                                n.min_key = int(getattr(on, 'min_key', n.min_key))
-                                n.max_key = int(getattr(on, 'max_key', n.max_key))
-                                n.pitch = getattr(on, 'pitch', n.pitch)
-                            except Exception:
-                                pass
-            else:
-                self.notes_tree = []
-        else:
-            # JSON-only or no XML root: restore deepcopy of notes_tree
-            self.notes_tree = copy.deepcopy(snap.get('notes_tree', []))
-        self.pedal_spans = copy.deepcopy(snap.get('pedal_spans', []))
-        self.dynamics = copy.deepcopy(snap.get('dynamics', {}))
-
         self.rebuild_display_cache()
         self.dirty = True
-        return True
 
     # ------------------------------------------------------------------
     # 音符顯示快取
@@ -1944,6 +2227,112 @@ class NoteModel:
         self.dirty = True
         return changed
 
+    def earliest_time_ms(self) -> Optional[int]:
+        """整份譜面最早的時間點（音符、拍點、拍號標記、踏板、強弱都算）。
+
+        `shift_all_time` 用它決定「最多能往前移多少」。
+        """
+        candidates = []
+        starts = [int(n.start) for n in self.notes_tree]
+        if starts:
+            candidates.append(min(starts))
+        beats = self.get_beat_entries()
+        if beats:
+            candidates.append(min(int(ms) for _i, ms in beats))
+        if self.time_sig_changes:
+            candidates.append(min(int(ms) for ms, _n, _d in self.time_sig_changes))
+        if self.pedal_spans:
+            candidates.append(int(min(float(a) for a, _b in self.pedal_spans)))
+        for marks in (self.dynamics or {}).values():
+            if marks:
+                candidates.append(int(min(float(ms) for ms, _l, _r in marks)))
+        return min(candidates) if candidates else None
+
+    def shift_all_time(self, delta_ms: int) -> int:
+        """把整個時間軸平移 `delta_ms`（正 = 往後）。回傳受影響音符數。
+
+        **小節線要跟著搬。** 只搬音符的話，音符和小節線的相對位置就跑掉了——
+        本來落在第 3 拍的音會變成落在別的地方。所以 beat_data / beat_timings、
+        拍號標記、踏板、強弱記號、music_end 全部一起平移。
+
+        往後移會在最前面留下一段**不屬於任何小節**的空白：第一個拍點原本在 0，
+        平移之後在 `delta_ms`，而 `_compute_precise_measure_boundaries` 是從第一
+        個拍點開始切小節的，所以 [0, delta_ms) 不屬於任何小節。這是刻意的，
+        遊戲顯示的 BPM 取自第一小節（兩個拍點的間距），平移不會改變間距，
+        所以顯示值不受影響。
+
+        往前移（負值）碰到 0 就夾住——夾住會壓縮開頭的間距，呼叫端要先確認
+        有足夠的前置空白。
+        """
+        delta = int(delta_ms)
+        if delta == 0:
+            return 0
+
+        if delta < 0:
+            # 逐一夾在 0 會把開頭幾筆**壓成同一個時間**——拍點變成 0,0,0，
+            # 小節長度歸零、BPM 變成天文數字，整份譜就毀了。所以夾的是「整個
+            # 位移量」：最多只能往前移到最早的那個東西剛好碰到 0。
+            earliest = self.earliest_time_ms()
+            if earliest is not None:
+                delta = max(delta, -int(earliest))
+            if delta == 0:
+                return 0
+
+        def _s(v) -> int:
+            return max(0, int(round(float(v))) + delta)
+
+        changed = 0
+        for n in self.notes_tree:
+            length = max(1, int(n.end) - int(n.start))
+            n.start = _s(n.start)
+            n.end = n.start + length
+            n.gate = length
+            for se in getattr(n, 'sub_elems', None) or []:
+                for tag in ('start_timing_msec', 'end_timing_msec'):
+                    cur = _child_int(se, tag)
+                    if cur is not None:
+                        _set_child_int(se, tag, _s(cur))
+            changed += 1
+
+        if self.root is not None:
+            br = self.root.find('beat_data')
+            if br is not None:
+                for b in br.findall('beat'):
+                    cur = _child_int(b, 'start_timing_msec')
+                    if cur is not None:
+                        _set_child_int(b, 'start_timing_msec', _s(cur))
+
+        jm = self.json_meta or {}
+        bt = jm.get('beat_timings')
+        if isinstance(bt, (list, tuple)) and bt:
+            jm['beat_timings'] = [_s(x) for x in bt]
+            self.json_meta = jm
+
+        self.music_end_ms = max(0.0, float(self.music_end_ms) + delta)
+
+        if self.time_sig_changes:
+            self.time_sig_changes = [
+                (_s(ms), num, den) for (ms, num, den) in self.time_sig_changes
+            ]
+            self._sync_time_sig_changes_out()
+
+        if self.pedal_spans:
+            self.pedal_spans = [[float(_s(a)), float(_s(b))]
+                                for a, b in self.pedal_spans]
+
+        if self.dynamics:
+            moved = {}
+            for hand, marks in self.dynamics.items():
+                moved[hand] = [[float(_s(ms)), lvl, ramp]
+                               for ms, lvl, ramp in marks]
+            self.dynamics = moved
+
+        self._epb_mode = None       # 拍點時間變了，格式判斷重來
+        self._epb_count = None
+        self.dirty = True
+        self.last_shift_ms = delta   # 實際套用的量（負值可能被夾小）
+        return changed
+
     def rebuild_from_reference_midi(
         self,
         midi_notes: List[Dict[str, Any]],
@@ -1969,9 +2358,66 @@ class NoteModel:
             samples.append((int(nn.start), int(p), lc, int(w)))
         samples.sort(key=lambda s: s[0])
         stimes = [s[0] for s in samples]
-        default_width = (
-            sorted(s[3] for s in samples)[len(samples) // 2] if samples else 1
+        # 寬度從**全部**音符學，不是只從有音高的那些。`samples` 只收得到有
+        # 音高的音符（lane 回歸需要音高），但寬度根本不需要音高——它就是
+        # max_key-min_key+1。跟著一起丟掉的結果是：音高壞掉的譜面樣本全空、
+        # default_width 退回 1，於是重建出來的每一顆都是寬度 1。而「以參考
+        # MIDI 重建」正是音高壞掉時才會用的工具。
+        seen_widths = sorted(
+            abs(int(nn.max_key) - int(nn.min_key)) + 1 for nn in self.notes_tree
         )
+        default_width = (
+            seen_widths[len(seen_widths) // 2] if seen_widths
+            else DEFAULT_NOTE_LANE_WIDTH
+        )
+
+        # 「同一顆音」的原始位置：(起音時間, 音高) → [(min_key, max_key), ...]。
+        #
+        # 這個工具的說明寫的是「左右照原譜」，但它其實是從原譜學一條
+        # 「音高→鍵道」的區域回歸、再**重算每一顆**的位置——手擺好的位置會被
+        # 趨勢預測值取代。實測拿原本的 MIDI 回來重建，3473 顆有 100% 是
+        # (時間, 音高) 完全相同的同一顆音，卻整批被搬走了。
+        #
+        # 真的同一顆就照抄原位；只有找不到對應的（MIDI 有、原譜沒有的音）
+        # 才走回歸。
+        keep_note: Dict[Tuple[int, int], List[GNote]] = {}
+        for nn in self.notes_tree:
+            if nn.pitch is None:
+                continue
+            keep_note.setdefault((int(nn.start), int(nn.pitch)), []).append(nn)
+        for slots in keep_note.values():
+            slots.reverse()          # 之後用 pop() 依原順序取用
+
+        # 譜面沒有音高時（這個工具正是為了那種譜面存在的）就配不出「同一顆
+        # 音」，於是每一顆都會被重擺——實測 La Campanella 的 4118 顆全部換位置。
+        # 退而求其次用「起音時間＋順位」配：同一刻的音符照鍵道由低到高排，
+        # MIDI 那一刻的音符照音高由低到高排，兩邊依序配。鍵道順序本來就等於
+        # 音高順序（排譜器就是這樣排的），所以配得起來。
+        by_start: Dict[int, List[GNote]] = {}
+        if not keep_note:
+            for nn in self.notes_tree:
+                by_start.setdefault(int(nn.start), []).append(nn)
+            for slots in by_start.values():
+                slots.sort(key=lambda n: (int(n.min_key), int(n.max_key)))
+                slots.reverse()
+
+        # 連「同一個起音時間」都配不到時的最後一條路：**照順序**配。
+        #
+        # 譜面是固定 BPM、來源 MIDI 有速度圖，兩者的絕對時間本來就不一致
+        # ——實測 broken-moon 的時間比是 1.0293（非等速），用時間當鑰匙一顆都
+        # 配不到，2474 顆裡有 2471 顆被重擺。音符數接近時，第 n 顆就是第 n 顆。
+        ordered_existing = sorted(
+            self.notes_tree, key=lambda n: (int(n.start), int(n.min_key)))
+        # 容差取兩邊較大者的一成：broken-moon 是 2353 對 2474（差 121，
+        # 佔 4.9%），用譜面自己的 5% 算出來是 117，差 4 顆就被擋掉了。
+        #
+        # **不能加絕對下限**：寫成 max(8, 一成) 的話，5 顆對 1 顆（差了 80%）
+        # 也會被當成「接近」，於是小譜面永遠走序位配對、回歸那條路就測不到了。
+        # 兩邊都要有一定數量，順序配才有意義。
+        biggest = max(len(ordered_existing), len(midi_notes))
+        use_ordinal = (
+            min(len(ordered_existing), len(midi_notes)) >= 20
+            and abs(len(ordered_existing) - len(midi_notes)) <= biggest * 0.10)
 
         # 2) 左右手：從 MIDI 的音軌結構穩健判斷（忽略無音符的 tempo 軌），
         #    無法分軌時退回音高分手（中央 C 以下→左手）。
@@ -1981,6 +2427,10 @@ class NoteModel:
         ordered = sorted(
             midi_notes, key=lambda x: int(x.get('start_timing_msec', 0))
         )
+        # 診斷：有幾顆是沿用原本的音符物件（鍵道等欄位全部留住）、
+        # 有幾顆是靠「發音順序」配到的。
+        self.last_rebuild_reused = 0
+        self.last_rebuild_by_order = 0
         new_notes: List[GNote] = []
         for idx, m in enumerate(ordered):
             start = int(m.get('start_timing_msec', 0))
@@ -2003,6 +2453,39 @@ class NoteModel:
                 local = [(s[1], s[2], s[3]) for s in window]
             else:
                 local = []
+
+            slots = keep_note.get((start, pitch)) or by_start.get(start)
+            if slots:
+                self.last_rebuild_reused += 1
+            elif use_ordinal and idx < len(ordered_existing):
+                # 照順序配：第 n 顆配第 n 顆
+                slots = [ordered_existing[idx]]
+                self.last_rebuild_by_order += 1
+            if slots:
+                # 同一顆音就**沿用原本那個音符物件**，只有時間和音高是照 MIDI
+                # 的（而它們本來就一樣，所以等於原封不動）。
+                #
+                # 以前是每一顆都造新的 GNote，於是力度、note_index、param、
+                # note_type 全部重來：實測拿原本的 MIDI 回來重建，3469 顆配得
+                # 上的音符裡，**力度和 note_index 是 100% 被清掉**、note_type
+                # 有 219 顆被改（它是照長度重算的，>=180ms 就當長押），把人標的
+                # 長押／滑音／斷奏蓋掉。note_index 一掉，滑音鏈的 param1/param2
+                # 就指向不存在的音符，整條鏈斷掉。
+                existing = slots.pop()
+                if not slots:
+                    keep_note.pop((start, pitch), None)
+                    by_start.pop(start, None)
+                # 沿用的是**鍵道與人標的東西**（力度、note_index、param、
+                # note_type）；時間、音高、左右手仍然照 MIDI ——這個工具的說明
+                # 是「音高/時間照 MIDI、左右照原譜」，`左右` 指的是鍵道位置，
+                # 不是哪一隻手。
+                existing.start = start
+                existing.end = end
+                existing.gate = end - start
+                existing.pitch = pitch
+                existing.hand = hand
+                new_notes.append(existing)
+                continue
 
             lane_c, width = _fit_local_lane(
                 local, pitch, default_width, TOTAL_GAME_KEYS
@@ -2269,7 +2752,16 @@ class NoteModel:
                 return int(raw)
             except (TypeError, ValueError):
                 pass
-        return self._guess_lane_index_base(self.notes_tree)
+        # JSON 是遊戲的格式，startLane／endLane 從 0 開始（0～27），存檔也一律寫
+        # 0 開始。以前沿用 XML 的猜法「最小鍵道 >= 1 就當 1 開始」，於是沒用到最
+        # 左邊那一格的譜，開檔就被整份往左移一格、每存一次再開又移一格，直到碰到
+        # 第 0 格才停（曲庫有 13 份是這種譜）。只有真的出現第 28 格——0 開始的
+        # 寫法不可能有——才是舊的 1 開始檔案。
+        if self.notes_tree:
+            highest = max(max(int(n.min_key), int(n.max_key)) for n in self.notes_tree)
+            if highest >= TOTAL_GAME_KEYS:
+                return EXTERNAL_LANE_BASE
+        return INTERNAL_LANE_BASE
 
     # ------------------------------------------------------------------
     # 載入 XML
@@ -2292,6 +2784,9 @@ class NoteModel:
             raise ValueError('找不到 <note_data> 節點')
 
         self.notes_tree = [GNote(ne, i) for i, ne in enumerate(nd.findall('note'))]
+        self.pan_xml = True
+        self.hold_lengths_official = True
+        self.events = self._read_events_from_xml()
         self._read_pedal_data_from_xml()
         self._read_dynamics_data_from_xml()
         self._split_sub_notes_into_hidden()
@@ -2300,7 +2795,7 @@ class NoteModel:
         self.xml_lane_index_base = lane_base
         self._normalize_notes_to_internal(self.notes_tree, lane_base)
         self.rebuild_display_cache()
-        self.undo_stack.clear()
+        self.clear_history()
         self.dirty = False
 
     def _parse_xml_header(self) -> None:
@@ -2384,11 +2879,16 @@ class NoteModel:
             data = json.load(f)
 
         self.file_format = 'json'
+        self.pan_xml = False
+        self.hold_lengths_official = bool(
+            isinstance(data, dict) and data.get('hold_lengths_official'))
         self.root = None
         self.tree = None
         self.midi_data = None
         self.current_file = path
         self.json_meta = {k: v for k, v in data.items() if k != 'notes'} if isinstance(data, dict) else {}
+        # 事件由 self.events 持有，存檔時再寫回去，不在 json_meta 裡留第二份
+        self.events = self._events_from_json(self.json_meta.pop('event_data', None))
         self._epb_mode = None   # 換譜面 → 重新判斷 beat_data 格式
         self._epb_count = None
 
@@ -2485,7 +2985,7 @@ class NoteModel:
         self.xml_lane_index_base = lane_base
         self._normalize_notes_to_internal(self.notes_tree, lane_base)
         self.rebuild_display_cache()
-        self.undo_stack.clear()
+        self.clear_history()
         self.dirty = False
 
     @staticmethod
@@ -2991,6 +3491,11 @@ class NoteModel:
             return 100
         return self._clamp_midi_byte(int(round(sum(values) / len(values))), 100, minimum=1)
 
+    #: 還原音高時，「對上的組裡顆數也一致」至少要有這個比例才敢寫下去。
+    #: 對的 MIDI 是 1.00、別首曲子的 MIDI 是 0.21，中間有很大的空隙；留在
+    #: 0.5 是為了容許使用者本來就手改過一些和弦。
+    PITCH_RESTORE_MIN_AGREEMENT = 0.5
+
     #: 譜面完全沒有力度資料時，新音符用的預設值
     DEFAULT_NEW_NOTE_VELOCITY = 96
 
@@ -3124,6 +3629,9 @@ class NoteModel:
 
         mid = open_midi(path)
         self.file_format = 'midi'
+        self.pan_xml = False
+        self.hold_lengths_official = False
+        self.events = []
         self.root = None
         self.tree = None
         self.json_meta = {}
@@ -3156,7 +3664,7 @@ class NoteModel:
                     if first_bpm is None:
                         default_tempo = tempo_value
                         try:
-                            first_bpm = 60_000_000.0 / float(tempo_value)
+                            first_bpm = _bpm_from_midi_tempo(tempo_value)
                         except ZeroDivisionError:
                             first_bpm = 120.0
 
@@ -3324,7 +3832,7 @@ class NoteModel:
 
         self.notes_tree = notes
         self.rebuild_display_cache()
-        self.undo_stack.clear()
+        self.clear_history()
         self.dirty = False
         self.midi_data = {
             'ticks_per_beat': int(mid.ticks_per_beat),
@@ -3349,8 +3857,63 @@ class NoteModel:
             # 還沒排譜 —— 只有音高檢視有意義，其他檢視方式要先轉譜
             self.midi_unarranged = True
 
+    @staticmethod
+    def _time_offset_candidates(chart_times: Sequence[int],
+                                ref_times: Sequence[int],
+                                tolerance_ms: int,
+                                limit: int = 6) -> List[int]:
+        """猜「譜面比 MIDI 晚了幾毫秒」，回傳幾個最有希望的候選。
+
+        舊版是拿前 8 組依序相減（`chart_times[i] - ref_times[i]`）。那只在
+        兩邊開頭一顆不差時才成立——譜面開頭少了兩組音，8 個候選就**全部**
+        歪掉同一個量，真正的平移量根本不在候選裡。實測 +3600ms 且開頭少 2
+        組時，還原出來只有 5.8% 的音高是對的，而且回報 `changed=1952`、
+        `unmatched=2093`，看起來像成功了一半，其實是把 1952 顆音符寫成錯的。
+
+        改成投票：取樣譜面的發音時間，和**每一個**參考時間相減，把差值丟進
+        桶子裡數票。同一首曲子的兩份時間軸，真正的平移量會被反覆投到，隨機
+        的巧合則攤平在各個桶子裡。開頭多幾組、少幾組都不影響——那只是少了
+        幾票而已。
+
+        只看 ±`MAX_SHIFT_MS` 以內：現實中的平移是「開頭補一段空白」，幾秒
+        到十幾秒，放寬到整首長度只會引進雜訊。
+        """
+        MAX_SHIFT_MS = 60_000
+        bucket = max(1, int(tolerance_ms))
+        # 取樣要撒滿全曲，不能只取開頭——開頭正是最容易被增刪的地方。
+        step = max(1, len(chart_times) // 400)
+        sample = chart_times[::step]
+
+        votes: Dict[int, int] = {}
+        members: Dict[int, List[int]] = {}
+        for value in sample:
+            lo = bisect_left(ref_times, value - MAX_SHIFT_MS)
+            hi = bisect_right(ref_times, value + MAX_SHIFT_MS)
+            for ref in ref_times[lo:hi]:
+                diff = value - ref
+                # 兩條格線，錯開半個桶：真正的平移量剛好落在桶邊界時，
+                # 票會被劈成兩半而輸給雜訊。
+                for key in (diff // bucket, (diff + bucket // 2) // bucket):
+                    votes[key] = votes.get(key, 0) + 1
+                    members.setdefault(key, []).append(diff)
+
+        if not votes:
+            return []
+        top = sorted(votes, key=lambda k: -votes[k])[:limit]
+        out: List[int] = []
+        for key in top:
+            group = members[key]
+            group.sort()
+            # 桶只有 tolerance 的解析度，取桶內中位數把它磨細
+            value = int(group[len(group) // 2])
+            if value not in out:
+                out.append(value)
+        return out
+
     def restore_pitches_from_midi(self, midi_path: str,
-                                  tolerance_ms: int = 40) -> Tuple[int, int]:
+                                  tolerance_ms: int = 40,
+                                  min_match: float = 0.5,
+                                  apply: bool = True) -> 'PitchRestore':
         """拿原始 MIDI 把譜面裡壞掉的音高比對回來。
 
         可行的前提是**排譜不改時間**——`start_timing_msec` 直接沿用 MIDI 的
@@ -3362,7 +3925,17 @@ class NoteModel:
         器本來就是照音高決定鍵道順序的，所以「鍵道由低到高」等同「音高由低
         到高」，名次配得起來。
 
-        回傳 (改掉的音符數, 沒配到的音符數)。
+        兩種偏移都會量出來：
+
+        * **時間偏移**（`offset_ms`）——譜面開頭被補過空白就會整份平移。
+        * **音高偏移**（`semitones`）——譜面既有的音高和 MIDI 差一個固定的
+          音程，代表這份 MIDI 是移調過的版本。照樣覆蓋下去等於把整首移調，
+          所以量出來回報，讓呼叫端決定。
+
+        `min_match` 是安全閥：對得上的發音組數低於這個比例就**什麼都不改**
+        （通常代表選錯 MIDI 了）。之前沒有這道閘，選錯檔案會把湊巧對到的那
+        些音符寫成錯的、還回報「改了 N 顆」看起來像成功。`apply=False` 可以
+        只量不改。
         """
         # 用同一條載入路徑取得參考音符——自己重解 tempo 很容易出錯（多軌檔案
         # 的 tempo 事件在 track 0、音符在別軌，逐軌各算各的時間會全錯，實測
@@ -3373,7 +3946,7 @@ class NoteModel:
         ref = [(int(n.start), int(n.pitch)) for n in reference.notes_tree
                if n.pitch is not None]
         if not ref:
-            return (0, len(self.notes_tree))
+            return PitchRestore(0, len(self.notes_tree), 0, 0, 0.0, 0.0, False, False, False)
 
         ref_groups: Dict[int, List[int]] = {}
         for when, pitch in ref:
@@ -3384,15 +3957,13 @@ class NoteModel:
         for note in self.notes_tree:
             chart_groups.setdefault(int(note.start), []).append(note)
         chart_times = sorted(chart_groups)
+        if not chart_times:
+            return PitchRestore(0, 0, 0, 0, 0.0, 0.0, False, False, False)
 
         # 譜面被整份平移過的話，絕對時間永遠對不上——實測曲庫裡好幾份就是
         # 開頭補了空白（chronomia +3600ms、testify_mv +6700ms、エンドマーク
         # +6850ms），音符卻一顆不缺。先把平移量量出來、扣掉，再走原本那條
         # 容錯配對，這樣「平移」和「平移＋少數幾組被刪掉」兩種都吃得下。
-        #
-        # 量法：拿前幾組的時間差當候選（外加 0 = 沒平移），各自數數看能對上
-        # 幾組，取最高的。比直接用第一組的差穩——譜面開頭多一顆或少一顆音，
-        # 第一組的差就整個歪掉。
         def _hits(offset: int) -> int:
             hit = 0
             for value in chart_times:
@@ -3404,67 +3975,177 @@ class NoteModel:
                         break
             return hit
 
-        offset = 0
-        if chart_times and ref_times:
-            candidates = {0}
-            for index in range(min(8, len(chart_times), len(ref_times))):
-                candidates.add(chart_times[index] - ref_times[index])
-            offset, best_hits = 0, _hits(0)
-            for candidate in candidates:
-                if candidate == 0:
-                    continue
-                hits = _hits(candidate)
-                if hits > best_hits:
-                    offset, best_hits = candidate, hits
-            if offset:
-                logging.info('pitch restore: chart is shifted %+d ms from the MIDI',
-                             offset)
-
-            # 平移修不了「被拉伸」的譜（recollect-lines_ele 是 0~167598 對
-            # MIDI 的 0~165413，中間每一組都差一點點，愈後面差愈多）。那種
-            # 情形只要**發音組數完全相同**，就改用序位配對：第 n 組配第 n 組。
-            # 兩條路取能對上比較多的那條。
-            if (len(chart_times) == len(ref_times)
-                    and best_hits < len(chart_times) * 0.9):
-                changed = unmatched = 0
-                for index, when in enumerate(chart_times):
-                    group = chart_groups[when]
-                    pitches = sorted(ref_groups[ref_times[index]])
-                    group.sort(key=lambda n: (int(n.min_key) + int(n.max_key),
-                                              int(n.start)))
-                    if len(group) != len(pitches):
-                        unmatched += abs(len(group) - len(pitches))
-                    for note, pitch in zip(group, pitches):
-                        if note.pitch != pitch:
-                            note.pitch = int(pitch)
-                            changed += 1
-                logging.info('pitch restore (by ordinal): %d changed, %d unmatched',
-                             changed, unmatched)
-                return (changed, unmatched)
-
-        changed = unmatched = 0
-        cursor = 0
-        for when in chart_times:
-            aligned = when - offset
-            # 單調推進到最接近的參考時間
-            while (cursor + 1 < len(ref_times)
-                   and abs(ref_times[cursor + 1] - aligned) <= abs(ref_times[cursor] - aligned)):
-                cursor += 1
-            group = chart_groups[when]
-            if cursor >= len(ref_times) or abs(ref_times[cursor] - aligned) > tolerance_ms:
-                unmatched += len(group)
+        offset, best_hits = 0, _hits(0)
+        for candidate in self._time_offset_candidates(
+                chart_times, ref_times, tolerance_ms):
+            if candidate == 0:
                 continue
-            pitches = sorted(ref_groups[ref_times[cursor]])
-            # 鍵道由低到高 == 音高由低到高，依名次配
-            group.sort(key=lambda n: (int(n.min_key) + int(n.max_key), int(n.start)))
-            if len(group) != len(pitches):
-                unmatched += abs(len(group) - len(pitches))
-            for note, pitch in zip(group, pitches):
-                if note.pitch != pitch:
-                    note.pitch = int(pitch)
-                    changed += 1
-        logging.info('pitch restore: %d changed, %d unmatched', changed, unmatched)
-        return (changed, unmatched)
+            hits = _hits(candidate)
+            if hits > best_hits:
+                offset, best_hits = candidate, hits
+        if offset:
+            logging.info('pitch restore: chart is shifted %+d ms from the MIDI',
+                         offset)
+
+        # 擬計畫而不是直接寫：要先看過整體對得上多少，才知道能不能套用。
+        plan: List[Tuple[Any, int]] = []
+        unmatched = 0
+        matched_groups = 0
+        same_size = 0
+
+        # 平移修不了「被拉伸」的譜（recollect-lines_ele 是 0~167598 對
+        # MIDI 的 0~165413，中間每一組都差一點點，愈後面差愈多）。那種
+        # 情形只要**發音組數完全相同**，就改用序位配對：第 n 組配第 n 組。
+        # 兩條路取能對上比較多的那條。
+        # 序位配對：兩邊的發音點**依序**配，第 n 個配第 n 個。
+        #
+        # 譜面是固定 BPM、來源 MIDI 有速度圖，兩者的絕對時間本來就不會一致：
+        # 實測 broken-moon 的譜面 323.6 秒 / 1211 個發音點，MIDI 330.6 秒 /
+        # 1206 個，時間比 1.0293（非等速）。掃過 ±8 秒、每 10ms 一格，最好的
+        # 平移也只對上 36.7%——那不是偏移，是拉伸，平移救不了。
+        #
+        # 以前要求兩邊的發音點數**完全相同**才走這條路，1211 vs 1206 就不符。
+        # 放寬成「差不到 5%」，並用等比例的索引對應，順便吃掉少數幾個增刪。
+        counts_close = (abs(len(chart_times) - len(ref_times))
+                        <= max(4, int(len(chart_times) * 0.05)))
+        by_ordinal = counts_close and best_hits < len(chart_times) * 0.9
+        if by_ordinal:
+            # 等比例對應。試過帶狀 DP 對齊，結果反而更差（配不到的從 1160 變
+            # 1347）——兩邊的**發音點**本來就幾乎一對一（1211 對 1206），對齊
+            # 沒有東西可以修；真正對不上的是**和絃的顆數**，那是譜面改編過的
+            # 結果，不是對齊的問題。
+            span = max(1, len(chart_times) - 1)
+            reach = max(1, len(ref_times) - 1)
+            for index, when in enumerate(chart_times):
+                mapped = int(round(index * reach / float(span)))
+                group = chart_groups[when]
+                pitches = sorted(ref_groups[ref_times[mapped]])
+                group.sort(key=lambda n: (int(n.min_key) + int(n.max_key),
+                                          int(n.start)))
+                if len(group) != len(pitches):
+                    unmatched += abs(len(group) - len(pitches))
+                else:
+                    same_size += 1
+                matched_groups += 1
+                plan.extend(zip(group, pitches))
+        else:
+            # 每個**參考**發音點先認領它最接近的譜面發音點（誤差要在容錯窗
+            # 內），再把認領到同一組的音高併起來。
+            #
+            # 以前是反過來的：一個譜面發音點只認一個參考發音點。但 MIDI 常
+            # 常把和弦寫成琶音——實測「彩云追月 人工修正.mid」，譜面的 1475
+            # 是一整組，MIDI 拆成 1475 / 1490 / 1492 / 1505 四個發音點。只取
+            # 最近的那一個，同一組其他的音就全部配不到：1581 顆裡掉了 354
+            # 顆，和弦顆數一致率只有 81%。
+            aligned_times = [when - offset for when in chart_times]
+            buckets: Dict[int, List[int]] = {}
+            for when in ref_times:
+                index = bisect_left(aligned_times, when)
+                best = None
+                for probe in (index - 1, index):
+                    if not (0 <= probe < len(aligned_times)):
+                        continue
+                    delta = abs(aligned_times[probe] - when)
+                    if delta <= tolerance_ms and (best is None or delta < best[0]):
+                        best = (delta, probe)
+                if best is not None:
+                    buckets.setdefault(best[1], []).extend(ref_groups[when])
+            for index, when in enumerate(chart_times):
+                group = chart_groups[when]
+                pitches = sorted(buckets.get(index, ()))
+                if not pitches:
+                    unmatched += len(group)
+                    continue
+                # 鍵道由低到高 == 音高由低到高，依名次配
+                group.sort(key=lambda n: (int(n.min_key) + int(n.max_key),
+                                          int(n.start)))
+                if len(group) != len(pitches):
+                    unmatched += abs(len(group) - len(pitches))
+                else:
+                    same_size += 1
+                matched_groups += 1
+                plan.extend(zip(group, pitches))
+
+        ratio = matched_groups / float(len(chart_times))
+        agreement = same_size / float(matched_groups or 1)
+        # `unmatched` 要回報「有幾顆音符**沒有拿到音高**」，而不是把每一組的
+        # 顆數差累加起來——後者會重複計算：實測 broken-moon 累加出來是 1160，
+        # 但真正沒拿到音高的只有 514 顆。使用者要據此決定要不要套用，數字必須
+        # 是他看得懂的那一個。
+        unmatched = len(self.notes_tree) - len(plan)
+
+        # 兩邊的音域中位數：偏移大到不像移調時，靠它判斷是哪一側壞了。
+        chart_pitches = sorted(int(n.pitch) for n in self.notes_tree
+                               if getattr(n, 'pitch', None) is not None)
+        midi_pitches = sorted(pitch for _when, pitch in ref)
+        chart_median = (chart_pitches[len(chart_pitches) // 2]
+                        if chart_pitches else 0)
+        midi_median = (midi_pitches[len(midi_pitches) // 2]
+                       if midi_pitches else 0)
+
+        # 音高偏移：只看譜面本來就有音高的那些音符。整份差同一個音程，代表
+        # 這份 MIDI 是移調版；差值散開則代表音高本來就是壞的（那才是要修的
+        # 情形），mode 會落在 0 附近或毫無集中趨勢。
+        diffs: Dict[int, int] = {}
+        for note, pitch in plan:
+            have = getattr(note, 'pitch', None)
+            if have is None:
+                continue
+            key = int(pitch) - int(have)
+            diffs[key] = diffs.get(key, 0) + 1
+        semitones = 0
+        if diffs:
+            top = max(diffs, key=lambda k: diffs[k])
+            # 要夠一致才算「移調」，零星巧合不算
+            if top and diffs[top] >= sum(diffs.values()) * 0.8:
+                semitones = int(top)
+                logging.info('pitch restore: MIDI is transposed %+d semitones '
+                             'from the chart', semitones)
+
+        # 光看「對上幾組」擋不住選錯 MIDI：40ms 的容錯窗夠寬，兩首密度相近
+        # 的曲子有一半的發音點會巧合地對上（實測拿別首的 MIDI 去對，match
+        # 有 51%，剛好跨過門檻，於是寫壞 1087 顆音符只有 0.5% 是對的）。
+        #
+        # 「對上的那些組，顆數也一樣嗎」才是決定性的：同一首曲子是 100%，
+        # 別首曲子只有 21%。殘差也一樣乾淨（0.0ms 對 20.0ms），但序位配對
+        # 那條路本來就允許時間漂移，殘差在那裡沒有意義，顆數兩條路都適用。
+        # `acceptable` 和 `applied` 是兩件事：前者是「檢查過得了嗎」，後者是
+        # 「這次有沒有真的寫下去」。試算（apply=False）永遠不寫，所以拿 applied
+        # 判斷對不對得起來一定是 False——實測 La Campanella 明明 100% 對上，
+        # 對話框還是說「這份 MIDI 和譜面對不起來」。
+        if by_ordinal:
+            # 序位配對有自己的判準。
+            #
+            # 不能用和弦一致率——那是拿來擋「選錯 MIDI」的，而序位配對本來就
+            # 會讓組界對不齊（兩邊的時間軸不同，第 n 組和第 n 組的顆數自然
+            # 不一定一樣）。實測 broken-moon 走這條路時一致率只有 42.9%，
+            # 但它就是同一首曲子——發音點只差 5 個。
+            #
+            # 但光看「發音點數接近」也擋不住：長度相近的兩首歌數量也會接近。
+            # 真正的判準是**正規化之後的位置**（見 `_ordinal_shape_matches`）。
+            acceptable = counts_close and _ordinal_shape_matches(
+                chart_times, ref_times)
+        else:
+            acceptable = bool(ratio >= min_match
+                              and agreement >= self.PITCH_RESTORE_MIN_AGREEMENT)
+        applied = bool(apply and acceptable)
+        # `changed` 是「會改幾顆」，不是「改了幾顆」——試算（apply=False）也要
+        # 報得出這個數字，不然對話框只會說「0 顆會被覆蓋」。
+        changed = sum(1 for note, pitch in plan if note.pitch != pitch)
+        if applied:
+            for note, pitch in plan:
+                note.pitch = int(pitch)
+        elif apply:
+            logging.warning('pitch restore: %.0f%% of onsets matched, %.0f%% of '
+                            'those agree in size — refusing to overwrite '
+                            '(wrong MIDI?)', ratio * 100, agreement * 100)
+        logging.info('pitch restore%s: %d changed, %d unmatched, %.0f%% matched, '
+                     '%.0f%% agree',
+                     ' (by ordinal)' if by_ordinal else '',
+                     changed, unmatched, ratio * 100, agreement * 100)
+        return PitchRestore(changed, unmatched, offset, semitones, ratio,
+                            agreement, by_ordinal, acceptable, applied,
+                            chart_median, midi_median)
 
     def _merge_hidden_into_hosts(self) -> int:
         """把隱藏音符的 sub 元素併回寄主的 `sub_note_data`（存檔前呼叫）。
@@ -3472,7 +4153,14 @@ class NoteModel:
         從 XML 載入的隱藏音符持有原本那個 sub 元素、也記得它原本的排列位置
         （`_sub_order`），所以照順序併回去就是逐位元組還原。使用者自己標記
         隱藏的音符沒有原始元素，這裡替它現做一個。
+
+        併進去的結果**只給這次寫檔用**：寄主原本的 `sub_elems` 記在
+        `_merged_hosts`，寫完由 `_unmerge_hidden_from_hosts` 還回去。以前是直接
+        留在記憶體裡，於是同一次開檔連續存檔時，上一次併進去的子音被當成寄主
+        自己的、再併一次——編輯器裡隱藏的音符每存一次就多一份，重新開檔後
+        6 顆存 3 次變成 9 顆。自動儲存每幾分鐘就存一次，會一直踩到。
         """
+        self._merged_hosts = []
         hosts: Dict[int, List[Tuple[int, Any]]] = {}
         orphans = 0
         for note, host in self.resolve_hidden_hosts():
@@ -3505,8 +4193,15 @@ class NoteModel:
                 # `_split_sub_notes_into_hidden` 看到 len(subs) < 2 直接跳過，
                 # 於是寄主的音變成隱藏音的音、隱藏音符本身沒了。
                 own = [(-1, self._make_sub_elem(host))]
+            self._merged_hosts.append((host, host.sub_elems))
             host.sub_elems = [se for _o, se in sorted(own + items, key=lambda x: x[0])]
         return sum(len(v) for v in hosts.values())
+
+    def _unmerge_hidden_from_hosts(self) -> None:
+        """把 `_merge_hidden_into_hosts` 動過的寄主還原成寫檔前的 `sub_elems`。"""
+        for host, original in reversed(getattr(self, '_merged_hosts', None) or []):
+            host.sub_elems = original
+        self._merged_hosts = []
 
     @staticmethod
     def _make_sub_elem(note: Any) -> ET.Element:
@@ -3579,6 +4274,10 @@ class NoteModel:
         for note in list(self.notes_tree):
             subs = list(getattr(note, 'sub_elems', []) or [])
             if len(subs) < 2:
+                continue
+            if note_is_trill(int(getattr(note, 'note_type', 0))):
+                # 顫音的 sub_note 是每一下的敲擊（mesh 的格子），不是藏起來的和弦音。
+                # 拆掉的話官方 66 下的顫音在編輯器裡只剩 1 格、多出 65 顆隱藏音符。
                 continue
             own, extra = [], []
             for order, se in enumerate(subs):
@@ -3658,7 +4357,10 @@ class NoteModel:
         隱藏音符自帶多音時用平均音高比對。找不到寄主就回 None——那種情況不能
         隱藏，否則音就消失了。
         """
-        visible = [n for n in self.notes_tree if not getattr(n, 'hidden', False)]
+        # 顫音不能當寄主：它的 sub_note 是每一下敲擊，併進去的隱藏音會變成多出來的
+        # 敲擊，讀回來時音符就不見了（載入時顫音不拆 sub，見 _split_sub_notes_into_hidden）。
+        visible = [n for n in self.notes_tree if not getattr(n, 'hidden', False)
+                   and not note_is_trill(int(getattr(n, 'note_type', 0)))]
         visible.sort(key=lambda n: int(n.start))
         starts = [int(n.start) for n in visible]
         alive = {id(n) for n in visible}
@@ -4895,6 +5597,15 @@ class NoteModel:
         self.pedal_spans = self._normalise_pedal_spans(spans)
 
     def save_xml(self, path: Optional[str] = None, use_midi_restore: bool = False) -> None:
+        """存成 PAN（本家）讀得進去的 XML。
+
+        只寫官方檔有的區段和欄位——編輯器自己的東西（踏板、強弱記號、拍號變化、
+        trill 格子的 src_* 還原欄位…）一律不寫，那些留在 JSON。規則與驗證都在
+        `pan_format`。
+
+        記憶體裡的譜**不會被改**：PAN 沒有的類型（Soft／Staccato）在檔案裡寫成
+        Tap。要讓畫面也跟著變，介面會先呼叫 `convert_to_pan()`（可以復原）。
+        """
         if use_midi_restore:
             self.save_xml_with_midi_restore(path)
             return
@@ -4902,68 +5613,391 @@ class NoteModel:
             path = self.current_file
         if path is None:
             raise ValueError('未指定存檔路徑')
-        self._ensure_xml_tree_for_export()
-        self._sync_xml_metadata_for_export()
-        assert self.root is not None and self.tree is not None
-
-        # ── 永遠從 notes_tree 重建 note_data ────────────────────────
-        # （可正確處理刪除、新增、MIDI 匯入後的儲存）
-        nd = self.root.find('note_data')
-        if nd is None:
-            nd = ET.SubElement(self.root, 'note_data')
-        else:
-            for child in list(nd):
-                nd.remove(child)
-
-        # slide（note_type=4）鏈結修復：param1/param2 參照的是音符原始 <index>，
-        # 但下方會把 index 依序重新編號，因此先建立「舊 index → 新序號」對照表，
-        # 將 slide 音符的 param1/param2 重寫成新序號，避免存檔後鏈結錯位。
-        old_to_new: Dict[int, int] = {}
-        for i, n in enumerate(self.notes_tree):
-            if getattr(n, 'note_index', None) is not None:
-                old_to_new[int(n.note_index)] = i
-        for n in self.notes_tree:
-            if int(getattr(n, 'note_type', 0)) != 4:
-                continue
-            for attr in ('param1', 'param2'):
-                v = getattr(n, attr, -1)
-                if v is not None and int(v) >= 0 and int(v) in old_to_new:
-                    setattr(n, attr, old_to_new[int(v)])
-
-        # Preserve the current note_data order for regular NOS XML saves.
-        # Re-sorting here can reshuffle nearby notes after reload and make
-        # left/right hand labels appear to jump to a different note.
-        # 隱藏音符不獨立寫出——它們的音要併回寄主的 sub_note_data。
-        self._write_velocity_into_subs()
-        merged = self._merge_hidden_into_hosts()
-        for i, n in enumerate(self.notes_tree):
-            if getattr(n, 'hidden', False):
-                continue
-            if n.elem is not None:
-                # 更新既有 XML 元素後重新掛入
-                n.apply_back(EXTERNAL_LANE_BASE)
-                n.elem.set('index', str(i))
-                idx_child = n.elem.find('index')
-                if idx_child is not None:
-                    idx_child.text = str(i)
-                nd.append(n.elem)
-            else:
-                nd.append(self._build_note_element(n, i, EXTERNAL_LANE_BASE))
-            # 新序號成為此音符的新原始 index，供下一次存檔對照
-            n.note_index = i
-
-        self._ensure_event_data_for_export()
-        self._write_pedal_data_for_export()
-        self._write_dynamics_data_for_export()
-        raw = ET.tostring(self.root, encoding='unicode')
+        root = self.build_pan_xml()
+        raw = ET.tostring(root, encoding='unicode')
         pretty_bytes = xml.dom.minidom.parseString(raw).toprettyxml(indent='  ', encoding='utf-8')
         lines = [l for l in pretty_bytes.decode('utf-8').splitlines() if l.strip()]
         with open(path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
 
         self.file_format = 'xml'
+        self.pan_xml = True
         self.current_file = path
         self.dirty = False
+
+    # ------------------------------------------------------------------
+    # PAN 相容
+    # ------------------------------------------------------------------
+
+    def pan_conversion_preview(self) -> Dict[str, int]:
+        """轉成 PAN XML 會少掉／換掉什麼（只數，不改）。值為 0 的項目不列。"""
+        from .pan_format import EDITOR_ONLY_TYPES, is_pan_note_type
+        out: Dict[str, int] = {}
+        for nt, name in EDITOR_ONLY_TYPES.items():
+            count = sum(1 for n in self.notes_tree if int(n.note_type) == nt)
+            if count:
+                out[f'{name} 音符換成 Tap'] = count
+        odd = sum(1 for n in self.notes_tree
+                  if int(n.note_type) not in EDITOR_ONLY_TYPES
+                  and not is_pan_note_type(n.note_type))
+        if odd:
+            out['音符類型裡 PAN 沒有的位元被拿掉'] = odd
+        if self.pedal_spans:
+            out['延音踏板區段（PAN 沒有踏板）'] = len(self.pedal_spans)
+        marks = sum(len(v) for v in self.dynamics.values())
+        if marks:
+            out['強弱記號（PAN 沒有）'] = marks
+        return out
+
+    def convert_to_pan(self) -> Dict[str, int]:
+        """把 PAN 沒有的東西從譜面上拿掉／換掉。呼叫端負責先 push_history。"""
+        from .pan_format import pan_note_type
+        report = self.pan_conversion_preview()
+        for n in self.notes_tree:
+            n.note_type = pan_note_type(n.note_type)
+        self.pedal_spans = []
+        self.dynamics = {}
+        if report:
+            self.rebuild_display_cache()
+            self.dirty = True
+        return report
+
+    def sorted_events(self) -> List[List[int]]:
+        return sorted(([int(ms), int(ty), int(value)] for ms, ty, value in self.events),
+                      key=lambda e: (e[0], e[1]))
+
+    def tempo_events_from_measures(self) -> List[List[int]]:
+        """照每小節的 BPM 產生速度事件：開頭一個，之後 BPM 有變的小節各一個。"""
+        from .pan_format import TEMPO_EVENT
+        events = [[0, TEMPO_EVENT, bpm_to_xml_value(self.bpm)]]
+        previous = float(self.bpm)
+        for mi in range(self.count_measures()):
+            start, _end = self.get_measure_time_range(mi)
+            if start is None:
+                continue
+            bpm = float(self.get_measure_bpm(mi))
+            if mi == 0 and int(start) <= 0:
+                events[0][2] = bpm_to_xml_value(bpm)
+            elif abs(bpm - previous) > 0.005:
+                events.append([int(start), TEMPO_EVENT, bpm_to_xml_value(bpm)])
+            previous = bpm
+        return events
+
+    def default_events(self) -> List[List[int]]:
+        """新譜面的事件：速度照小節 BPM，音效參數用官方最常見的開頭值。"""
+        from .pan_format import DEFAULT_EFFECT_EVENTS
+        return self.tempo_events_from_measures() + [
+            [0, ty, value] for ty, value in sorted(DEFAULT_EFFECT_EVENTS.items())]
+
+    def pan_events(self) -> List[List[int]]:
+        """寫進 XML 的事件。沒有速度事件就照小節 BPM 補上（PAN 靠它知道速度）。"""
+        from .pan_format import TEMPO_EVENT
+        if not self.events:
+            return self.default_events()
+        events = self.sorted_events()
+        if not any(ty == TEMPO_EVENT for _ms, ty, _v in events):
+            events = sorted(self.tempo_events_from_measures() + events,
+                            key=lambda e: (e[0], e[1]))
+        return events
+
+    def _typical_measure_bpm(self) -> float:
+        """整首主要的速度：每小節 BPM 依小節長度加權的中位數。"""
+        weighted: List[Tuple[float, float]] = []
+        for mi in range(self.count_measures()):
+            start, end = self.get_measure_time_range(mi)
+            if start is None or end is None or end <= start:
+                continue
+            weighted.append((float(self.get_measure_bpm(mi)), float(end - start)))
+        if not weighted:
+            return float(self.bpm)
+        weighted.sort()
+        half = sum(w for _b, w in weighted) / 2.0
+        acc = 0.0
+        for bpm, w in weighted:
+            acc += w
+            if acc >= half:
+                return bpm
+        return weighted[-1][0]
+
+    def _pan_tracks_and_zones(self) -> Tuple[List[Tuple[int, str]], List[Dict[str, int]]]:
+        """原檔帶的 track_info 與力度區：XML 來的從 root 讀，JSON 來的從 json_meta 讀。"""
+        tracks: List[Tuple[int, str]] = []
+        zones: List[Dict[str, int]] = []
+        if self.root is not None and self.root.find('track_info') is not None:
+            for tr in self.root.findall('track_info/track'):
+                try:
+                    tracks.append((int(float(tr.findtext('index'))),
+                                   (tr.findtext('name') or '').strip()))
+                except (TypeError, ValueError):
+                    continue
+            for zone in self.root.findall('velocity_zone_data/velocity_zone'):
+                zones.append({tag: int(_child_int(zone, tag) or 0) for tag in
+                              ('start_timing_msec', 'end_timing_msec', 'velocity_type')})
+        else:
+            jm = self.json_meta or {}
+            for item in jm.get('pan_track_info') or []:
+                try:
+                    tracks.append((int(item['index']), str(item['name']).strip()))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for item in jm.get('pan_velocity_zones') or []:
+                try:
+                    zones.append({tag: int(item[tag]) for tag in
+                                  ('start_timing_msec', 'end_timing_msec', 'velocity_type')})
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return [(i, name) for i, name in tracks if name], zones
+
+    def _read_events_from_xml(self) -> List[List[int]]:
+        out: List[List[int]] = []
+        if self.root is None:
+            return out
+        for ev in self.root.findall('event_data/event'):
+            try:
+                out.append([int(float(ev.findtext('start_timing_msec'))),
+                            int(float(ev.findtext('type'))),
+                            int(float(ev.findtext('value')))])
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _events_from_json(raw: Any) -> List[List[int]]:
+        out: List[List[int]] = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            try:
+                if isinstance(item, dict):
+                    out.append([int(item['ms']), int(item['type']), int(item['value'])])
+                else:
+                    out.append([int(item[0]), int(item[1]), int(item[2])])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return out
+
+    def _pan_beat_times(self) -> List[int]:
+        """PAN 的 beat_data 是一拍一筆、index 從 0 連號。
+
+        已經是這個形狀（官方譜、一拍一筆的 JSON）就原樣寫；一小節一筆、半小節
+        一筆、精確拍格這些編輯器內部的寫法，照小節邊界重新切成一拍一筆。
+        """
+        entries = self.get_beat_entries()
+        bpb = max(1, int(self.beats_per_bar))
+        consecutive = all(int(idx) == i for i, (idx, _ms) in enumerate(entries))
+        per_bar = bpb > 1 and self.entries_per_bar == 1
+        # 已經連號的就原樣寫：讀回來的拍格和現在一模一樣（官方 3/4 的譜量出來是
+        # 一小節 3 筆，重切成 4 筆反而把小節弄亂）。只有一小節一筆（節拍器一小節
+        # 才響一下）和精確拍格這種非連號的才重切。
+        if entries and consecutive and not per_bar and not self._uses_explicit_beat_units():
+            return [int(ms) for _idx, ms in entries]
+        times: List[int] = []
+        last_end: Optional[int] = None
+        for mi in range(self.count_measures()):
+            start, end = self.get_measure_time_range(mi)
+            if start is None or end is None or end <= start:
+                continue
+            num = max(1, int(self.get_beats_per_bar_at_ms(start)))
+            for b in range(num):
+                times.append(int(round(start + (end - start) * b / num)))
+            last_end = int(end)
+        if last_end is not None:
+            times.append(last_end)
+        if not times and entries:
+            return [int(ms) for _idx, ms in entries]
+        if not times:
+            # 譜面完全沒有拍點（有些 JSON 只有音符）：照 BPM 均勻補到曲末，
+            # 不然 beat_data 是空的，節拍器和拍子線都沒有，嚴格一點的讀取器還會拒收。
+            step = 60000.0 / max(1.0, float(self.bpm))
+            end = max(float(self.music_end_ms or 0.0),
+                      max((float(n.end) for n in self.notes_tree), default=0.0))
+            count = int(end // step) + 2
+            return [int(round(i * step)) for i in range(count)]
+        cleaned: List[int] = []
+        for ms in sorted(times):
+            if not cleaned or ms > cleaned[-1]:
+                cleaned.append(ms)
+        return cleaned
+
+    def official_hold_scale(self) -> float:
+        """轉成官方格式時長押長度要乘多少。
+
+        MIDI／JSON 的長度是聲音的長度，官方譜的長押比那短。預設 80%，偏好設定
+        可以改；已經是官方長度的（從官方 XML 讀進來）不縮，JSON 本身也不動。
+        """
+        if self.hold_lengths_official:
+            return 1.0
+        try:
+            from .settings import settings as _st
+            pct = float(_st.get('official_hold_length_pct', 80))
+        except Exception:                       # noqa: BLE001
+            pct = 80.0
+        return max(0.1, min(1.0, pct / 100.0))
+
+    def build_pan_xml(self, hold_scale: Optional[float] = None) -> ET.Element:
+        """組出 PAN 相容的整棵 XML（不動 self.root，也不改音符類型與長度）。
+
+        `hold_scale` 不給就用 `official_hold_scale()`：長押（note_type 帶 0x02）
+        的長度乘上這個比例，只影響寫出去的檔案。
+        """
+        if hold_scale is None:
+            hold_scale = self.official_hold_scale()
+        from .pan_format import (DEFAULT_TRACKS, FIELDS, default_track_for_hand,
+                                 pan_note_type, typed)
+
+        old = self.root
+        root = ET.Element('music_score')
+
+        # ── 音符（先算，header 的音域要用）──────────────────────────────
+        self._write_velocity_into_subs()
+        self._merge_hidden_into_hosts()
+        try:
+            visible = [n for n in self.notes_tree if not getattr(n, 'hidden', False)]
+            # 照時間排：PAN 串滑鍵是在檔案順序裡往前往後找。穩定排序，同一刻
+            # 的音符維持原本的先後，讀回來左右手才不會看起來跳位。
+            visible.sort(key=lambda n: int(n.start))
+            position = {id(n): i for i, n in enumerate(visible)}
+            index_map = build_slide_index_map(visible)
+            prev_of: Dict[int, int] = {}
+            next_of: Dict[int, int] = {}
+            for n in visible:
+                if not note_is_slide(int(n.note_type)):
+                    continue
+                nxt = slide_next_note(n, visible, index_map)
+                if nxt is not None and id(nxt) in position and nxt is not n:
+                    next_of[id(n)] = position[id(nxt)]
+                    prev_of.setdefault(id(nxt), position[id(n)])
+
+            tracks, zones = self._pan_tracks_and_zones()
+            tracks = tracks or list(DEFAULT_TRACKS)
+            track_ids = {i for i, _name in tracks}
+            fallback_track = min(track_ids)
+
+            def pitch_index(note: Any) -> int:
+                if note.pitch is not None:
+                    return midi_to_official_piano_index(int(note.pitch))
+                centre = (int(note.min_key) + int(note.max_key)) // 2
+                return midi_to_official_piano_index(game_lane_index_to_midi_pitch(centre))
+
+            def clean_sub(se: Optional[ET.Element], note: Any, first: bool) -> ET.Element:
+                def value(tag: str) -> Optional[int]:
+                    if se is None:
+                        return None
+                    return _child_int(se, tag)
+                start = value('start_timing_msec')
+                end = value('end_timing_msec')
+                pitch = value('scale_piano')
+                velocity = note.velocity if (first and note.velocity is not None) else value('velocity')
+                track = value('track_index')
+                if track not in track_ids:
+                    wanted = default_track_for_hand(int(note.hand))
+                    track = wanted if wanted in track_ids else fallback_track
+                out = ET.Element('sub_note')
+                typed(out, 'start_timing_msec', int(note.start if start is None else start), 's32')
+                typed(out, 'end_timing_msec', int(note.end if end is None else end), 's32')
+                sp = pitch_index(note) if pitch is None or not 1 <= pitch <= 88 else pitch
+                typed(out, 'scale_piano', int(sp), 'u8')
+                typed(out, 'velocity', max(1, min(127, int(100 if velocity is None else velocity))), 'u8')
+                typed(out, 'track_index', int(track), 's32')
+                return out
+
+            pitches: List[int] = []
+            note_data = ET.Element('note_data')
+            for i, n in enumerate(visible):
+                el = ET.SubElement(note_data, 'note')
+                lo, hi = lane_range_to_serialized(n.min_key, n.max_key, EXTERNAL_LANE_BASE)
+                lo, hi = max(1, min(TOTAL_GAME_KEYS, int(lo))), max(1, min(TOTAL_GAME_KEYS, int(hi)))
+                lo, hi = min(lo, hi), max(lo, hi)
+                start, end = int(n.start), max(int(n.start), int(n.end))
+                nt = pan_note_type(n.note_type)
+                if nt & 0x02 and hold_scale < 1.0 and end > start:
+                    end = start + max(1, int(round((end - start) * hold_scale)))
+                slide = bool(nt & 0x04)
+                hand = int(n.hand) if int(n.hand) in (0, 1, 2) else 0
+                sp = pitch_index(n)
+                pitches.append(sp)
+                values = {
+                    'index': i, 'start_timing_msec': start, 'end_timing_msec': end,
+                    'gate_time_msec': end - start, 'scale_piano': sp,
+                    'min_key_index': lo, 'max_key_index': hi, 'note_type': nt,
+                    'hand': hand, 'key_kind': 0,
+                    'param1': prev_of.get(id(n), -1) if slide else 0,
+                    'param2': next_of.get(id(n), -1) if slide else 0,
+                    'param3': 0,
+                }
+                for tag, ty in FIELDS['note']:
+                    typed(el, tag, values[tag], ty)
+                subs = list(getattr(n, 'sub_elems', None) or [])
+                sub_root = ET.SubElement(el, 'sub_note_data')
+                for k, se in enumerate(subs or [None]):
+                    sub_root.append(clean_sub(se, n, k == 0))
+                # 記下這次寫出去的 index，下一次存檔滑鍵鏈才對得上
+                n.note_index = i
+                if slide:
+                    n.param1, n.param2 = values['param1'], values['param2']
+        finally:
+            self._unmerge_hidden_from_hosts()
+
+        # ── header ─────────────────────────────────────────────────────
+        header = ET.SubElement(root, 'header')
+        old_header = old.find('header') if old is not None else None
+
+        def old_int(tag: str) -> Optional[int]:
+            if old_header is None:
+                return None
+            return _child_int(old_header, tag)
+
+        max_scale = old_int('max_scale')
+        min_scale = old_int('min_scale')
+        if max_scale is None or min_scale is None:
+            max_scale = max(pitches) if pitches else 88
+            min_scale = min(pitches) if pitches else 1
+        typed(header, 'max_scale', int(max_scale), 's32')
+        typed(header, 'min_scale', int(min_scale), 's32')
+        typed(header, 'file_version', 1, 's16')
+        events = self.pan_events()
+        first_bpm = old_int('first_bpm')
+        if first_bpm is None or first_bpm <= 0:
+            # 讀回來時「一小節幾拍」是拿 first_bpm 和拍子間距推的，所以這裡要寫
+            # 整首**主要的**速度：json 的 bpm 欄位常常只是標稱值（實測有譜寫 99、
+            # 實際 74），第一小節又常是弱起的短小節，拿它的 BPM 也會推錯。
+            first_bpm = bpm_to_xml_value(self._typical_measure_bpm())
+        typed(header, 'first_bpm', int(first_bpm), 's64')
+        typed(header, 'music_finish_time_msec', int(round(self.music_end_ms)), 's32')
+
+        root.append(note_data)
+
+        # ── 事件 ───────────────────────────────────────────────────────
+        event_data = ET.SubElement(root, 'event_data')
+        for i, (ms, ty, value) in enumerate(events):
+            ev = ET.SubElement(event_data, 'event')
+            typed(ev, 'index', i, 's32')
+            typed(ev, 'start_timing_msec', int(ms), 's32')
+            typed(ev, 'type', int(ty), 's32')
+            typed(ev, 'value', int(value), 's64')
+
+        # ── 拍子 ───────────────────────────────────────────────────────
+        beat_data = ET.SubElement(root, 'beat_data')
+        for i, ms in enumerate(self._pan_beat_times()):
+            beat = ET.SubElement(beat_data, 'beat')
+            typed(beat, 'index', i, 's32')
+            typed(beat, 'start_timing_msec', int(ms), 's32')
+
+        # ── 音色 ───────────────────────────────────────────────────────
+        track_info = ET.SubElement(root, 'track_info')
+        for idx, name in tracks:
+            tr = ET.SubElement(track_info, 'track')
+            typed(tr, 'index', int(idx), 's32')
+            typed(tr, 'name', name, 'str')
+
+        # ── 力度區（演奏會模式用，只有原檔有才寫）────────────────────────
+        if zones:
+            zone_data = ET.SubElement(root, 'velocity_zone_data')
+            for i, zone in enumerate(zones):
+                z = ET.SubElement(zone_data, 'velocity_zone')
+                for tag, ty in FIELDS['velocity_zone']:
+                    typed(z, tag, i if tag == 'index' else zone[tag], ty)
+        return root
 
     def save_xml_with_midi_restore(self, path: Optional[str] = None) -> None:
         if path is None:
@@ -5079,10 +6113,31 @@ class NoteModel:
         else:
             meta.pop('dynamics_data', None)
 
+        if self.hold_lengths_official:
+            meta['hold_lengths_official'] = True
+        else:
+            meta.pop('hold_lengths_official', None)
+
+        if self.events:
+            meta['event_data'] = [{'ms': int(ms), 'type': int(ty), 'value': int(value)}
+                                  for ms, ty, value in self.sorted_events()]
+        else:
+            meta.pop('event_data', None)
+
+        # 從 XML 來的譜：PAN 專用、JSON 本來沒地方放的東西也帶著走，之後轉回
+        # XML 才不會變成預設值（官方有 81 份用 key_cat1 之類的音色）。
+        tracks, zones = self._pan_tracks_and_zones()
+        if tracks:
+            meta['pan_track_info'] = [{'index': i, 'name': name} for i, name in tracks]
+        if zones:
+            meta['pan_velocity_zones'] = zones
+
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
         self.current_file = path
+        self.file_format = 'json'
+        self.pan_xml = False
         self.dirty = False
 
     # ------------------------------------------------------------------
@@ -5209,8 +6264,8 @@ class NoteModel:
         guard = 0
         while cur_unit < last_unit - 1e-6 and guard < 100000:
             guard += 1
-            beats_in_bar = max(1, self.get_beats_per_bar_at_ms(cur_ms))
-            end_unit = cur_unit + float(beats_in_bar)
+            # 一小節佔幾個拍單位要看分母（2/2 是 4 個四分音符，不是 2 個）
+            end_unit = cur_unit + max(1e-6, self.bar_units_at_ms(cur_ms))
             end_ms_f = self._unit_to_ms_from_entries(end_unit, entries)
             if end_ms_f is None:
                 break
@@ -5389,6 +6444,26 @@ class NoteModel:
         self.rebuild_display_cache()
         self.dirty = True
 
+    def bar_units_at_ms(self, ms: float) -> float:
+        """ms 時刻的一個小節佔幾個「拍單位」。
+
+        **不是 numerator。** beat_data 的單位是四分音符，分母不是 4 的時候兩者
+        不一樣：2/2 的分子是 2，但一小節仍然是 4 個四分音符；6/8 的分子是 6，
+        一小節只有 3 個。拿 numerator 當單位數的話，把一小節改成 2/2 會讓它只
+        佔一半——那一小節被切成兩半、後面每一小節都往前擠一格，看起來就像
+        「改一個拍號結果後面全部小節都變了」。
+
+        非整數是正常的（7/8 = 3.5 個四分音符），呼叫端用浮點運算。
+        """
+        num = max(1, int(self.get_beats_per_bar_at_ms(ms)))
+        den = max(1, int(self.time_sig_denominator))
+        for change_ms, _num, change_den in self.time_sig_changes:
+            if change_ms <= ms:
+                den = max(1, int(change_den))
+            else:
+                break
+        return num * 4.0 / den
+
     def get_beats_per_bar_at_ms(self, ms: float) -> int:
         """查詢 ms 時刻的每小節拍數（numerator），無變拍號資料時回傳 beats_per_bar。"""
         if not self.time_sig_changes:
@@ -5541,6 +6616,9 @@ class NoteModel:
         """從頭建立一份空白譜面，回傳已初始化的 NoteModel。"""
         model = cls()
         model.file_format   = 'xml'
+        model.pan_xml       = False          # 新譜預設存 JSON
+        model.hold_lengths_official = False
+        model.events        = []
         model.current_file  = None
         model.xml_lane_index_base = EXTERNAL_LANE_BASE
         model.bpm           = max(1.0, float(bpm))
@@ -5589,7 +6667,7 @@ class NoteModel:
         model.tree  = ET.ElementTree(root)
         model.notes_tree = []
         model.notes      = []
-        model.undo_stack.clear()
+        model.clear_history()
         model.dirty = False
         # 記住曲名供建議存檔名稱用
         model._song_name: str = song_name
@@ -5919,7 +6997,7 @@ class NoteModel:
         if dur_ms <= 0:
             return False
         insert_ms = int(start_ms)
-        beats_in_bar = max(1, self.get_beats_per_bar_at_ms(insert_ms))
+        beats_in_bar = max(1e-6, self.bar_units_at_ms(insert_ms))
         beat_ms_each = dur_ms / epb
 
         # 1. 插入點之後的音符整段往後推（長度不變）
@@ -5991,8 +7069,8 @@ class NoteModel:
         # 重建 beat 清單：跳過 [del_start, del_end)，後續 ms 與 index 都往前
         # 補上這一小節的量。index 照原刻度平移，不能重編號——重編號會把
         # beat index 的刻度打掉，explicit beat units 的譜會整個換一套小節切法。
-        beats_in_bar = max(1, self.get_beats_per_bar_at_ms(start_ms))
-        idx_shift = int(round(beats_in_bar * self._detect_beat_index_scale()))
+        idx_shift = int(round(self.bar_units_at_ms(start_ms)
+                              * self._detect_beat_index_scale()))
         entries: List[Tuple[int, int]] = []
         for i, (bidx, bms) in enumerate(all_beats):
             if i < del_start:
@@ -6050,12 +7128,15 @@ class NoteModel:
             if not entries:
                 return
             unit = float(entries[0][0])
-            for num, _den in sig_by_measure:
+            for num, den in sig_by_measure:
                 ms = self._unit_to_ms_from_entries(unit, entries)
                 if ms is None:
                     break
                 starts.append(max(0, int(round(ms))))
-                unit += float(max(1, num))
+                # 累加的是「拍單位」不是分子——和
+                # `_compute_precise_measure_boundaries` 用同一套，否則 6/8 這種
+                # 分子和單位數不一樣的拍號會讓後面每個標記都落在錯的位置。
+                unit += max(1e-6, float(max(1, num)) * 4.0 / max(1, int(den)))
         else:
             for i in range(len(sig_by_measure)):
                 s, _e = self.get_measure_time_range(i)
@@ -6128,6 +7209,12 @@ class NoteModel:
             return
 
         old_dur = end_ms - start_ms
+        # 這兩個一定要在改 `time_sig_changes` **之前**問。改完之後
+        # `_measure_entry_slice` / `_measure_unit_bounds` 看到的已經是新拍號，
+        # 於是「舊跨度」等於新跨度（idx_shift 變 0）、切片也只涵蓋新的長度——
+        # 尾巴那段就被當成小節內容重寫，寫出重複 ms、index 不遞增的清單。
+        pre_entry_slice = self._measure_entry_slice(measure_idx)
+        pre_bounds = self._measure_unit_bounds(measure_idx)
         # read current BPM for this measure (before we change the signature)
         try:
             bpm_here = float(self.get_measure_bpm(measure_idx))
@@ -6257,7 +7344,7 @@ class NoteModel:
         # 2. 更新拍點（XML beat_data 與 JSON beat_timings 走同一條路）
         all_beats = list(self.get_beat_entries())
         if all_beats:
-            entry_s, entry_e = self._measure_entry_slice(measure_idx)
+            entry_s, entry_e = pre_entry_slice
             entry_s = max(0, entry_s)
             entry_e = min(len(all_beats), entry_e)
 
@@ -6272,14 +7359,18 @@ class NoteModel:
             scale = self._detect_beat_index_scale()
             explicit = self._uses_explicit_beat_units()
             per_beat = self.entries_per_bar > 1
-            bounds = self._measure_unit_bounds(measure_idx)
+            bounds = pre_bounds
             old_span_units = (bounds[1] - bounds[0]) if bounds else float(prev_num)
 
             if explicit:
                 base_idx = int(round(bounds[0] * scale)) if bounds else int(all_beats[entry_s][0])
-                new_span_units = float(num)
+                # 單位是四分音符，不是「拍」：2/2 佔 4 個單位、6/8 佔 3 個。
+                # 這裡跟著 `_compute_precise_measure_boundaries` 用同一個算法，
+                # 兩邊不一致的話寫出來的 entry 和小節邊界對不上——實測會寫出
+                # 重複 ms、index 不遞增的清單，小節長度再被比例套第二次。
+                new_span_units = float(num) * 4.0 / max(1, int(den))
                 idx_shift = int(round((new_span_units - old_span_units) * scale))
-                new_count = max(1, num if per_beat else 1)
+                new_count = max(1, int(round(new_span_units)) if per_beat else 1)
                 idx_step = int(round(scale * new_span_units / new_count))
             else:
                 # 舊格式：index 本來就是 0..n-1 的流水號，維持原本的重編行為
@@ -6373,6 +7464,36 @@ class NoteModel:
             if bar_ms > 0:
                 return round(num * 4.0 * 60000.0 / (den * bar_ms), 2)
         return float(self.bpm)
+
+    def same_bpm_run(self, start_idx: int, tolerance: float = 0.5) -> Tuple[int, float]:
+        """從 start_idx 往後，BPM 一直「差不多一樣」的最後一個小節。
+
+        回傳 (最後一個小節的 0-based index, 這一段的平均 BPM)。
+
+        從錄音或 MIDI 轉出來的譜，每小節量出來的 BPM 會在真正的速度上下各抖
+        `tolerance` 左右（120.4、119.6…），所以不能比相等，也不能拿第一小節
+        當基準：第一小節自己偏高 0.5 的話，偏低 0.5 的正常小節和它差到 1.0
+        就被切掉了。規則是**整段放得進一條 ±tolerance 的帶子裡**，也就是
+        最快和最慢差不超過 2×tolerance；慢慢漂移的速度也因此不會無限延伸。
+        """
+        total = self.count_measures()
+        if total <= 0:
+            return 0, float(self.bpm)
+        start_idx = max(0, min(int(start_idx), total - 1))
+        width = 2.0 * max(0.0, float(tolerance)) + 1e-6   # 小數兩位的四捨五入誤差
+        first = float(self.get_measure_bpm(start_idx))
+        lo = hi = total_bpm = first
+        count = 1
+        last = start_idx
+        for mi in range(start_idx + 1, total):
+            bpm = float(self.get_measure_bpm(mi))
+            if max(hi, bpm) - min(lo, bpm) > width:
+                break
+            lo, hi = min(lo, bpm), max(hi, bpm)
+            total_bpm += bpm
+            count += 1
+            last = mi
+        return last, total_bpm / count
 
     def set_measure_bpm(self, measure_idx: int, new_bpm: float, uniform: bool = False, mode: str = 'scale', adjust_notes: bool = True) -> None:
         """修改第 measure_idx 小節的 BPM。

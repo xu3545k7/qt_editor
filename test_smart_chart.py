@@ -653,7 +653,9 @@ class SmartChartTests(unittest.TestCase):
         """兩套風格是實測出來的兩種做法，不是鬆緊度的差別。
 
         官方靠「讓鍵道重疊」擠空間、只有單手同時 4 音才收窄、會自動標滑音；
-        Eather 靠「收窄」擠空間（整組跨度 7~11 半音就收）、表情記號自己標。
+        Eather 靠「收窄」擠空間（整組跨度 8~10 半音就收）、表情記號自己標。
+        收窄帶 2026-09-18 從 7~11 縮成 8~10：原本收窄率 21.3%，他自己的譜是
+        16.1%，改完 14.3%，旋律步伐差距同時變好。
         和絃內部幾何、分手上限、度數階梯表兩者共用 —— 那些是官方語料量出來
         的物理事實，手寫譜也遵守。
         """
@@ -661,17 +663,18 @@ class SmartChartTests(unittest.TestCase):
             STYLE_EATHER, STYLE_OFFICIAL, settings_for_style,
         )
 
-        def widths_for(style):
+        def widths_for(style, top=71):
             notes = [
                 note(0, 63, track=2, index=0),
                 note(0, 67, track=2, index=1),
-                note(0, 70, track=2, index=2),      # 跨度 7 半音
+                note(0, top, track=2, index=2),
                 note(1000, 36, track=1, index=3),
             ]
             arrange_midi_notes(notes, settings_for_style(style))
             return [n.max_key - n.min_key + 1 for n in notes[:3]]
 
-        self.assertEqual(widths_for(STYLE_EATHER), [2, 2, 2])
+        self.assertEqual(widths_for(STYLE_EATHER), [2, 2, 2])        # 跨度 8：收窄
+        self.assertEqual(widths_for(STYLE_EATHER, top=70), [3, 3, 3])  # 跨度 7：不收了
         self.assertEqual(widths_for(STYLE_OFFICIAL), [3, 3, 3])
 
         def slides_for(style):
