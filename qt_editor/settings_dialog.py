@@ -366,6 +366,11 @@ class SettingsDialog(QDialog):
         self._latency_spin.setToolTip('判定線比聲音早到就調大。')
         playback.addRow(QLabel('音效輸出延遲補償'), self._latency_spin)
 
+        # ── 音源（SoundFont）───────────────────────────────────────
+        # 以前音源躺在 exe 裡面，使用者看不到也換不掉。這裡讓人換自己的。
+        sf_form = section(editing, '音源（SoundFont）')
+        self._build_soundfont_rows(sf_form, hint)
+
         for body in self._tab_bodies:
             body.addStretch(1)
 
@@ -447,6 +452,117 @@ class SettingsDialog(QDialog):
         if seq is not None:
             self._set_key(key, seq)
 
+    # ── 音源 ──────────────────────────────────────────────────────────
+
+    def _build_soundfont_rows(self, form, hint) -> None:
+        from PyQt5.QtWidgets import QHBoxLayout, QPushButton
+
+        from . import soundfonts as SF
+
+        self._sf_combo = QComboBox()
+        self._sf_combo.setToolTip('音源檔（.sf2）。換了之後鋼琴試聽、音源預覽、'
+                                  '輸出歌曲包時算的音訊都會用新的那一份。')
+        self._sf_preset = QComboBox()
+        self._sf_preset.setToolTip('同一個音源檔裡通常有好幾個音色，'
+                                   '鋼琴不一定是第 0 個。')
+        self._sf_combo.currentIndexChanged.connect(self._reload_sf_presets)
+
+        row = QHBoxLayout()
+        row.addWidget(self._sf_combo, 1)
+        browse = QPushButton('瀏覽…')
+        browse.clicked.connect(self._browse_soundfont)
+        row.addWidget(browse)
+        form.addRow(QLabel('音源'), self._wrap(row))
+        form.addRow(QLabel('音色'), self._sf_preset)
+
+        tools = QHBoxLayout()
+        open_btn = QPushButton('開啟音源資料夾')
+        open_btn.setToolTip('丟 .sf2 進這個資料夾，上面的清單就會出現它。')
+        open_btn.clicked.connect(self._open_soundfont_dir)
+        export_btn = QPushButton('把內建音源複製出來')
+        export_btn.setToolTip('內建音源是打包在程式裡的。複製一份到資料夾裡，'
+                              '就可以拿去改、或當成自己音源的起點。')
+        export_btn.clicked.connect(self._export_builtin_soundfont)
+        tools.addWidget(open_btn)
+        tools.addWidget(export_btn)
+        tools.addStretch(1)
+        form.addRow(QLabel(''), self._wrap(tools))
+        hint(form, '音源資料夾：%s' % SF.user_dir())
+
+        self._reload_sf_choices()
+
+    def _wrap(self, layout):
+        holder = QWidget()
+        holder.setLayout(layout)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return holder
+
+    def _reload_sf_choices(self, select: str = None) -> None:
+        from . import soundfonts as SF
+
+        if select is None:
+            select = str(settings.get(SF.SETTING_PATH, '') or '')
+        self._sf_combo.blockSignals(True)
+        self._sf_combo.clear()
+        for choice in SF.available_soundfonts():
+            self._sf_combo.addItem(choice.label, choice.key)
+        if self._sf_combo.count() == 0:
+            self._sf_combo.addItem('（找不到任何音源）', '')
+        index = self._sf_combo.findData(select)
+        self._sf_combo.setCurrentIndex(max(0, index))
+        self._sf_combo.blockSignals(False)
+        self._reload_sf_presets()
+
+    def _reload_sf_presets(self) -> None:
+        from . import soundfonts as SF
+
+        key = self._sf_combo.currentData()
+        path = key or (SF.builtin_soundfont() or (None, 0))[0]
+        wanted = int(settings.get(SF.SETTING_PRESET, -1))
+        self._sf_preset.clear()
+        self._sf_preset.addItem('跟著音源的預設音色', -1)
+        for name, number, bank in SF.list_presets(path) if path else []:
+            label = '%d：%s%s' % (number, name,
+                                 '' if bank == 0 else '（bank %d）' % bank)
+            self._sf_preset.addItem(label, number)
+        index = self._sf_preset.findData(wanted)
+        self._sf_preset.setCurrentIndex(max(0, index))
+
+    def _browse_soundfont(self) -> None:
+        from PyQt5.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, '選擇音源檔', '', 'SoundFont (*.sf2 *.sf3);;All Files (*)')
+        if not path:
+            return
+        index = self._sf_combo.findData(path)
+        if index < 0:
+            self._sf_combo.addItem('%s（%s）' % (os.path.basename(path),
+                                                os.path.dirname(path)), path)
+            index = self._sf_combo.count() - 1
+        self._sf_combo.setCurrentIndex(index)
+
+    def _open_soundfont_dir(self) -> None:
+        from PyQt5.QtCore import QUrl
+        from PyQt5.QtGui import QDesktopServices
+
+        from . import soundfonts as SF
+
+        folder = SF.ensure_user_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _export_builtin_soundfont(self) -> None:
+        from PyQt5.QtWidgets import QMessageBox
+
+        from . import soundfonts as SF
+
+        target = SF.export_builtin()
+        if target is None:
+            QMessageBox.information(self, '音源', '沒有內建音源可以複製。')
+            return
+        QMessageBox.information(self, '音源', '已複製到：%s' % target)
+        self._reload_sf_choices(str(target))
+
     def _on_accept(self) -> None:
         lang_code = self._lang_combo.currentData()
         scroll_inv = self._scroll_combo.currentData()
@@ -458,6 +574,10 @@ class SettingsDialog(QDialog):
         settings.set('keyboard_height_px', int(self._kb_spin.value()))
         settings.set('pitch_pedal_lane', bool(self._pedal_chk.isChecked()))
         settings.set('pitch_velocity_shading', bool(self._vel_chk.isChecked()))
+        if getattr(self, '_sf_combo', None) is not None:
+            from . import soundfonts as SF
+            SF.set_selection(self._sf_combo.currentData() or '',
+                             int(self._sf_preset.currentData() or -1))
         for key, value in self._key_values.items():
             settings.set(key, value)
         for key, chk in self._toggles.items():

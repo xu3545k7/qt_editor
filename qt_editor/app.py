@@ -112,6 +112,17 @@ def main() -> None:
     if lang and settings.get('language', 'zh_tw') != lang:
         settings.set('language', lang)
     set_lang(settings.get('language', 'zh_tw'))
+    # 音源資料夾：開機就建好（裡面附一張說明），使用者才知道音源可以換。
+    # 唯讀位置或沒有權限都不會丟例外。
+    try:
+        try:
+            from .soundfonts import ensure_user_dir
+        except ImportError:
+            # 打包之後這個檔是以腳本身分跑的，沒有父套件，相對匯入會失敗
+            from qt_editor.soundfonts import ensure_user_dir
+        ensure_user_dir()
+    except Exception:                   # noqa: BLE001
+        pass
 
     # 高 DPI 支援
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)

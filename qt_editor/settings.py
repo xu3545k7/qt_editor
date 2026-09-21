@@ -141,6 +141,9 @@ _DEFAULTS: dict[str, object] = {
     'shortcut_toggle_width': 'E',
     'shortcut_measures_bpm': '',
     'shortcut_events': '',
+    # 音源（SoundFont）：空字串 = 用內建那一份；preset 負數 = 跟著音源的預設音色
+    'soundfont_path': '',
+    'soundfont_preset': -1,
     # MIDI 轉譜對話框：上次用的選項，以及自訂參數的預設集（名稱 -> 選項）
     'arrange_options': {},
     'arrange_presets': {},

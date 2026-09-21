@@ -111,7 +111,18 @@ def _runtime_root() -> Path:
 
 
 def default_soundfont() -> Tuple[Path, int]:
-    """(音源路徑, preset)。找不到主音源就退回舊的那份，preset 跟著換。"""
+    """(音源路徑, preset)。
+
+    使用者在偏好設定換過音源就用他選的那一份（見 `soundfonts.py`）；
+    沒換、或換的那個檔案不見了，就退回跟著程式帶的內建音源。
+    """
+    try:
+        from .soundfonts import selected_soundfont
+        path, preset = selected_soundfont()
+        if path is not None:
+            return (Path(path), int(preset))
+    except Exception:                   # noqa: BLE001
+        pass                            # 設定壞掉不該讓試聽整個不能用
     root = _runtime_root()
     for name, preset in (DEFAULT_SOUNDFONT, FALLBACK_SOUNDFONT):
         for folder in ("soundfonts", "UprightPianoKW-SF2-20220221"):
