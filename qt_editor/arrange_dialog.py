@@ -206,11 +206,12 @@ class ArrangeDialog(QDialog):
 
     def __init__(self, parent=None, title: str = 'MIDI 轉譜',
                  intro: str = '', options: Optional[ArrangeOptions] = None,
-                 allow_skip: bool = False):
+                 allow_skip: bool = False, fresh_import: bool = True):
         super().__init__(parent)
         self.setWindowTitle(tr(title))
         self.resize(640, 0)
         opts = (options or ArrangeOptions.from_dict(settings.get('arrange_options'))).normalised()
+        self._fresh_import = bool(fresh_import)
         layout = QVBoxLayout(self)
 
         if intro:
@@ -273,6 +274,25 @@ class ArrangeDialog(QDialog):
             self.overlap.setCurrentIndex(OVERLAP_OFF)
         overlap_layout.addWidget(self.overlap)
         layout.addWidget(overlap_box)
+
+        # ── 音符長度 ──────────────────────────────────────────────────
+        # 這個開關以前是寫死的：只要排譜就裁。結果「重新排整份譜面」會把
+        # 使用者自己調好的長押一起砍掉（回報：很多長音變短）。
+        length_box = QGroupBox(tr('音符長度'))
+        length_layout = QVBoxLayout(length_box)
+        self.trim_holds = QCheckBox(tr('先裁掉踏板殘響造成的長音（會縮短長押）'))
+        self.trim_holds.setToolTip(tr(
+            '鋼琴踩著踏板時，MIDI 的音長是殘響而不是手按著的時間。' + chr(10) +
+            '剛匯入的 MIDI 應該裁；已經排好、長押手動調過的譜不要裁，' + chr(10) +
+            '否則那些長押會被砍短。'))
+        stored = opts.trim_pedal_holds
+        self.trim_holds.setChecked(bool(fresh_import) if stored is None else bool(stored))
+        length_layout.addWidget(self.trim_holds)
+        note = QLabel(tr('沒勾的話，音符的時間與長度完全不動，只重排鍵道。'))
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #555;')
+        length_layout.addWidget(note)
+        layout.addWidget(length_box)
 
         # ── 自訂 ──────────────────────────────────────────────────────
         self.custom_box = QGroupBox(tr('自訂參數'))
@@ -337,6 +357,7 @@ class ArrangeDialog(QDialog):
         self.overlap.setCurrentIndex(OVERLAP_BY_MODE)
         self.base_style.setCurrentIndex(0)
         self.table.set_base(STYLE_EATHER, {})
+        self.trim_holds.setChecked(bool(self._fresh_import))
 
     def _mode_changed(self, *_args) -> None:
         mode = self.mode()
@@ -432,6 +453,7 @@ class ArrangeDialog(QDialog):
             allow_chord_overlap=allow,
             base_style=self.base_style.currentData(),
             overrides=self.table.overrides() if self.mode() == MODE_CUSTOM else {},
+            trim_pedal_holds=self.trim_holds.isChecked(),
         ).normalised()
 
     def _skip(self) -> None:

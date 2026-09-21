@@ -96,6 +96,10 @@ class ArrangeOptions:
     base_style: str = STYLE_EATHER
     #: 自訂模式的參數覆寫
     overrides: Dict[str, Any] = field(default_factory=dict)
+    #: 轉譜前要不要先裁掉「踏板踩住的殘響」造成的長音。
+    #: None ＝只有還沒排過的 MIDI 才裁（剛匯入的那種）。已經排好的譜再跑一次
+    #: 會把手動調過的長押一起砍掉，所以預設不碰。
+    trim_pedal_holds: Optional[bool] = None
 
     # ── 基本查詢 ──────────────────────────────────────────────────────
 
@@ -116,6 +120,7 @@ class ArrangeOptions:
             allow_chord_overlap=self.allow_chord_overlap,
             base_style=normalise_style(self.base_style),
             overrides=dict(self.overrides or {}),
+            trim_pedal_holds=self.trim_pedal_holds,
         )
 
     @property
@@ -139,6 +144,12 @@ class ArrangeOptions:
             return normalise_style(self.base_style)
         return STYLE_EATHER
 
+    def should_trim_pedal_holds(self, midi_unarranged: bool) -> bool:
+        """這次要不要裁長音。沒指定就只有「還沒排過的 MIDI」才裁。"""
+        if self.trim_pedal_holds is not None:
+            return bool(self.trim_pedal_holds)
+        return bool(midi_unarranged)
+
     def overlap_allowed(self) -> bool:
         if self.allow_chord_overlap is not None:
             return bool(self.allow_chord_overlap)
@@ -156,6 +167,7 @@ class ArrangeOptions:
             'base_style': opt.base_style,
             'overrides': {k: (list(v) if isinstance(v, tuple) else v)
                           for k, v in opt.overrides.items()},
+            'trim_pedal_holds': opt.trim_pedal_holds,
         }
 
     @classmethod
@@ -172,6 +184,7 @@ class ArrangeOptions:
                     overrides[key] = coerce_value(key, value)
                 except (TypeError, ValueError):
                     continue
+        trim = data.get('trim_pedal_holds', None)
         return cls(
             mode=normalise_mode(data.get('mode')),
             lane_lo=int(data.get('lane_lo', 0) or 0),
@@ -179,6 +192,7 @@ class ArrangeOptions:
             allow_chord_overlap=overlap,
             base_style=normalise_style(data.get('base_style')),
             overrides=overrides,
+            trim_pedal_holds=None if trim is None else bool(trim),
         ).normalised()
 
     # ── 產生排譜器設定 ────────────────────────────────────────────────

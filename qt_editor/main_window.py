@@ -4951,7 +4951,8 @@ class MainWindow(QMainWindow):
             return False
         return self._arrange_now(options)
 
-    def ask_arrange_options(self, intro: str = '', allow_skip: bool = False):
+    def ask_arrange_options(self, intro: str = '', allow_skip: bool = False,
+                            fresh_import: bool = True):
         """跳出「MIDI 轉譜」對話框。回傳 (要不要轉, 選項)。
 
         `allow_skip=True` 時多一顆「先不轉譜」，按了就回 (False, None)——匯入
@@ -4959,7 +4960,8 @@ class MainWindow(QMainWindow):
         """
         from .arrange_dialog import ArrangeDialog
 
-        dlg = ArrangeDialog(self, intro=intro, allow_skip=allow_skip)
+        dlg = ArrangeDialog(self, intro=intro, allow_skip=allow_skip,
+                            fresh_import=fresh_import)
         if dlg.exec_() != ArrangeDialog.Accepted:
             return None, None
         if getattr(dlg, 'skipped', False):
@@ -4974,12 +4976,14 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QThread, pyqtSignal as _sig
         from PyQt5.QtWidgets import QProgressDialog, QMessageBox
 
+        model = self.view.model
+        fresh = bool(getattr(model, 'midi_unarranged', False))
         if options is None:
             arrange, options = self.ask_arrange_options(
-                intro='這份 MIDI 還沒轉成譜面。要怎麼轉？')
+                intro='這份 MIDI 還沒轉成譜面。要怎麼轉？', fresh_import=fresh)
             if not arrange:
                 return False
-        model = self.view.model
+        trim_holds = options.should_trim_pedal_holds(fresh)
         # 自動排譜會重寫每一顆音符的鍵道，還會先裁掉踏板殘響造成的長音——
         # 這是整份譜面級別的改動，沒有 push_history 就**完全救不回來**。
         # 觸發它的又是切換檢視時跳出來的那個問句（快捷鍵一按就會碰到），
@@ -4991,7 +4995,11 @@ class MainWindow(QMainWindow):
 
             def run(self) -> None:
                 try:
-                    model.trim_pedal_sustained_holds()
+                    # 裁「踏板踩住的殘響」會縮短長押。剛匯入的 MIDI 該裁
+                    # （那些長度是踏板造成的，不是真的按著），但對一份已經
+                    # 排好、長押調過的譜再裁一次就是把人家的工作毀掉。
+                    if trim_holds:
+                        model.trim_pedal_sustained_holds()
                     model.arrange_with_options(options)
                     self.done.emit(True, '')
                 except Exception as exc:            # noqa: BLE001
@@ -6651,7 +6659,9 @@ class MainWindow(QMainWindow):
                 '這份譜沒有音高資料（不是從 MIDI 來的），沒辦法重新轉譜。')
             return
         arrange, options = self.ask_arrange_options(
-            intro='重新排整份譜面。原本的鍵道會被全部重寫（可以復原）。')
+            intro='重新排整份譜面。原本的鍵道會被全部重寫（可以復原）。'
+                  '音符的時間與長度不動，除非下面勾了裁長音。',
+            fresh_import=False)
         if not arrange:
             return
         if self._arrange_now(options):

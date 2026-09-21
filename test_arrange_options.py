@@ -611,3 +611,89 @@ class AnnounceTests(unittest.TestCase):
         text = self.message_for(ArrangeOptions(lane_lo=5, lane_hi=20))
         self.assertIn('6', text)
         self.assertIn('21', text)
+
+
+class TrimPedalHoldsTests(unittest.TestCase):
+    """裁「踏板殘響造成的長音」會縮短長押，所以不能每次排譜都做。
+
+    回報：用「重新排整份譜面」之後「很多長音變短」。匯入新 MIDI 該裁（那些
+    長度是踏板造成的），但已經排好、長押手動調過的譜不該被動到。
+    """
+
+    def test_a_fresh_midi_is_trimmed_by_default(self):
+        self.assertTrue(ArrangeOptions().should_trim_pedal_holds(True))
+
+    def test_an_arranged_chart_is_left_alone_by_default(self):
+        self.assertFalse(ArrangeOptions().should_trim_pedal_holds(False))
+
+    def test_an_explicit_choice_wins_either_way(self):
+        self.assertFalse(
+            ArrangeOptions(trim_pedal_holds=False).should_trim_pedal_holds(True))
+        self.assertTrue(
+            ArrangeOptions(trim_pedal_holds=True).should_trim_pedal_holds(False))
+
+    def test_the_choice_survives_a_round_trip(self):
+        for value in (True, False, None):
+            back = ArrangeOptions.from_dict(
+                ArrangeOptions(trim_pedal_holds=value).to_dict())
+            self.assertIs(back.trim_pedal_holds, value)
+
+
+class TrimInTheWindowTests(unittest.TestCase):
+    """主視窗實際上有沒有裁。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import contextlib
+        import io as _io
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        from qt_editor.main_window import MainWindow
+        with contextlib.redirect_stdout(_io.StringIO()):
+            cls.win = MainWindow()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.win.view.model.dirty = False
+        cls.win.close()
+
+    def chart(self, unarranged):
+        m = NoteModel.create_new('t', 120.0, 60.0, 4)
+        m.notes_tree = scale(8)
+        for n in m.notes_tree:
+            n.note_type = 2
+            n.end = n.start + 4000        # 手動調長的長押
+            n.gate = 4000
+        m.midi_unarranged = unarranged
+        m.rebuild_display_cache()
+        m.dirty = False
+        self.win._load_model_all(m)
+        return m
+
+    def trimmed_when(self, unarranged, options):
+        from unittest import mock
+        m = self.chart(unarranged)
+        with mock.patch.object(NoteModel, 'trim_pedal_sustained_holds',
+                               autospec=True, return_value=0) as trim:
+            self.win._arrange_now(options)
+        return trim.called
+
+    def test_an_arranged_chart_keeps_its_note_lengths(self):
+        self.assertFalse(self.trimmed_when(False, ArrangeOptions()),
+                         '已經排好的譜不該被裁長音')
+
+    def test_a_fresh_midi_still_gets_trimmed(self):
+        self.assertTrue(self.trimmed_when(True, ArrangeOptions()))
+
+    def test_ticking_the_box_trims_anyway(self):
+        self.assertTrue(self.trimmed_when(False, ArrangeOptions(trim_pedal_holds=True)))
+
+    def test_unticking_it_protects_a_fresh_midi_too(self):
+        self.assertFalse(self.trimmed_when(True, ArrangeOptions(trim_pedal_holds=False)))
+
+    def test_lengths_really_survive_a_rearrange(self):
+        m = self.chart(False)
+        before = [(int(n.start), int(n.end)) for n in m.notes_tree]
+        self.win._arrange_now(ArrangeOptions())
+        self.assertEqual([(int(n.start), int(n.end)) for n in m.notes_tree], before,
+                         '重排只動鍵道，時間與長度都不能變')
