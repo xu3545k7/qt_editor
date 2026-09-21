@@ -13,9 +13,21 @@
 
 ```bash
 cd qt_editor
-chmod +x build_mac.sh
-./build_mac.sh
+bash build_mac.sh
 ```
+
+用 `bash build_mac.sh` 而不是 `./build_mac.sh`：不需要先 `chmod +x`，
+也不會受檔案權限影響。看不到任何輸出就表示指令根本沒執行到
+（腳本第一行就會印 `=== build_mac.sh starting ===`）。
+
+出錯時加 `--debug` 會印出每一行指令：
+
+```bash
+bash build_mac.sh --debug 2>&1 | tee ~/build_mac.log
+```
+
+其他選項：`--no-brew`（跳過 FluidSynth，沒有音源預覽）、
+`--no-venv`（用目前的 Python 環境，不另外建虛擬環境）。
 
 腳本會自己做這些事：建虛擬環境、裝相依套件、`brew install fluid-synth`、
 把 FluidSynth 與它相依的 dylib 複製進 `vendor/fluidsynth/mac/`、

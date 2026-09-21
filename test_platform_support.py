@@ -243,6 +243,32 @@ class MacBuildFilesTests(unittest.TestCase):
         self.assertIn('fluid-synth', script, '要處理 FluidSynth')
         self.assertNotIn('\r\n', script, 'CRLF 會讓 bash 說找不到直譯器')
 
+    def test_the_build_script_is_pure_ascii(self):
+        """中文在機器之間複製時被改掉編碼，會讓 shell 把後面當成變數展開
+        （實測回報：line 19 unbound variable）。說明放 README-mac.md。"""
+        script = self.read('build_mac.sh')
+        bad = [(i, line) for i, line in enumerate(script.splitlines(), 1)
+               if any(ord(ch) > 126 for ch in line)]
+        self.assertEqual(bad, [], '這幾行有非 ASCII 字元：%s' % bad[:3])
+
+    def test_the_build_script_does_not_use_set_u(self):
+        """`set -u` 擋不了什麼，卻會在 venv 的 activate 與訊息字串上炸掉。"""
+        for line in self.read('build_mac.sh').splitlines():
+            stripped = line.strip()
+            if stripped.startswith('set -') and not stripped.startswith('set -x'):
+                flags = stripped.split()[1].lstrip('-')
+                self.assertNotIn('u', flags, stripped)
+
+    def test_the_build_script_announces_itself_before_any_check(self):
+        """沒有輸出＝沒有執行到。第一個會印東西的指令要排在所有檢查前面，
+        使用者回報「跑了但什麼都沒有」時才分辨得出來是哪一種。"""
+        lines = [l.strip() for l in self.read('build_mac.sh').splitlines()]
+        code = [l for l in lines if l and not l.startswith('#')]
+        first_echo = next(i for i, l in enumerate(code) if l.startswith('echo'))
+        first_check = next((i for i, l in enumerate(code)
+                            if l.startswith('if [') or l.startswith('[ ')), len(code))
+        self.assertLess(first_echo, first_check)
+
 
 if __name__ == '__main__':
     unittest.main()
