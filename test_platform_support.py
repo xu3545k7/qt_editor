@@ -221,6 +221,21 @@ class MacBuildFilesTests(unittest.TestCase):
         here = os.path.dirname(os.path.abspath(__file__))
         return io.open(os.path.join(here, name), encoding='utf-8').read()
 
+    def test_every_build_file_is_actually_in_git(self):
+        """.gitignore 有 `*.spec`，Mac 的 spec 就這樣被擋掉、推不上 GitHub，
+        使用者在 Mac 上拿到的是一份少了 spec 的原始碼。"""
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        needed = ['NostalgiaChartEditor-mac.spec', 'build_mac.sh',
+                  'requirements-mac.txt', 'README-mac.md']
+        try:
+            out = subprocess.run(['git', 'check-ignore'] + needed, cwd=here,
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest('沒有 git')
+        ignored = [l for l in out.stdout.splitlines() if l.strip()]
+        self.assertEqual(ignored, [], '這些建置檔案被 .gitignore 擋住了：%s' % ignored)
+
     def test_the_mac_spec_makes_an_app_bundle(self):
         spec = self.read('NostalgiaChartEditor-mac.spec')
         self.assertIn('BUNDLE(', spec)

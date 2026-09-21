@@ -9,8 +9,12 @@ env/
 dist/
 build/
 build_tmp/
+# spec 一律不進版控，除了這幾支真的用來出貨的。
+# 漏掉的話檔案會靜靜地不見（Mac 的 spec 就這樣漏過一次），
+# test_platform_support 有一個測試會抓。
 *.spec
 !NostalgiaChartEditor.spec
+!NostalgiaChartEditor-mac.spec
 !NosMania.spec
 dist_build/
 build_tmp*/
