@@ -19,6 +19,10 @@ datas = [
     # AI 轉譜的工作程序：不在製譜器裡執行，是複製到另外裝的轉譜環境去跑的，
     # 所以要當資料檔帶著（打包進 PYZ 的話就拿不到原始碼了）。
     ('qt_editor/ai_transcribe_worker.py', 'qt_editor'),
+    # 轉譜參數的說明文字＝smart_chart.py 裡那些中文註解。打包之後
+    # inspect.getsource() 讀不到原始碼，所以原始碼本身也要帶一份，
+    # 不然「MIDI 轉譜」的參數表就只剩欄位名沒有解釋（arrange_param_text.py）。
+    ('qt_editor/smart_chart.py', 'qt_editor'),
     # 主音源。遊戲端的取樣庫是用同一份的「Bright Steinway」preset 烤的，
     # 換掉這裡就要重跑 render_piano_samples.py，否則兩邊音色會不一樣。
     ('soundfonts/Nice-Steinway-v3.8.sf2', 'soundfonts'),

@@ -42,6 +42,8 @@
   "shortcut_dur_shorter": "[",
   "shortcut_dur_longer": "]",
   "shortcut_toggle_hand": "Q",
+  "shortcut_toggle_tap_hold": "W",
+  "shortcut_toggle_width": "E",
   "shortcut_measures_bpm": "",
   "shortcut_events": "",
   "hiraeth_export_dir": "",
@@ -56,5 +58,5 @@
   "hiraeth_root": "",
   "custom_note_divisions": [],
   "oplog_enabled": true,
-  "ai_grid_division": 0
+  "ai_grid_division": 4
 }

@@ -3619,10 +3619,14 @@ class NoteModel:
         beat_entries.sort(key=lambda item: item[1])
         return beat_entries
 
-    def load_midi(self, path: str, auto_arrange: bool = True) -> None:
+    def load_midi(self, path: str, auto_arrange: bool = True,
+                  arrange_options=None) -> None:
         """載入 MIDI。
 
         `auto_arrange=False` 時只匯入音符、不做自動排譜，維持 MIDI 編輯模式。
+        `arrange_options` 給的話（見 `arrange_options.ArrangeOptions`）就照那份
+        選項轉譜——模式、鍵道範圍、和絃重疊、自訂參數都在裡面；沒給就照偏好
+        設定裡記住的風格。
         """
         if mido is None:
             raise RuntimeError('mido is not available.')
@@ -3847,7 +3851,10 @@ class NoteModel:
             # 踏板殘響造成的長音先裁掉，再排版 —— 否則那些過長的長條會佔住
             # 走廊，把後面的排版空間吃光。
             self.trim_pedal_sustained_holds()
-            self.last_smart_chart_stats = self.smart_arrange_midi()
+            if arrange_options is not None:
+                self.last_smart_chart_stats = self.arrange_with_options(arrange_options)
+            else:
+                self.last_smart_chart_stats = self.smart_arrange_midi()
             self.midi_unarranged = False
         else:
             # 不轉譜：維持 MIDI 編輯模式，音符保留原始音高與時間，鍵道只是
@@ -4440,6 +4447,23 @@ class NoteModel:
             centre = int(round((int(n.pitch) - lo) / span * usable))
             n.min_key = max(0, min(TOTAL_GAME_KEYS - 3, centre))
             n.max_key = n.min_key + 2
+
+    def arrange_with_options(self, options):
+        """照「MIDI 轉譜」對話框給的選項轉譜（模式／鍵道範圍／和絃重疊／自訂）。
+
+        直接平攤沒有統計，回傳 None；其餘回傳 SmartChartStats。兩種都會把譜面
+        標成排過了（`midi_unarranged = False`），其他檢視模式才解得開。
+        """
+        from .arrange_options import arrange_notes
+
+        beat_ms = 60_000.0 / max(1.0, float(self.bpm or 120.0))
+        stats, opt = arrange_notes(self.notes_tree, options, beat_ms=beat_ms)
+        self.chart_style = opt.style()
+        self.midi_unarranged = False
+        self.last_smart_chart_stats = stats
+        self.rebuild_display_cache()
+        self.dirty = True
+        return stats
 
     def smart_arrange_midi(self, style: Optional[str] = None):
         """Keep all notes while arranging lanes from MIDI pitch and timing.

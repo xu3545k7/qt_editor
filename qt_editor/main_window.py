@@ -291,6 +291,14 @@ def _model_path(model) -> str:
     return getattr(model, 'current_file', '') or ''
 
 
+def _still_playing(obj) -> bool:
+    """播放物件還在響嗎（simpleaudio 與 sounddevice 的替身都有這個方法）。"""
+    try:
+        return bool(obj.is_playing())
+    except Exception:                           # noqa: BLE001
+        return False
+
+
 class MainWindow(QMainWindow):
     """頂層主視窗（完整功能版）。"""
 
@@ -1160,8 +1168,10 @@ class MainWindow(QMainWindow):
         self._add_action(midi_sub, t('action_open_midi_overlay'), self._open_midi_overlay)
         # 音檔 → MIDI（ByteDance 鋼琴轉譜模型），轉完走一般的 MIDI 匯入
         ai_sub = file_m.addMenu('AI 轉譜（音檔 → 譜面）')
-        self._add_action(ai_sub, '從音檔轉譜…', self.transcribe_audio_ai)
-        self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe)
+        self._add_action(ai_sub, '從音檔轉譜…', self.transcribe_audio_ai,
+                         feature='ai_transcribe')
+        self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe,
+                         feature='ai_transcribe')
         file_m.addSeparator()
         self._add_action(file_m, t('action_save'), self.save_file, QKeySequence.Save)
         self._add_action(file_m, t('action_save_as'), self.save_file_as, 'Ctrl+Shift+S')
@@ -1254,6 +1264,7 @@ class MainWindow(QMainWindow):
         # 工具（分類；與工具列「工具」分頁同一份內容）
         tools_m = mb.addMenu(t('menu_tools'))
         self._add_action(tools_m, t('action_smart_midi_chart'), self.smart_midi_chart_dialog)
+        self._add_action(tools_m, 'MIDI 轉譜…（重新排整份譜面）', self.rearrange_dialog)
         tools_m.addSeparator()
         for title, entries in self._tool_groups():
             sub = tools_m.addMenu(title)
@@ -1477,12 +1488,22 @@ class MainWindow(QMainWindow):
         label = t(key)
         return fallback if label == key else label
 
-    def _add_action(self, menu, label: str, slot, shortcut=None, keys=None) -> QAction:
+    def _add_action(self, menu, label: str, slot, shortcut=None, keys=None,
+                    feature: str = '') -> QAction:
+        """`feature` 給的話，在做不到那件事的平台上這個項目會變灰並寫出原因
+        （例如 AI 轉譜的執行環境只有 Windows 版），而不是按下去才壞掉。"""
         act = QAction(label, self)
         if shortcut is not None:
             act.setShortcut(QKeySequence(shortcut) if isinstance(shortcut, str) else shortcut)
         act.triggered.connect(slot)
         menu.addAction(act)
+        if feature:
+            from .platform_support import feature_available, feature_reason
+            if not feature_available(feature):
+                act.setEnabled(False)
+                act.setToolTip(feature_reason(feature))
+                act.setText('%s（%s）' % (label, feature_reason(feature)))
+                return act
         self._register_pan_gated(act, slot or '')
         if shortcut is None:
             # 自己沒綁快捷鍵的選單項目（綁了的 Qt 會自己畫在右邊），看看偏好設定
@@ -3282,40 +3303,27 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QThread, pyqtSignal as _sig
         from PyQt5.QtWidgets import QProgressDialog, QMessageBox
 
-        # 匯入 MIDI 不再硬性轉譜——先問。不轉就停在 MIDI 編輯模式，
-        # 使用者可以先自己整理，之後再按自動排譜。
-        box = QMessageBox(self)
-        box.setWindowTitle(t('dlg_midi_arrange_title'))
-        box.setText(t('dlg_midi_arrange_ask', os.path.basename(path)))
-        # 兩套轉譜風格：使用者自己的（靠收窄擠空間、幾乎不重疊、表情記號
-        # 自己標）與官方語料的（靠鍵道重疊擠空間、只有單手同時 4 音才收窄、
-        # 自動標滑音）。預設選偏好設定裡記住的那一個。
-        from .smart_chart import STYLE_EATHER, STYLE_OFFICIAL, normalise_style
-
-        preferred = normalise_style(settings.get('chart_style'))
-        yes = box.addButton(t('dlg_midi_arrange_yes'), QMessageBox.AcceptRole)
-        official = box.addButton(
-            t('dlg_midi_arrange_official'), QMessageBox.AcceptRole
+        # 匯入 MIDI 不再硬性轉譜——先問要怎麼轉（模式／鍵道範圍／和絃重疊／
+        # 自訂參數）。按「先不轉譜」就停在 MIDI 編輯模式，使用者可以先自己
+        # 整理，之後再轉。
+        arrange, options = self.ask_arrange_options(
+            intro=t('dlg_midi_arrange_ask', os.path.basename(path)),
+            allow_skip=True,
         )
-        no = box.addButton(t('dlg_midi_arrange_no'), QMessageBox.RejectRole)
-        box.addButton(t('dlg_cancel'), QMessageBox.DestructiveRole)
-        box.setDefaultButton(official if preferred == STYLE_OFFICIAL else yes)
-        box.exec_()
-        clicked = box.clickedButton()
-        if clicked not in (yes, official, no):
+        if arrange is None:                       # 取消
             return False
-        auto_arrange = clicked in (yes, official)
+        auto_arrange = bool(arrange)
         if auto_arrange:
-            chosen = STYLE_OFFICIAL if clicked is official else STYLE_EATHER
-            settings.set('chart_style', chosen)
-            model.chart_style = chosen
+            settings.set('chart_style', options.style())
+            model.chart_style = options.style()
 
         class _Worker(QThread):
             done = _sig(bool, str)
 
             def run(self) -> None:
                 try:
-                    model.load_midi(path, auto_arrange=auto_arrange)
+                    model.load_midi(path, auto_arrange=auto_arrange,
+                                    arrange_options=options)
                     self.done.emit(True, '')
                 except Exception as exc:            # noqa: BLE001
                     self.done.emit(False, str(exc))
@@ -4932,23 +4940,41 @@ class MainWindow(QMainWindow):
         model = self.view.model
         if not getattr(model, 'midi_unarranged', False):
             return True
-        from PyQt5.QtWidgets import QMessageBox
-        reply = QMessageBox.question(
-            self, t('dlg_midi_arrange_title'), t('dlg_midi_need_arrange'),
-            QMessageBox.Yes | QMessageBox.No,
-            # 預設 No：這個框是切換檢視時自動跳的（快捷鍵一按就會碰到），
-            # 而排譜會重寫整份譜面。預設停在 Yes 等於 Enter 一下就排下去。
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+        # 這個框是切換檢視時自動跳的（快捷鍵一按就會碰到），而排譜會重寫整份
+        # 譜面，所以維持「要按確定才會動」：對話框的取消＝留在音高模式。
+        arrange, options = self.ask_arrange_options(intro=t('dlg_midi_need_arrange'))
+        if not arrange:
             return False
-        return self._arrange_now()
+        return self._arrange_now(options)
 
-    def _arrange_now(self) -> bool:
-        """對目前這份未排譜的 MIDI 就地執行自動排譜（含進度視窗）。"""
+    def ask_arrange_options(self, intro: str = '', allow_skip: bool = False):
+        """跳出「MIDI 轉譜」對話框。回傳 (要不要轉, 選項)。
+
+        `allow_skip=True` 時多一顆「先不轉譜」，按了就回 (False, None)——匯入
+        MIDI 用得到，切換檢視時跳的那個框則直接取消就好。
+        """
+        from .arrange_dialog import ArrangeDialog
+
+        dlg = ArrangeDialog(self, intro=intro, allow_skip=allow_skip)
+        if dlg.exec_() != ArrangeDialog.Accepted:
+            return None, None
+        if getattr(dlg, 'skipped', False):
+            return False, None
+        return True, dlg.options()
+
+    def _arrange_now(self, options=None) -> bool:
+        """對目前這份未排譜的 MIDI 就地執行自動排譜（含進度視窗）。
+
+        `options` 給的話就照那份選項轉；沒給就先問（模式／鍵道範圍／重疊／自訂）。
+        """
         from PyQt5.QtCore import QThread, pyqtSignal as _sig
         from PyQt5.QtWidgets import QProgressDialog, QMessageBox
 
+        if options is None:
+            arrange, options = self.ask_arrange_options(
+                intro='這份 MIDI 還沒轉成譜面。要怎麼轉？')
+            if not arrange:
+                return False
         model = self.view.model
         # 自動排譜會重寫每一顆音符的鍵道，還會先裁掉踏板殘響造成的長音——
         # 這是整份譜面級別的改動，沒有 push_history 就**完全救不回來**。
@@ -4962,7 +4988,7 @@ class MainWindow(QMainWindow):
             def run(self) -> None:
                 try:
                     model.trim_pedal_sustained_holds()
-                    model.smart_arrange_midi()
+                    model.arrange_with_options(options)
                     self.done.emit(True, '')
                 except Exception as exc:            # noqa: BLE001
                     self.done.emit(False, str(exc))
@@ -5179,8 +5205,9 @@ class MainWindow(QMainWindow):
             self._hit_wav_tmp_path = None
 
     def _play_hit_sound(self) -> None:
-        # 使用 winsound.PlaySound + SND_ASYNC 直接在主執行緒非同步播放。
         # 音量已套用在 _hit_wav_tmp_path 的暫存 WAV 中。
+        # Windows 走 winsound（最輕、不佔音訊裝置）；其他平台沒有 winsound，
+        # 改用播放器的後端（simpleaudio 或 sounddevice），不然放置音效會無聲。
         path = self._hit_wav_tmp_path
         if not path:
             path = os.path.join(os.path.dirname(__file__), 'short-shimmering-hi-hat.wav')
@@ -5190,7 +5217,35 @@ class MainWindow(QMainWindow):
                 path,
                 winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
             )
+            return
         except Exception:
+            pass
+        self._play_hit_sound_pcm(path)
+
+    def _play_hit_sound_pcm(self, path: str) -> None:
+        """沒有 winsound 時的放置音效：直接丟給 simpleaudio／sounddevice。
+
+        每次播一顆短音就開一條串流，播完自己結束；留著參照是為了不讓物件
+        在播完前被回收（PortAudio 的串流被 GC 掉就沒聲音了）。
+        """
+        import wave as _wave
+
+        from . import audio_player as _ap
+
+        if not _ap._HAS_SA or _ap.sa is None:
+            return
+        try:
+            with _wave.open(path, 'rb') as wf:
+                params = wf.getparams()
+                pcm = wf.readframes(params.nframes)
+            obj = _ap.sa.WaveObject(pcm, num_channels=params.nchannels,
+                                    bytes_per_sample=params.sampwidth,
+                                    sample_rate=params.framerate)
+            playing = getattr(self, '_hit_sound_objs', [])
+            playing = [o for o in playing if _still_playing(o)]
+            playing.append(obj.play())
+            self._hit_sound_objs = playing[-8:]
+        except Exception:                       # noqa: BLE001
             pass
 
     # ==================================================================
@@ -6558,6 +6613,25 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, t('dlg_ref_midi_ok_title'), t('dlg_ref_midi_ok_msg', n))
 
+    def rearrange_dialog(self) -> None:
+        """對目前這份譜重跑一次轉譜，選項自己挑（模式／鍵道範圍／重疊／自訂）。
+
+        已經排過的譜也能再排——音高還在就排得出來，所以調參數看效果不必重新
+        匯入 MIDI。會重寫每一顆音符的鍵道，`_arrange_now` 會先 push_history。
+        """
+        model = self.view.model
+        if not any(n.pitch is not None for n in model.notes_tree):
+            QMessageBox.information(
+                self, t('dlg_warn'),
+                '這份譜沒有音高資料（不是從 MIDI 來的），沒辦法重新轉譜。')
+            return
+        arrange, options = self.ask_arrange_options(
+            intro='重新排整份譜面。原本的鍵道會被全部重寫（可以復原）。')
+        if not arrange:
+            return
+        if self._arrange_now(options):
+            self.statusBar().showMessage('已重新轉譜', 3000)
+
     def smart_midi_chart_dialog(self) -> None:
         """Open a MIDI and create a non-destructive, pitch-aware first chart."""
         path, _ = QFileDialog.getOpenFileName(
@@ -6575,9 +6649,9 @@ class MainWindow(QMainWindow):
             if not model.notes_tree:
                 QMessageBox.information(self, t('dlg_warn'), t('dlg_midi_no_notes'))
                 return
+            # 使用者在轉譜對話框選了「直接平攤」或「先不轉譜」時就沒有統計。
+            # 以前這裡會再偷偷跑一次智能排譜，等於把他的選擇推翻掉。
             stats = getattr(model, 'last_smart_chart_stats', None)
-            if stats is None:
-                stats = model.smart_arrange_midi()
             model.json_meta = dict(model.json_meta or {})
             model.json_meta['smart_midi_source'] = os.path.basename(path)
             # The source MIDI must never be overwritten by Ctrl+S. The result
@@ -6589,6 +6663,11 @@ class MainWindow(QMainWindow):
             self._set_note_input_mode(False)
             self._rebuild_hit_times()
             self._refresh_title()
+            if stats is None:
+                QMessageBox.information(
+                    self, t('dlg_smart_midi_ok_title'),
+                    '已匯入 %d 顆音符（沒有跑智能排譜）。' % len(model.notes_tree))
+                return
             QMessageBox.information(
                 self,
                 t('dlg_smart_midi_ok_title'),

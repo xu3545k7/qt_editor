@@ -28,13 +28,24 @@ from typing import Optional
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
-# 後端支援偵測
+# 後端支援偵測。
+# simpleaudio 沒有（macOS／新版 Python 常常裝不起來）就換 sounddevice 的替身，
+# 它的 WaveObject/PlayObject 介面和 simpleaudio 一樣，下面的程式碼不用分platform。
 try:
     import simpleaudio as sa
     _HAS_SA = True
 except Exception:
     sa = None  # type: ignore
     _HAS_SA = False
+
+if not _HAS_SA:
+    try:
+        from . import audio_backend_sd as _sd_backend
+        if _sd_backend.available():
+            sa = _sd_backend        # type: ignore
+            _HAS_SA = True
+    except Exception:               # noqa: BLE001
+        pass
 
 try:
     import winsound

@@ -17,6 +17,7 @@ import unittest
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 import qt_editor.main_window as mw
+from qt_editor.arrange_options import ArrangeOptions
 from qt_editor.main_window import MainWindow
 from qt_editor.models import GNote, NoteModel
 
@@ -94,64 +95,70 @@ class ArrangeIsUndoableTests(unittest.TestCase):
         self.model = midi_model()
         self.win.view.model = self.model
         self._trim = NoteModel.trim_pedal_sustained_holds
-        self._arrange = NoteModel.smart_arrange_midi
+        self._arrange = NoteModel.arrange_with_options
 
-        def fake_arrange(model, style=None):
+        def fake_arrange(model, options=None):
             for n in model.notes_tree:
                 n.min_key, n.max_key = 20, 22
             model.midi_unarranged = False
             return {}
 
         NoteModel.trim_pedal_sustained_holds = lambda model, *a, **k: 0
-        NoteModel.smart_arrange_midi = fake_arrange
+        NoteModel.arrange_with_options = fake_arrange
 
     def tearDown(self):
         NoteModel.trim_pedal_sustained_holds = self._trim
-        NoteModel.smart_arrange_midi = self._arrange
+        NoteModel.arrange_with_options = self._arrange
+
+    def arrange(self):
+        # 選項直接給，才不會跳出「MIDI 轉譜」對話框停在那裡等人按
+        return self.win._arrange_now(ArrangeOptions())
 
     def test_it_arranges(self):
-        self.assertTrue(self.win._arrange_now())
+        self.assertTrue(self.arrange())
         self.assertFalse(self.model.midi_unarranged)
 
     def test_it_leaves_exactly_one_undo_step(self):
         depth = len(self.model.undo_stack)
-        self.win._arrange_now()
+        self.arrange()
         self.assertEqual(len(self.model.undo_stack), depth + 1,
                          '排譜不是一個乾淨的復原步驟')
 
     def test_undoing_it_gives_back_the_unarranged_midi(self):
-        self.win._arrange_now()
+        self.arrange()
         self.assertTrue(self.model.undo(), '排譜之後沒有東西可以 undo')
         self.assertTrue(self.model.midi_unarranged)
         self.assertNotEqual([n.min_key for n in self.model.notes_tree], [20] * 8)
 
 
 class PromptTests(unittest.TestCase):
-    """預設按鈕：Enter 一下不該就把整份譜排掉。"""
+    """切換檢視撞到未排譜的 MIDI 時，要先問過才准排。
+
+    以前是一個預設停在「否」的 Yes/No 問句；現在是「MIDI 轉譜」對話框，
+    取消＝不排。重點沒變：這條路徑上的動作都很輕（快捷鍵、分割、時間均分），
+    不能按一下就把整份譜的鍵道重寫掉。
+    """
 
     def setUp(self):
         self.win = window()
         self.win.view.model = midi_model()
         self.calls = []
-        self._q = mw.QMessageBox.question
+        self._ask = MainWindow.ask_arrange_options
 
-        def question(parent, title, text, buttons=0, default=0):
-            self.calls.append((buttons, default))
-            return QMessageBox.No
+        def ask(win, intro='', allow_skip=False):
+            self.calls.append((intro, allow_skip))
+            return None, None          # 使用者按取消
 
-        mw.QMessageBox.question = staticmethod(question)
+        MainWindow.ask_arrange_options = ask
 
     def tearDown(self):
-        mw.QMessageBox.question = self._q
+        MainWindow.ask_arrange_options = self._ask
 
-    def test_the_default_button_is_no(self):
+    def test_it_asks_before_arranging(self):
         self.win._require_arranged_for_view()
         self.assertTrue(self.calls, '沒有問就直接排譜了')
-        _buttons, default = self.calls[0]
-        self.assertEqual(default, QMessageBox.No,
-                         '預設停在「是」，切換檢視的快捷鍵按下去 Enter 就排掉了')
 
-    def test_saying_no_leaves_the_chart_alone(self):
+    def test_cancelling_leaves_the_chart_alone(self):
         self.assertFalse(self.win._require_arranged_for_view())
         self.assertTrue(self.win.view.model.midi_unarranged)
 
@@ -188,13 +195,13 @@ class SplitViewTests(unittest.TestCase):
         self.assertEqual(len(self.win._visible_panes()), 1,
                          '前置條件：先收成單格')
         self.asked = []
-        self._q = mw.QMessageBox.question
+        self._ask = MainWindow.ask_arrange_options
 
-        def question(parent, title, text, *a, **k):
-            self.asked.append(text)
-            return QMessageBox.No
+        def ask(win, intro='', allow_skip=False):
+            self.asked.append(intro)
+            return None, None
 
-        mw.QMessageBox.question = staticmethod(question)
+        MainWindow.ask_arrange_options = ask
         self.signals = []
         for pane in self.win._panes:
             pane.arrange_required.connect(self._note_signal)
@@ -203,7 +210,7 @@ class SplitViewTests(unittest.TestCase):
         self.signals.append(1)
 
     def tearDown(self):
-        mw.QMessageBox.question = self._q
+        MainWindow.ask_arrange_options = self._ask
         for pane in self.win._panes:
             try:
                 pane.arrange_required.disconnect(self._note_signal)

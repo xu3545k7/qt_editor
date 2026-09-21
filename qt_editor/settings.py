@@ -31,6 +31,16 @@ def _base_dir() -> str:
     """
     if not getattr(sys, 'frozen', False):
         return os.path.dirname(__file__)
+    # macOS 的 .app 例外：exe 旁邊是 Foo.app/Contents/MacOS/，寫進去會破壞
+    # 簽章，而且從網路下載（被隔離）或放在唯讀磁碟時根本寫不進去。
+    from .platform_support import IS_MAC, user_data_dir
+    if IS_MAC:
+        folder = user_data_dir()
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+        return folder
     return os.path.dirname(os.path.abspath(sys.executable))
 
 
@@ -131,6 +141,9 @@ _DEFAULTS: dict[str, object] = {
     'shortcut_toggle_width': 'E',
     'shortcut_measures_bpm': '',
     'shortcut_events': '',
+    # MIDI 轉譜對話框：上次用的選項，以及自訂參數的預設集（名稱 -> 選項）
+    'arrange_options': {},
+    'arrange_presets': {},
     # 輸出 Hiraeth 歌曲包（ZIP）的資料夾
     'hiraeth_export_dir': '',
     'hiraeth_mix_piano': True,

@@ -107,6 +107,10 @@ class SmartChartSettings:
     repair_time_budget_sec: float = 8.0
     pitch_order_projection_passes: int = 12
     edge_margin: int = 1
+    #: 同一刻的音符可不可以在鍵道上重疊。False（預設）＝肩並肩排開，這是這個
+    #: 曲庫手寫譜的做法（實測 0.0~4.6% 重疊）；True＝只照音程留推進量，塞不下
+    #: 就疊上去，這是官方語料的做法（單手同時 5 音有 72.6% 重疊、6 音 100%）。
+    allow_chord_overlap: bool = False
     normal_width: int = 3
     dense_width: int = 2
     # 單手同時 4 個音以上就收窄每一顆 —— 那是容量問題（真的塞不下），
@@ -2853,10 +2857,14 @@ def _place_hand(
             # 音符不重疊。官方是靠重疊來擠空間（28% 的組別鍵道重疊），但
             # 這個曲庫的手寫譜幾乎不重疊（8 首實測 0.0~4.6%），改用收窄，
             # 所以這裡維持不重疊。
-            floor_start = max(
-                floor_start,
-                int(round(starts[index - 1] + advance)),
-            )
+            if getattr(settings, 'allow_chord_overlap', False):
+                # 允許重疊：只照音程的推進量走，不再被上一顆的右緣頂開。
+                floor_start = int(round(starts[index - 1] + advance))
+            else:
+                floor_start = max(
+                    floor_start,
+                    int(round(starts[index - 1] + advance)),
+                )
         # 貼齊：desired 只比「音程對應的間距」寬一點點時就吸回去。官方 real
         # 有 50% 的八度剛好隔 5 格，分布是尖峰而不是散開的。
         if (index > 0 and floor_start > cursor
@@ -2864,7 +2872,9 @@ def _place_hand(
                 <= settings.interval_snap_tolerance):
             starts[index] = floor_start
         starts[index] = max(starts[index], floor_start)
-        cursor = starts[index] + placed_widths[index]
+        cursor = (starts[index] + 1
+                  if getattr(settings, 'allow_chord_overlap', False)
+                  else starts[index] + placed_widths[index])
     if cursor - 1 > lane_hi:
         starts[-1] = lane_hi - placed_widths[-1] + 1
         for index in range(len(starts) - 2, -1, -1):
@@ -4378,11 +4388,25 @@ def _greedy_group_order_repair(
     return repairs
 
 
-def _group_overlaps(group: Sequence[Any]) -> int:
+#: 允許和絃鍵道重疊時，所有「這樣擺會不會重疊」的守門都要放行。那些守門散在
+#: 二十幾個修復通道裡、只拿得到 group，所以用模組旗標，由 arrange_midi_notes
+#: 依設定開關（和 _prime_pitch_cache 的做法一致）。
+_ALLOW_OVERLAP = False
+
+
+def _count_group_overlaps(group: Sequence[Any]) -> int:
+    """真正的重疊數，不受 _ALLOW_OVERLAP 影響（統計用）。"""
     ranges = sorted(
         (int(note.min_key), int(note.max_key), _pitch(note)) for note in group
     )
     return sum(ranges[index - 1][1] >= ranges[index][0] for index in range(1, len(ranges)))
+
+
+def _group_overlaps(group: Sequence[Any]) -> int:
+    """守門用的重疊數。允許重疊時一律回 0，修復通道就不會為了它否決擺法。"""
+    if _ALLOW_OVERLAP:
+        return 0
+    return _count_group_overlaps(group)
 
 
 def _hold_obstacles(
@@ -6121,6 +6145,8 @@ def arrange_midi_notes(
     """Arrange MIDI-backed notes in place without removing or retiming them."""
     config = settings or SmartChartSettings()
     note_list = list(notes)
+    global _ALLOW_OVERLAP
+    _ALLOW_OVERLAP = bool(getattr(config, 'allow_chord_overlap', False))
     _clear_cluster_cache()
     stats = SmartChartStats(notes=len(note_list))
     if not note_list:
@@ -6376,7 +6402,7 @@ def arrange_midi_notes(
     stats.width_two_notes = sum(
         int(note.max_key) - int(note.min_key) + 1 == 2 for note in note_list
     )
-    stats.unresolved_overlaps = sum(_group_overlaps(group) for group in groups)
+    stats.unresolved_overlaps = sum(_count_group_overlaps(group) for group in groups)
     stats.pitch_order_violations = sum(
         _pitch_order_violations(group) for group in groups
     )

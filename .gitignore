@@ -66,3 +66,11 @@ test_tmp.xml
 
 # 操作紀錄（本機分析用，見 qt_editor/oplog.py）
 qt_editor/logs/
+
+# macOS 建置（build_mac.sh 產生的）
+.venv-mac/
+dist_mac/
+build_tmp_mac/
+vendor/fluidsynth/mac/
+qt_editor/icon.icns
+*.app/

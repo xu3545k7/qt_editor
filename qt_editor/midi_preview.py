@@ -125,20 +125,55 @@ def default_soundfont_path() -> Path:
     return default_soundfont()[0]
 
 
-def default_fluidsynth_dll_path() -> Path:
-    root = _runtime_root()
-    candidates = [
-        root / "fluidsynth" / "libfluidsynth-3.dll",
-        root / "vendor" / "fluidsynth" / "bin" / "libfluidsynth-3.dll",
-        (
-            root
-            / "vendor"
-            / "fluidsynth"
-            / "fluidsynth-v2.5.7-win10-x64-cpp11"
-            / "bin"
-            / "libfluidsynth-3.dll"
-        ),
+#: 各平台的 FluidSynth 函式庫檔名（依序試）
+_FLUIDSYNTH_NAMES = {
+    'win': ("libfluidsynth-3.dll",),
+    'mac': ("libfluidsynth.3.dylib", "libfluidsynth.dylib", "libfluidsynth.2.dylib"),
+    'other': ("libfluidsynth.so.3", "libfluidsynth.so"),
+}
+
+
+def _platform_key() -> str:
+    if sys.platform.startswith("win"):
+        return 'win'
+    return 'mac' if sys.platform == "darwin" else 'other'
+
+
+def _fluidsynth_search_dirs(root: Path) -> list:
+    """去哪些資料夾找 FluidSynth。
+
+    先找跟著程式一起帶的（打包進來的、vendor 裡的），再找系統裝的。
+    macOS 上 Homebrew 在 Apple Silicon 是 /opt/homebrew、Intel 是 /usr/local，
+    兩個都要看——使用者用 `brew install fluid-synth` 裝的就在那裡。
+    """
+    dirs = [
+        root / "fluidsynth",
+        root / "vendor" / "fluidsynth" / "bin",
+        root / "vendor" / "fluidsynth" / "lib",
+        root / "vendor" / "fluidsynth" / "fluidsynth-v2.5.7-win10-x64-cpp11" / "bin",
     ]
+    key = _platform_key()
+    if key == 'mac':
+        dirs += [Path("/opt/homebrew/lib"), Path("/usr/local/lib"),
+                 Path("/opt/local/lib")]
+    elif key == 'other':
+        dirs += [Path("/usr/lib"), Path("/usr/local/lib"),
+                 Path("/usr/lib/x86_64-linux-gnu")]
+    return dirs
+
+
+def fluidsynth_library_candidates() -> list:
+    """所有可能的完整路徑，依優先順序。"""
+    root = _runtime_root()
+    names = _FLUIDSYNTH_NAMES[_platform_key()]
+    return [folder / name
+            for folder in _fluidsynth_search_dirs(root)
+            for name in names]
+
+
+def default_fluidsynth_dll_path() -> Path:
+    """找得到就回那一份；都找不到回第一個候選（錯誤訊息才有東西可以指）。"""
+    candidates = fluidsynth_library_candidates()
     for candidate in candidates:
         if candidate.is_file():
             return candidate
@@ -427,7 +462,13 @@ class MidiPreviewSynth:
         if not self.soundfont_path.is_file():
             raise MidiPreviewError(f"SoundFont not found: {self.soundfont_path}")
         if not self.dll_path.is_file():
-            raise MidiPreviewError(f"FluidSynth DLL not found: {self.dll_path}")
+            hint = ''
+            if _platform_key() == 'mac':
+                hint = "（macOS 請先 brew install fluid-synth）"
+            elif _platform_key() == 'other':
+                hint = "（請先安裝 libfluidsynth）"
+            raise MidiPreviewError(
+                f"FluidSynth library not found: {self.dll_path}{hint}")
 
         try:
             if hasattr(os, "add_dll_directory"):

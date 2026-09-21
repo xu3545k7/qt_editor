@@ -917,11 +917,21 @@ def _same_dir(a: str, b: str) -> bool:
 
 
 def make_junction(target: str, link: str) -> None:
-    """建目錄連結：不複製檔案、不需要系統管理員。"""
+    """建目錄連結：不複製檔案、不需要系統管理員。
+
+    Windows 用 junction（`mklink /J`），其他平台用 symlink。名字沿用舊的，
+    呼叫的地方不用改。
+    """
+    from .platform_support import IS_WINDOWS, make_dir_link
+    if not IS_WINDOWS:
+        if not make_dir_link(link, target) or not os.path.isdir(link):
+            raise OSError(tr('建立資料夾連結失敗：%s') % link)
+        return
     import subprocess
     result = subprocess.run(['cmd', '/c', 'mklink', '/J', link, target],
                             capture_output=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if result.returncode != 0 or not os.path.isdir(link):
+        # mbcs 只有 Windows 有，所以這一行只能待在這個分支裡
         raise OSError(tr('建立資料夾連結失敗：%s') % (
             (result.stderr or result.stdout or b'').decode('mbcs', 'replace').strip() or link))
 
