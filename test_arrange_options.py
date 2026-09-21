@@ -522,3 +522,92 @@ class ParamDocFallbackTests(unittest.TestCase):
                 self.assertEqual(T.tooltip_for('normal_width'), 'normal_width')
         finally:
             T._docs_cache.clear()
+
+
+class ModeVisibilityTests(unittest.TestCase):
+    """「上次按了直接平攤」不能默默一路沿用下去卻沒人看得出來。
+
+    回報：匯入 MIDI 之後譜面「碎碎的」。排譜演算法沒有變（同一份 MIDI 新舊
+    程式碼逐項相同），最可能就是模式被記住了。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from qt_editor.settings import settings
+        self._saved = settings.get('arrange_options')
+        settings.set('arrange_options', {})
+
+    def tearDown(self):
+        from qt_editor.settings import settings
+        settings.set('arrange_options', self._saved)
+
+    def dialog(self, **kwargs):
+        from qt_editor.arrange_dialog import ArrangeDialog
+        self._dlg = ArrangeDialog(None, **kwargs)
+        return self._dlg
+
+    def test_flat_mode_is_called_out_in_red(self):
+        dlg = self.dialog()
+        dlg._modes[MODE_FLAT].setChecked(True)
+        self.assertIn('不會排譜', dlg.hint.text())
+        self.assertIn('b00', dlg.hint.styleSheet(), '要顯眼')
+
+    def test_smart_modes_are_not_scary(self):
+        dlg = self.dialog()
+        dlg._modes[MODE_EATHER].setChecked(True)
+        self.assertNotIn('不會排譜', dlg.hint.text())
+
+    def test_reset_puts_everything_back(self):
+        dlg = self.dialog()
+        dlg._modes[MODE_FLAT].setChecked(True)
+        dlg.limit_lanes.setChecked(True)
+        dlg.lane_lo.setValue(6)
+        dlg.lane_hi.setValue(12)
+        dlg._reset_to_defaults()
+        opt = dlg.options()
+        self.assertEqual(opt.mode, MODE_EATHER)
+        self.assertFalse(opt.lanes_limited)
+        self.assertIsNone(opt.allow_chord_overlap)
+
+
+class AnnounceTests(unittest.TestCase):
+    """轉完要講是用哪個模式排的。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import contextlib
+        import io as _io
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        from qt_editor.main_window import MainWindow
+        with contextlib.redirect_stdout(_io.StringIO()):
+            cls.win = MainWindow()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.win.view.model.dirty = False
+        cls.win.close()
+
+    def message_for(self, options):
+        self.win.statusBar().clearMessage()
+        self.win._announce_arrange_mode(options)
+        return self.win.statusBar().currentMessage()
+
+    def test_flat_mode_says_so_and_how_to_redo_it(self):
+        text = self.message_for(ArrangeOptions(mode=MODE_FLAT))
+        self.assertIn('直接平攤', text)
+        self.assertIn('沒有跑智能排譜', text)
+        self.assertIn('MIDI 轉譜', text, '要告訴人怎麼重排')
+
+    def test_smart_mode_names_the_style(self):
+        self.assertIn('Eather', self.message_for(ArrangeOptions(mode=MODE_EATHER)))
+        self.assertIn('官方', self.message_for(ArrangeOptions(mode=MODE_OFFICIAL)))
+
+    def test_a_limited_lane_range_is_mentioned(self):
+        text = self.message_for(ArrangeOptions(lane_lo=5, lane_hi=20))
+        self.assertIn('6', text)
+        self.assertIn('21', text)

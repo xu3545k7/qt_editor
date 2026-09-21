@@ -3316,6 +3316,10 @@ class MainWindow(QMainWindow):
         if auto_arrange:
             settings.set('chart_style', options.style())
             model.chart_style = options.style()
+            self._announce_arrange_mode(options)
+        else:
+            self.statusBar().showMessage(
+                '沒有轉譜：停在 MIDI 編輯模式。要轉請用 工具 → MIDI 轉譜…', 12000)
 
         class _Worker(QThread):
             done = _sig(bool, str)
@@ -5023,7 +5027,28 @@ class MainWindow(QMainWindow):
         for pane in self._panes:
             pane.rebuild_mapper()
             pane.update()
+        self._announce_arrange_mode(options)
         return True
+
+    def _announce_arrange_mode(self, options) -> None:
+        """轉完講清楚是用哪個模式排的。
+
+        對話框會記住上次的選擇，所以「上次按過直接平攤」會一路沿用下去；
+        使用者只會看到譜面變得零零碎碎，卻不知道是模式的關係。
+        """
+        from .arrange_options import MODE_FLAT, MODE_LABELS
+
+        mode = getattr(options, 'mode', '')
+        label = MODE_LABELS.get(mode, mode)
+        if mode == MODE_FLAT:
+            self.statusBar().showMessage(
+                '已用「直接平攤」排：音高直接對應鍵道，沒有跑智能排譜。'
+                '要重排請用 工具 → MIDI 轉譜…', 12000)
+            return
+        extra = ''
+        if getattr(options, 'lanes_limited', False):
+            extra = '（只用第 %d～%d 格）' % (options.lane_lo + 1, options.lane_hi + 1)
+        self.statusBar().showMessage('已用「%s」轉譜%s' % (label, extra), 6000)
 
     def _cycle_view_mode(self, checked: bool = False) -> None:
         # 音高 → 下一個模式時才需要確認；留在音高永遠是允許的

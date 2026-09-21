@@ -28,6 +28,9 @@ from .ui_text import tr
 
 OVERLAP_BY_MODE, OVERLAP_ON, OVERLAP_OFF = range(3)
 
+#: 不是智能排譜的模式，選了之後譜面看起來會「零零碎碎」——要讓人看得出來
+UNARRANGED_MODES = (MODE_FLAT,)
+
 MODE_HINTS = {
     MODE_FLAT: '音高直接線性對應鍵道，不跑任何排譜通道。最快，但只是攤開，不是譜。',
     MODE_EATHER: '這個曲庫的風格：靠收窄擠空間、幾乎不重疊、表情記號留給人自己標。',
@@ -307,6 +310,9 @@ class ArrangeDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText(tr('開始轉譜'))
+        reset = buttons.addButton(tr('回到預設'), QDialogButtonBox.ResetRole)
+        reset.setToolTip(tr('模式回到 Eather 智能轉譜、整條鍵道都能用、重疊照模式決定。'))
+        reset.clicked.connect(self._reset_to_defaults)
         if allow_skip:
             skip = buttons.addButton(tr('先不轉譜'), QDialogButtonBox.DestructiveRole)
             skip.setToolTip(tr('只匯入音符，停留在 MIDI 編輯模式，之後隨時可以再轉。'))
@@ -322,9 +328,27 @@ class ArrangeDialog(QDialog):
         self.lane_lo.setEnabled(bool(on))
         self.lane_hi.setEnabled(bool(on))
 
+    def _reset_to_defaults(self) -> None:
+        """回到出廠狀態。上次亂按留下來的設定不該一路跟著使用者。"""
+        self._modes[MODE_EATHER].setChecked(True)
+        self.limit_lanes.setChecked(False)
+        self.lane_lo.setValue(1)
+        self.lane_hi.setValue(TOTAL_GAME_KEYS)
+        self.overlap.setCurrentIndex(OVERLAP_BY_MODE)
+        self.base_style.setCurrentIndex(0)
+        self.table.set_base(STYLE_EATHER, {})
+
     def _mode_changed(self, *_args) -> None:
         mode = self.mode()
         self.hint.setText(tr(MODE_HINTS[mode]))
+        # 不是智能排譜的模式要顯眼：對話框記得上次的選擇，使用者常常直接按
+        # 「開始轉譜」，然後只看到譜面變得零零碎碎，不知道是模式的關係。
+        if mode in UNARRANGED_MODES:
+            self.hint.setStyleSheet('color: #b00; font-weight: bold;')
+            self.hint.setText(tr('注意：%s 不會排譜，出來的譜面會零零碎碎。'
+                                 % MODE_LABELS[mode]))
+        else:
+            self.hint.setStyleSheet('color: #555;')
         custom = mode == MODE_CUSTOM
         self.custom_box.setVisible(custom)
         # 直接平攤不跑排譜通道，重疊與否沒有意義
