@@ -77,7 +77,7 @@ _DEFAULTS: dict[str, object] = {
     # 音效裝置輸出延遲補償（ms）：判定線比聲音早到就調大。見 AudioPlayer.current_ms
     'audio_latency_ms': 0,
     # 音高模式：力度用音符亮度表示 / 在音符上顯示力度數字
-    'pitch_velocity_shading': True,
+    'pitch_velocity_shading': False,
     'pitch_velocity_numbers': True,
     # 音高模式：左右邊緣的強弱曲線欄（左手在左、右手在右）
     'pitch_dynamics_lane': True,

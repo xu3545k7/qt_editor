@@ -460,6 +460,12 @@ VELOCITY_TEXT        = QColor(255, 198,  92)
 VELOCITY_TEXT_BG     = QColor(  0,   0,   0, 215)   # 描邊色，讓橘字在亮/暗音符上都讀得到
 VELOCITY_PILL_H      = 11.0
 VELOCITY_TEXT_MIN_H  = 26.0    # 音符至少這麼高才畫得下音高＋力度兩行
+# 長音裡「其實已經放開、只剩踏板殘響」的那一段：蓋一層白紗畫淺。
+# 深＝我們猜他真的按著，淺＝殘響。判斷來自 models.pedal_release_guesses。
+RESONANCE_WASH       = QColor(255, 255, 255, 120)
+RESONANCE_EDGE       = QColor(255, 255, 255, 170)   # 放開的那一刻畫一條細線
+#: 音高／力度數字離音符前緣（開始那一端）多遠
+LABEL_EDGE_PAD       = 9.0
 PITCH_GRID_FOCUS_KEYS = 6      # 放置模式下滑鼠左右各顯示幾個欄位的格線
 # 鍵盤高度。之前「拉伸到判定線」時大約是這個量體，你要的是那個長度——
 # 只是不能跟著縮放變動，所以改成固定值。真實鋼琴白鍵長寬比約 6:1，
@@ -471,9 +477,11 @@ TAIL_PAD_WINDOWS = 1.0         # 曲末額外留幾個視窗高的空白，讓�
 def _velocity_shading_on() -> bool:
     try:
         from .settings import settings as _st
-        return bool(_st.get('pitch_velocity_shading', True))
+        # 預設關掉：力度改用數字標（使用者要求）。深淺和左右手的紅藍、
+        # 殘響的淺色三種明暗疊在一起會互相干擾，數字讀得準確得多。
+        return bool(_st.get('pitch_velocity_shading', False))
     except Exception:                       # noqa: BLE001
-        return True
+        return False
 
 
 def _velocity_numbers_on() -> bool:
@@ -4361,6 +4369,7 @@ class ChartView(QWidget):
             qp.setRenderHint(QPainter.Antialiasing, True)
             radius = min(NOTE_CORNER_RADIUS, rect.width() / 2.0, rect.height() / 2.0)
             qp.drawRoundedRect(QRectF(rect), radius, radius)
+            self._draw_resonance(qp, n, QRectF(rect), radius)
             qp.setRenderHint(QPainter.Antialiasing, False)
 
         # Pass 2：畫所有音高文字（疊在最上層，不被其他音符遮擋，允許超出音符範圍）
@@ -4370,21 +4379,75 @@ class ChartView(QWidget):
             if n.pitch is None:
                 continue
             cx = rect.center().x()
-            cy = rect.center().y()
             vel = self._velocity_label(n) if show_vel else None
-            # 有力度要畫時音高往上讓半行，兩個數字才不會疊在一起
-            if vel is not None and rect.height() >= VELOCITY_TEXT_MIN_H:
-                pitch_cy = cy - VELOCITY_PILL_H / 2.0
-            else:
-                pitch_cy = cy
+            # 音符太矮就不畫力度：兩行數字疊在一起反而都讀不到
+            if vel is not None and rect.height() < VELOCITY_TEXT_MIN_H:
                 vel = None
+            if self.pitch_mode:
+                # 音高模式：兩個數字都標在**音符前緣**（開始的那一端；時間往上
+                # 走，所以前緣是下緣）。標中間的話長音的數字會飄到音符中央，
+                # 和「這顆音從哪裡開始」對不起來。
+                head_y = max(rect.bottom() - LABEL_EDGE_PAD, rect.top() + LABEL_EDGE_PAD)
+                pitch_cy = head_y
+                vel_cy = head_y - VELOCITY_PILL_H - 4.0
+            else:
+                # 小節／時間模式維持原樣（置中）——那邊看的是「要按哪裡」，
+                # 音符也照樣畫滿，不做任何深淺。
+                cy = rect.center().y()
+                pitch_cy = cy - VELOCITY_PILL_H / 2.0 if vel is not None else cy
+                vel_cy = cy + VELOCITY_PILL_H / 2.0
             qp.setFont(self._font_pitch)
             qp.setPen(PITCH_TEXT)
-            # 以音符中心為基準，給一個固定大小的繪製區域，不受音符尺寸限制
             text_rect = QRectF(cx - 16, pitch_cy - 8, 32, 16)
             qp.drawText(text_rect.toRect(), Qt.AlignCenter, self._pitch_label(n.pitch))
             if vel is not None:
-                self._draw_velocity_text(qp, cx, cy + VELOCITY_PILL_H / 2.0, vel)
+                self._draw_velocity_text(qp, cx, vel_cy, vel)
+
+    def _release_guesses(self) -> dict:
+        """{id(note): 猜測放開的時刻}。每幀都要用，所以照長音的簽章快取。"""
+        holds = [n for n in self.model.notes_tree if int(n.note_type) == 2]
+        sig = (len(self.model.notes_tree), len(holds),
+               sum(int(n.start) + int(n.end) for n in holds))
+        if getattr(self, '_release_sig', None) != sig:
+            try:
+                self._release_map = self.model.pedal_release_guesses()
+            except Exception:               # noqa: BLE001
+                self._release_map = {}
+            self._release_sig = sig
+        return self._release_map
+
+    def _draw_resonance(self, qp: QPainter, n: 'GNote', rect: QRectF,
+                        radius: float) -> None:
+        """長音裡「其實已經放開、只剩踏板殘響」的那一段畫淺。
+
+        深＝我們猜他手還按著，淺＝踏板踩著的殘響。判斷和
+        `trim_pedal_sustained_holds` 是同一份（`pedal_release_guesses`），
+        所以畫面上看到的淺色段落，正好就是按下「裁掉踏板長音」會被裁掉的部分。
+        """
+        if not self.pitch_mode or int(n.note_type) != 2:
+            return
+        cut = self._release_guesses().get(id(n))
+        if cut is None:
+            return
+        start, end = float(n.start), float(n.end)
+        if not (start < cut < end):
+            return
+        # 時間往上走：cut 之後（殘響）在 rect 的上半部
+        ratio = (float(cut) - start) / max(1.0, end - start)
+        split_y = rect.bottom() - rect.height() * ratio
+        if split_y <= rect.top() + 1.0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+        qp.save()
+        qp.setClipPath(path, Qt.IntersectClip)
+        qp.setPen(Qt.NoPen)
+        qp.setBrush(QBrush(RESONANCE_WASH))
+        qp.drawRect(QRectF(rect.left(), rect.top(),
+                           rect.width(), split_y - rect.top()))
+        qp.setPen(QPen(RESONANCE_EDGE, 1))
+        qp.drawLine(QPointF(rect.left(), split_y), QPointF(rect.right(), split_y))
+        qp.restore()
 
     @staticmethod
     def _velocity_label(n: GNote) -> Optional[str]:

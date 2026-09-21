@@ -1765,9 +1765,42 @@ class NoteModel:
 
         回傳被裁切的音符數。
         """
+        cuts = self.pedal_release_guesses(hand_reach_semitones=hand_reach_semitones)
         gap = max(0, int(gap_ms))
-        reach = max(1, int(hand_reach_semitones))
+        changed = 0
+        for hold in self.notes_tree:
+            cut = cuts.get(id(hold))
+            if cut is None:
+                continue
+            start, end = int(hold.start), int(hold.end)
+            new_end = max(start + 1, int(cut) - gap)
+            if new_end >= end:
+                continue
+            hold.end = new_end
+            hold.gate = max(1, new_end - start)
+            changed += 1
+        if changed:
+            self.rebuild_display_cache()
+            self.dirty = True
+        return changed
 
+    def pedal_release_guesses(
+        self, hand_reach_semitones: int = 12
+    ) -> Dict[int, int]:
+        """猜每個長音「其實在哪一刻就放開了」：{id(note): 放開的時刻}。
+
+        兩種證據都代表後面那段是踏板踩住的殘響，不是手還按著：
+
+        1. 長音的**時值中間**又出現完全相同的音高 —— 同一個鍵不可能在還按著
+           的時候再被按一次。
+        2. 長音還在響的時候，**同一隻手**出現了距離超過一個八度的音符 ——
+           一隻手構不到，所以那個長音一定已經放開了。
+
+        只回傳「猜得出來」的那些；沒有證據的音符不在字典裡。裁切
+        （`trim_pedal_sustained_holds`）與畫面上的深淺（殘響畫淺）共用這一份
+        判斷，兩邊才不會各講一套。
+        """
+        reach = max(1, int(hand_reach_semitones))
         pitched = [n for n in self.notes_tree
                    if getattr(n, 'pitch', None) is not None]
         by_pitch: Dict[int, List['GNote']] = {}
@@ -1780,7 +1813,7 @@ class NoteModel:
         for items in by_hand.values():
             items.sort(key=lambda n: int(n.start))
 
-        changed = 0
+        out: Dict[int, int] = {}
         for hold in pitched:
             if int(hold.note_type) != 2:
                 continue
@@ -1813,19 +1846,10 @@ class NoteModel:
                     break
                 idx += 1
 
-            if cut is None:
+            if cut is None or cut <= start:
                 continue
-            new_end = max(start + 1, cut - gap)
-            if new_end >= end:
-                continue
-            hold.end = new_end
-            hold.gate = max(1, new_end - start)
-            changed += 1
-
-        if changed:
-            self.rebuild_display_cache()
-            self.dirty = True
-        return changed
+            out[id(hold)] = int(cut)
+        return out
 
     def hand_onset_timelines(self) -> Dict[int, List[int]]:
         """每支手的「起音時間軸」：{hand: 排序後且去重的 start 清單}。

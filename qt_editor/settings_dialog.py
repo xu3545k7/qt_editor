@@ -275,7 +275,7 @@ class SettingsDialog(QDialog):
         pitch.addRow(QLabel('延音踏板'), self._pedal_chk)
 
         self._vel_chk = QCheckBox('依力度調整音符明暗')
-        self._vel_chk.setChecked(bool(settings.get('pitch_velocity_shading', True)))
+        self._vel_chk.setChecked(bool(settings.get('pitch_velocity_shading', False)))
         pitch.addRow(QLabel('力度明暗'), self._vel_chk)
 
         toggle(pitch, 'pitch_velocity_numbers', '力度數字',
