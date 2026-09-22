@@ -55,6 +55,7 @@ Y: 下方 = window_start（較早），上方 = window_end（較晚）
 
 from __future__ import annotations
 
+import io
 import math
 import os
 from bisect import bisect_left, bisect_right
@@ -1854,9 +1855,215 @@ class ChartView(QWidget):
             'off_velocity': n.off_velocity,
             'gate':      n.end - n.start,
         } for n in nodes]
+        self._write_system_clipboard(self.clipboard)
+
+    #: 寫進系統剪貼簿的格式標記。認得這個標記才會當成音符貼上，
+    #: 免得把別的程式複製的文字當成譜面。
+    CLIPBOARD_TAG = 'nos-chart-maker/notes'
+    CLIPBOARD_VERSION = 1
+
+    #: 剪貼簿上的 MIDI。DAW 與其他工具認的是這幾個 MIME 名稱。
+    MIDI_MIME_TYPES = ('audio/midi', 'audio/x-midi', 'application/x-midi')
+    #: 剪貼簿裡的音符要多長才算長條（和匯入 MIDI 的規則一致）
+    CLIPBOARD_HOLD_MS = 500
+
+    def _notes_to_midi_bytes(self, notes: List[dict]) -> bytes:
+        """把剪貼簿上的音符寫成一份小的 MIDI，讓別的程式（DAW）也貼得進去。"""
+        try:
+            import mido
+        except Exception:                       # noqa: BLE001
+            return b''
+        bpm = float(getattr(self.model, 'bpm', 120.0) or 120.0)
+        ticks_per_beat = 480
+        ms_per_tick = 60_000.0 / max(1.0, bpm) / ticks_per_beat
+        events = []
+        for item in notes:
+            pitch = item.get('pitch')
+            if pitch is None:
+                continue
+            start = float(item.get('rel_start', 0))
+            end = max(start + 1.0, float(item.get('rel_end', start + 1)))
+            vel = int(item.get('velocity') or 100)
+            events.append((start, 1, int(pitch), max(1, min(127, vel))))
+            events.append((end, 0, int(pitch), 0))
+        if not events:
+            return b''
+        events.sort(key=lambda e: (e[0], e[1]))
+        mid = mido.MidiFile(type=0, ticks_per_beat=ticks_per_beat)
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+        track.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(bpm), time=0))
+        last_tick = 0
+        for when, on, pitch, vel in events:
+            tick = int(round(when / ms_per_tick))
+            track.append(mido.Message('note_on' if on else 'note_off',
+                                      note=pitch, velocity=vel,
+                                      time=max(0, tick - last_tick)))
+            last_tick = tick
+        buf = io.BytesIO()
+        mid.save(file=buf)
+        return buf.getvalue()
+
+    def _notes_from_midi_bytes(self, data: bytes) -> Optional[List[dict]]:
+        """剪貼簿上的 MIDI → 剪貼簿音符。
+
+        走的是正式的匯入流程（同音配對、速度圖、力度／踏板），所以和「開啟
+        MIDI」拿到的東西一致；鍵道還不知道，就照音高線性攤開（和未排譜的
+        MIDI 一樣），貼進來之後可以再排。
+        """
+        import os
+        import tempfile
+
+        from .models import NoteModel
+
+        if not data or data[:4] != b'MThd':
+            return None
+        tmp_path = ''
+        try:
+            handle, tmp_path = tempfile.mkstemp(suffix='.mid')
+            with os.fdopen(handle, 'wb') as fh:
+                fh.write(data)
+            scratch = NoteModel()
+            scratch.load_midi(tmp_path, auto_arrange=False)
+        except Exception:                       # noqa: BLE001
+            return None
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        notes = sorted(scratch.notes_tree, key=lambda n: (int(n.start), int(n.min_key)))
+        if not notes:
+            return None
+        base = int(notes[0].start)
+        out = []
+        for n in notes:
+            length = max(1, int(n.end) - int(n.start))
+            out.append({
+                'rel_start': int(n.start) - base,
+                'rel_end': int(n.end) - base,
+                'min_key': int(n.min_key),
+                'max_key': int(n.max_key),
+                'note_type': 2 if length >= self.CLIPBOARD_HOLD_MS else 0,
+                'hand': int(n.hand),
+                'pitch': int(n.pitch) if n.pitch is not None else None,
+                'track': n.track,
+                'velocity': n.velocity,
+                'channel': n.channel,
+                'off_velocity': n.off_velocity,
+                'gate': length,
+            })
+        return out
+
+    def _midi_from_clipboard_mime(self, mime) -> Optional[List[dict]]:
+        """剪貼簿裡的 MIDI：別的程式放的位元組，或檔案總管複製的 .mid 檔。"""
+        if mime is None:
+            return None
+        for name in self.MIDI_MIME_TYPES:
+            if mime.hasFormat(name):
+                notes = self._notes_from_midi_bytes(bytes(mime.data(name)))
+                if notes:
+                    return notes
+        if mime.hasUrls():
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path.lower().endswith(('.mid', '.midi')):
+                    try:
+                        with open(path, 'rb') as fh:
+                            notes = self._notes_from_midi_bytes(fh.read())
+                    except OSError:
+                        continue
+                    if notes:
+                        return notes
+        return None
+
+    def _write_system_clipboard(self, notes: List[dict]) -> None:
+        """把複製的音符也寫進系統剪貼簿，另一個編輯器視窗才貼得到。
+
+        `self.clipboard` 只活在這個行程裡，所以開兩個編輯器時複製完全傳不過去。
+        系統剪貼簿是兩邊唯一共用的東西；用純文字 JSON 還有一個好處：貼進聊天
+        視窗或文字編輯器就能把片段傳給別人，對方貼回來一樣認得。
+        """
+        import json
+
+        from PyQt5.QtWidgets import QApplication
+
+        payload = {
+            'format': self.CLIPBOARD_TAG,
+            'version': self.CLIPBOARD_VERSION,
+            'count': len(notes),
+            'notes': notes,
+        }
+        try:
+            from PyQt5.QtCore import QMimeData
+
+            board = QApplication.clipboard()
+            if board is None:
+                return
+            mime = QMimeData()
+            mime.setText(json.dumps(payload, ensure_ascii=False))
+            # 同一份東西也放一份 MIDI：貼到 DAW 或別的工具裡才有意義，
+            # 而且對方貼回來時我們自己也認得（見 _midi_from_clipboard_mime）。
+            midi = self._notes_to_midi_bytes(notes)
+            if midi:
+                for name in self.MIDI_MIME_TYPES:
+                    mime.setData(name, midi)
+            board.setMimeData(mime)
+        except Exception:                       # noqa: BLE001
+            pass                                # 沒有剪貼簿（離屏測試）也不該炸
+
+    def _read_system_clipboard(self) -> Optional[List[dict]]:
+        """系統剪貼簿裡如果是這個編輯器複製的音符就回傳它，否則 None。"""
+        import json
+
+        from PyQt5.QtWidgets import QApplication
+
+        try:
+            board = QApplication.clipboard()
+            text = board.text() if board is not None else ''
+        except Exception:                       # noqa: BLE001
+            return None
+        if not text or self.CLIPBOARD_TAG not in text:
+            return None                         # 別的程式複製的東西，別亂解析
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict) or payload.get('format') != self.CLIPBOARD_TAG:
+            return None
+        notes = payload.get('notes')
+        if not isinstance(notes, list) or not notes:
+            return None
+        required = ('rel_start', 'rel_end', 'min_key', 'max_key', 'note_type', 'hand')
+        out = []
+        for item in notes:
+            if not isinstance(item, dict) or any(k not in item for k in required):
+                return None                     # 半殘的資料寧可不貼
+            out.append(dict(item))
+        return out
 
     def paste_from_clipboard(self) -> None:
-        if not self.clipboard or self.alloc_active:
+        if self.alloc_active:
+            return
+        # 系統剪貼簿優先：那是另一個編輯器視窗（另一個行程）唯一送得過來的路。
+        # 自己複製的時候兩邊內容一樣，所以不會互相打架。
+        shared = self._read_system_clipboard()
+        if shared:
+            self.clipboard = shared
+        else:
+            # 不是這個編輯器複製的 → 看看是不是 MIDI（別的程式放的位元組，
+            # 或在檔案總管複製的 .mid 檔）
+            try:
+                from PyQt5.QtWidgets import QApplication
+                board = QApplication.clipboard()
+                midi_notes = self._midi_from_clipboard_mime(
+                    board.mimeData() if board is not None else None)
+            except Exception:                   # noqa: BLE001
+                midi_notes = None
+            if midi_notes:
+                self.clipboard = midi_notes
+        if not self.clipboard:
             return
         if self._last_mouse_unit is not None:
             base_ms = self.mapper.unit_to_ms(self._last_mouse_unit)
