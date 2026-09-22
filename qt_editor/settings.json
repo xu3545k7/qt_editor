@@ -46,6 +46,18 @@
   "shortcut_toggle_width": "E",
   "shortcut_measures_bpm": "",
   "shortcut_events": "",
+  "soundfont_path": "",
+  "soundfont_preset": -1,
+  "arrange_options": {
+    "mode": "eather",
+    "lane_lo": 0,
+    "lane_hi": 27,
+    "allow_chord_overlap": null,
+    "base_style": "eather",
+    "overrides": {},
+    "trim_pedal_holds": false
+  },
+  "arrange_presets": {},
   "hiraeth_export_dir": "",
   "hiraeth_mix_piano": true,
   "hiraeth_hold_gap_ms": 80,
@@ -57,6 +69,5 @@
   "editor_exe_path": "",
   "hiraeth_root": "",
   "custom_note_divisions": [],
-  "oplog_enabled": true,
-  "ai_grid_division": 4
+  "oplog_enabled": true
 }

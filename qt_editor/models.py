@@ -1785,7 +1785,8 @@ class NoteModel:
         return changed
 
     def pedal_release_guesses(
-        self, hand_reach_semitones: int = 12
+        self, hand_reach_semitones: int = 12,
+        use_hand_reach: Optional[bool] = None,
     ) -> Dict[int, int]:
         """猜每個長音「其實在哪一刻就放開了」：{id(note): 放開的時刻}。
 
@@ -1803,6 +1804,12 @@ class NoteModel:
         reach = max(1, int(hand_reach_semitones))
         pitched = [n for n in self.notes_tree
                    if getattr(n, 'pitch', None) is not None]
+        # 第二條規則（同手構不到）只有在**手真的分開**時才成立。單軌的鋼琴
+        # MIDI 兩手都擠在同一軌，匯入後整份都是同一隻手，這條規則就變成
+        # 「看到大跳就裁」——實測一份單軌譜 452 個長條被裁掉 305 個，長度只
+        # 剩 28%（最慘 4%），使用者看到的就是「被切碎」。
+        if use_hand_reach is None:
+            use_hand_reach = len({int(n.hand) for n in pitched}) > 1
         by_pitch: Dict[int, List['GNote']] = {}
         by_hand: Dict[int, List['GNote']] = {}
         for note in pitched:
@@ -1832,7 +1839,7 @@ class NoteModel:
                     cut = nxt
 
             # (2) 中間出現同手、超過一個八度的音符（手構不到）
-            mates = by_hand.get(int(hold.hand), [])
+            mates = by_hand.get(int(hold.hand), []) if use_hand_reach else []
             starts = [int(n.start) for n in mates]
             idx = bisect_right(starts, start)
             while idx < len(mates):

@@ -37,18 +37,22 @@ class ReleaseGuessTests(unittest.TestCase):
         self.assertEqual(m.pedal_release_guesses()[id(hold)], 1000)
 
     def test_a_note_the_hand_cannot_reach_means_it_was_released(self):
+        # 要有兩隻手，那條規則才成立（見 SingleHandFilesTests）
         hold = note(0, 0, 4000, 60)
-        m = self.model([hold, note(1, 800, 900, 90, 0)])
+        m = self.model([hold, note(1, 800, 900, 90, 0),
+                        note(2, 50, 100, 40, 0, hand=1)])
         self.assertEqual(m.pedal_release_guesses()[id(hold)], 800)
 
     def test_a_reachable_note_is_not_evidence(self):
         hold = note(0, 0, 4000, 60)
-        m = self.model([hold, note(1, 800, 900, 67, 0)])
+        m = self.model([hold, note(1, 800, 900, 67, 0),
+                        note(2, 50, 100, 40, 0, hand=1)])
         self.assertEqual(m.pedal_release_guesses(), {})
 
     def test_taps_are_never_guessed(self):
         tap = note(0, 0, 4000, 60, note_type=0)
-        m = self.model([tap, note(1, 800, 900, 90, 0)])
+        m = self.model([tap, note(1, 800, 900, 90, 0),
+                        note(2, 50, 100, 40, 0, hand=1)])
         self.assertEqual(m.pedal_release_guesses(), {})
 
     def test_guessing_does_not_modify_anything(self):
@@ -190,6 +194,55 @@ class PreviewIsUntouchedTests(unittest.TestCase):
         qp = mock.MagicMock()
         v._draw_resonance(qp, hold, QRectF(0, 0, 20, 400), 3.0)
         self.assertTrue(qp.drawRect.called)
+
+
+class SingleHandFilesTests(unittest.TestCase):
+    """手沒有真的分開時，不能用「同手構不到」那條規則。
+
+    單軌的鋼琴 MIDI（或第 0 軌只有曲名的兩軌檔）匯入後整份都是同一隻手，
+    那條規則就變成「看到大跳就裁」。實測 Cocytus 78-100.mid：452 個長條被裁
+    305 個，長度只剩 28%（最慘 4%）——使用者看到的就是「被切碎」。
+    """
+
+    def model(self, notes):
+        m = NoteModel.create_new('t', 120.0, 60.0, 4)
+        m.notes_tree = notes
+        m.rebuild_display_cache()
+        return m
+
+    def test_one_hand_means_the_reach_rule_is_off(self):
+        hold = note(0, 0, 4000, 60, hand=1)
+        m = self.model([hold, note(1, 800, 900, 90, 0, hand=1)])
+        self.assertEqual(m.pedal_release_guesses(), {},
+                         '整份同一隻手＝手沒分開，不能拿手的跨度當證據')
+
+    def test_two_hands_keep_the_reach_rule(self):
+        hold = note(0, 0, 4000, 60, hand=1)
+        m = self.model([hold, note(1, 800, 900, 90, 0, hand=1),
+                        note(2, 100, 200, 40, 0, hand=0)])
+        self.assertEqual(m.pedal_release_guesses()[id(hold)], 800)
+
+    def test_the_same_pitch_rule_still_works_with_one_hand(self):
+        hold = note(0, 0, 4000, 60, hand=1)
+        m = self.model([hold, note(1, 1000, 1100, 60, 0, hand=1)])
+        self.assertEqual(m.pedal_release_guesses()[id(hold)], 1000,
+                         '同一個鍵再次被按下，永遠是有效證據')
+
+    def test_it_can_be_forced_either_way(self):
+        hold = note(0, 0, 4000, 60, hand=1)
+        m = self.model([hold, note(1, 800, 900, 90, 0, hand=1)])
+        self.assertEqual(m.pedal_release_guesses(use_hand_reach=True)[id(hold)], 800)
+        self.assertEqual(m.pedal_release_guesses(use_hand_reach=False), {})
+
+    def test_a_single_hand_chart_is_not_shredded(self):
+        """整段長音 + 大跳的單手譜：一顆都不該被裁。"""
+        # 音高都不重複：重複的話第一條規則（同鍵再次被按）本來就該裁
+        holds = [note(i, i * 1000, i * 1000 + 3000, 48 + i * 5, hand=1)
+                 for i in range(8)]
+        m = self.model(holds)
+        before = [(int(n.start), int(n.end)) for n in holds]
+        self.assertEqual(m.trim_pedal_sustained_holds(), 0)
+        self.assertEqual([(int(n.start), int(n.end)) for n in holds], before)
 
 
 if __name__ == '__main__':
