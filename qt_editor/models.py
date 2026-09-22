@@ -1748,7 +1748,8 @@ class NoteModel:
             n.idx = i
 
     def trim_pedal_sustained_holds(
-        self, gap_ms: int = 100, hand_reach_semitones: int = 12
+        self, gap_ms: int = 100, hand_reach_semitones: int = 12,
+        only: Optional[Iterable['GNote']] = None,
     ) -> int:
         """裁切被踏板延長的長音。
 
@@ -1766,6 +1767,11 @@ class NoteModel:
         回傳被裁切的音符數。
         """
         cuts = self.pedal_release_guesses(hand_reach_semitones=hand_reach_semitones)
+        # `only` 給的話只處理那幾顆（框選起來的）。判斷仍然看整份譜——
+        # 「後面那顆音證明這個長音放開了」的證據本來就可能在選取範圍之外。
+        if only is not None:
+            keep = {id(n) for n in only}
+            cuts = {k: v for k, v in cuts.items() if k in keep}
         gap = max(0, int(gap_ms))
         changed = 0
         for hold in self.notes_tree:

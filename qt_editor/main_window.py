@@ -1451,6 +1451,7 @@ class MainWindow(QMainWindow):
                  self.hold_length_fix_dialog),
                 ('移除重複音符（同 start/pitch）…', self.remove_duplicate_start_pitch_dialog),
                 ('取消整份譜面的隱藏音符…', self.unhide_all_dialog),
+                ('裁掉選取長音的踏板殘響', self.trim_selected_pedal_holds),
             ]),
             ('難度', [
                 # 預設走這條：直接寫進樂曲資料夾，生完進遊戲就看得到。
@@ -6645,6 +6646,17 @@ class MainWindow(QMainWindow):
         self.view.note_edited.emit()
         QMessageBox.information(
             self, t('dlg_ref_midi_ok_title'), t('dlg_ref_midi_ok_msg', n))
+
+    def trim_selected_pedal_holds(self) -> None:
+        """把框選起來的長音裁到猜測放開的那一刻（音高模式畫成淺色的那一段）。"""
+        changed = self.view.trim_pedal_holds_selected()
+        if changed:
+            self.statusBar().showMessage(
+                '裁掉 %d 顆長音的殘響（Ctrl+Z 可復原）' % changed, 6000)
+        elif not self.view.selected:
+            self.statusBar().showMessage('先框選要處理的音符', 4000)
+        else:
+            self.statusBar().showMessage('選取範圍裡沒有可以裁的殘響', 4000)
 
     def rearrange_dialog(self) -> None:
         """對目前這份譜重跑一次轉譜，選項自己挑（模式／鍵道範圍／重疊／自訂）。

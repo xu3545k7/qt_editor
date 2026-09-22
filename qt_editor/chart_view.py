@@ -1371,6 +1371,33 @@ class ChartView(QWidget):
         self.update()
         self.note_edited.emit()
 
+    def trim_pedal_holds_selected(self) -> int:
+        """把框選起來的長音裁到「猜測放開的那一刻」——也就是畫面上淺色的那一段。
+
+        只動選取的音符，而且先 push_history，Ctrl+Z 就回得來。以前這件事只在
+        匯入 MIDI 時自動整份做掉，使用者沒有選擇權（回報：長音被切碎）。
+        """
+        if not self.selected or self.alloc_active:
+            self._drag_status = '先框選要處理的音符'
+            self._emit_status()
+            return 0
+        picked = [n for n in self.model.notes_tree if n.idx in self.selected]
+        if not picked:
+            return 0
+        self.model.push_history()
+        changed = int(self.model.trim_pedal_sustained_holds(only=picked) or 0)
+        if not changed:
+            self.model.discard_last_history()
+            self._drag_status = '選取範圍裡沒有可以裁的殘響'
+            self._emit_status()
+            return 0
+        self.model.rebuild_display_cache()
+        self.update()
+        self.note_edited.emit()
+        self._drag_status = '裁掉 %d 顆長音的殘響（Ctrl+Z 可復原）' % changed
+        self._emit_status()
+        return changed
+
     def toggle_tap_hold_selected(self) -> Optional[int]:
         """快捷鍵用：選取的全是長條就改成點擊，否則全部改成長條。回傳改成的類型。"""
         if not self.selected or self.alloc_active:
@@ -6624,6 +6651,12 @@ class ChartView(QWidget):
             a.setEnabled(has_sel and allowed)
             a.triggered.connect(
                 lambda checked=False, _t=ntype: self.set_type_selected(_t))
+
+        trim_act = menu.addAction('裁掉殘響（淺色那段）')
+        trim_act.setToolTip('把選取的長音裁到「猜測放開的那一刻」。可以復原。')
+        trim_act.setEnabled(has_sel)
+        trim_act.triggered.connect(
+            lambda checked=False: self.trim_pedal_holds_selected())
 
         hand_m = menu.addMenu('左右手')
         for label, hand in [('右手  (R)', 0), ('左手  (L)', 1)]:

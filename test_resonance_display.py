@@ -245,5 +245,65 @@ class SingleHandFilesTests(unittest.TestCase):
         self.assertEqual([(int(n.start), int(n.end)) for n in holds], before)
 
 
+class TrimSelectionTests(unittest.TestCase):
+    """裁殘響改成「框選起來的才處理」，而且一定要能復原。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def view(self):
+        from qt_editor.chart_view import ChartView
+        m = NoteModel.create_new('t', 120.0, 60.0, 4)
+        # 兩顆長音，各自都有「同一個鍵又被按下」的證據
+        self.holds = [note(0, 0, 4000, 60), note(2, 10000, 14000, 64)]
+        m.notes_tree = [self.holds[0], note(1, 1000, 1100, 60, 0),
+                        self.holds[1], note(3, 11000, 11100, 64, 0)]
+        m.rebuild_display_cache()
+        v = ChartView()
+        v.load_model(m)
+        v.pitch_mode = True
+        self._v = v
+        return v, m
+
+    def test_only_the_selected_notes_are_trimmed(self):
+        v, m = self.view()
+        keep = [(int(n.start), int(n.end)) for n in m.notes_tree]
+        v.selected = {m.notes_tree[0].idx}
+        self.assertEqual(v.trim_pedal_holds_selected(), 1)
+        self.assertEqual(int(self.holds[0].end), 900, '選到的要裁')
+        self.assertEqual(int(self.holds[1].end), keep[2][1], '沒選到的不准動')
+
+    def test_it_can_be_undone(self):
+        v, m = self.view()
+        before = [(int(n.start), int(n.end)) for n in m.notes_tree]
+        v.selected = {n.idx for n in m.notes_tree}
+        self.assertEqual(v.trim_pedal_holds_selected(), 2)
+        self.assertTrue(m.undo())
+        self.assertEqual([(int(n.start), int(n.end)) for n in m.notes_tree], before)
+
+    def test_nothing_selected_does_nothing(self):
+        v, m = self.view()
+        before = [(int(n.start), int(n.end)) for n in m.notes_tree]
+        v.selected = set()
+        self.assertEqual(v.trim_pedal_holds_selected(), 0)
+        self.assertEqual([(int(n.start), int(n.end)) for n in m.notes_tree], before)
+        self.assertIn('框選', v._drag_status)
+
+    def test_a_selection_with_nothing_to_trim_leaves_no_undo_step(self):
+        v, m = self.view()
+        v.selected = {m.notes_tree[1].idx}          # 一顆短音，沒得裁
+        depth = len(m.undo_stack)
+        self.assertEqual(v.trim_pedal_holds_selected(), 0)
+        self.assertEqual(len(m.undo_stack), depth,
+                         '沒改到東西就不該留下一步空的復原')
+
+    def test_evidence_outside_the_selection_still_counts(self):
+        """證據（後面那顆同音）不在選取裡，也照樣算數。"""
+        v, m = self.view()
+        v.selected = {m.notes_tree[0].idx}          # 只選長音，不選證據那顆
+        self.assertEqual(v.trim_pedal_holds_selected(), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
