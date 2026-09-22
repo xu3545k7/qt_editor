@@ -7,7 +7,7 @@ Build (from the qt_editor/ directory, on a Mac):
 or by hand:
     pyinstaller NostalgiaChartEditor-mac.spec --noconfirm
 
-Produces: dist/Nos Chart Maker.app
+Produces: dist_mac/Nos Chart Maker <版本>.app（版本取自 qt_editor/version.py）
 
 和 Windows 版的差別（NostalgiaChartEditor.spec）：
   * onedir + BUNDLE，不是單檔。macOS 的單檔執行檔不是 .app，Finder 點不開，
@@ -19,9 +19,32 @@ Produces: dist/Nos Chart Maker.app
   * 音源 SF2 有 187MB 且不在 git repo 裡；有就打包進去，沒有就不打包，
     程式會退回舊音源或告訴使用者找不到音源。
 """
+import ast
 import os
 
 from PyInstaller.utils.hooks import collect_submodules
+
+
+def _read_version():
+    """從 qt_editor/version.py 取 __version__，不 import 它。
+
+    用讀檔 + ast 而不是 import：不依賴 sys.path 長什麼樣（spec 是被 exec 的，
+    cwd 不一定是專案根目錄），也不會執行到 version.py 以外的任何程式碼。
+    路徑以 SPECPATH（PyInstaller 注入的 spec 所在目錄）為基準。
+    Windows 的 NostalgiaChartEditor.spec 有同一份邏輯，改動請一起改。
+    """
+    path = os.path.join(SPECPATH, 'qt_editor', 'version.py')
+    with open(path, encoding='utf-8') as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == '__version__'
+                for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise SystemExit(f'{path} 裡找不到 __version__')
+
+
+VERSION = _read_version()
 
 datas = [
     ('qt_editor/graphic', 'qt_editor/graphic'),
@@ -97,13 +120,17 @@ coll = COLLECT(
 
 app = BUNDLE(
     coll,
-    name='Nos Chart Maker.app',
+    # 檔名帶版本，好和舊版擺在一起；bundle 內的執行檔名維持乾淨的
+    # 'Nos Chart Maker'（COLLECT/EXE 的 name），換版不會動到路徑。
+    name=f'Nos Chart Maker {VERSION}.app',
     icon='qt_editor/icon.icns' if os.path.isfile('qt_editor/icon.icns') else None,
     bundle_identifier='com.nostalgia.chartmaker',
     info_plist={
         'NSHighResolutionCapable': True,
         'CFBundleDisplayName': 'Nos Chart Maker',
         'CFBundleName': 'Nos Chart Maker',
+        'CFBundleShortVersionString': VERSION,
+        'CFBundleVersion': VERSION,
         'LSMinimumSystemVersion': '11.0',
         # 譜面檔（.json / .xml）可以直接拖到 App 上開啟
         'CFBundleDocumentTypes': [{

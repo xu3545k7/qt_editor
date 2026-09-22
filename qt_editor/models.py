@@ -30,6 +30,30 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     mido = None  # type: ignore[assignment]
 
 
+class _MsView(Sequence):
+    """把 [(任意值, ms), ...] 包成「只看得到 ms」的唯讀序列，給 bisect 用。
+
+    `bisect_right(seq, x, key=...)` 是 Python 3.10 才有的參數。macOS 內建的
+    python3 是 3.9，用它建出來的打包版一跑到這裡就 TypeError——而呼叫點在
+    `chart_view.paintEvent` 裡，PyQt5 對 paintEvent 丟出的未捕捉例外是直接
+    `qFatal()`，整支 app 當場閃退、連錯誤視窗都沒有。
+
+    不直接 `[b[1] for b in seq]` 是因為這是熱路徑（每條拍線、播放每幀都查），
+    那樣每次查詢都要複製一整份清單，O(log n) 會變成 O(n)。
+    """
+
+    __slots__ = ('_seq',)
+
+    def __init__(self, seq: Sequence) -> None:
+        self._seq = seq
+
+    def __len__(self) -> int:
+        return len(self._seq)
+
+    def __getitem__(self, index):
+        return self._seq[index][1]
+
+
 def _tolerate_broken_key_signatures() -> None:
     """讓 mido 不要因為壞掉的調號 meta 事件就拒絕整個檔案。
 
@@ -2203,6 +2227,42 @@ class NoteModel:
                 n.start = new_start
             else:  # 'end'
                 new_end = max(int(n.start) + 1, value)
+                if new_end == int(n.end):
+                    continue
+                n.end = new_end
+            n.gate = int(n.end) - int(n.start)
+            changed += 1
+        return changed
+
+    @staticmethod
+    def nudge_notes_edge(notes: List[GNote], target: str,
+                         deltas: Dict[int, int]) -> int:
+        """把一組音符的 start 或 end 各自提前／延後，另一端不動。
+
+        和 `align_notes_edge` 的差別是相對而非絕對：那個把所有選取音符的邊對齊
+        到同一個時間點，這個讓每顆各自位移、彼此的相對關係保留。
+
+        deltas：`{id(note): 位移 ms}`，正=延後、負=提前。之所以每顆分開給而不是
+        收一個數字，是為了變速譜——以拍為單位的位移換算成 ms 時，每顆音符要吃
+        自己所在位置的 BPM，量本來就不一樣。
+
+        夾限與 `align_notes_edge` 一致：start 落在 [0, end-1]，end 至少 start+1。
+        回傳實際被修改的音符數；gate 會同步更新。
+        """
+        if target not in ('start', 'end'):
+            return 0
+        changed = 0
+        for n in notes:
+            delta = int(deltas.get(id(n), 0))
+            if not delta:
+                continue
+            if target == 'start':
+                new_start = max(0, min(int(n.start) + delta, int(n.end) - 1))
+                if new_start == int(n.start):
+                    continue
+                n.start = new_start
+            else:  # 'end'
+                new_end = max(int(n.start) + 1, int(n.end) + delta)
                 if new_end == int(n.end):
                     continue
                 n.end = new_end
@@ -6776,7 +6836,7 @@ class NoteModel:
             if not bounds:
                 return 0
             # bounds 依 start_ms 遞增且相接（end==下一個 start）→ bisect 找所屬小節。
-            i = bisect_right(bounds, float(ms), key=lambda b: b[1]) - 1
+            i = bisect_right(_MsView(bounds), float(ms)) - 1
             return max(0, min(i, len(bounds) - 1))
         beats = self.get_beat_entries()
         if not beats:
@@ -6784,7 +6844,7 @@ class NoteModel:
             return max(0, int(ms / max(1.0, bar_ms)))
         epb = self.entries_per_bar
         # 找最後一個 beat_ms <= ms 的位置 i；該拍屬於第 i // epb 小節。
-        i = bisect_right(beats, float(ms), key=lambda b: b[1]) - 1
+        i = bisect_right(_MsView(beats), float(ms)) - 1
         return max(0, i // max(1, epb))
 
     def _measure_entry_slice(self, measure_idx: int) -> Tuple[int, int]:

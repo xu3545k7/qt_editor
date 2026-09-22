@@ -4,7 +4,9 @@
 #   cd qt_editor
 #   bash build_mac.sh
 #
-# Output: dist_mac/Nos Chart Maker.app
+# Output: dist_mac/Nos Chart Maker <version>.app
+# The version comes from qt_editor/version.py -- bump that one line to cut a
+# new build; nothing else needs editing.
 # Notes in Chinese live in README-mac.md; this script stays ASCII-only on
 # purpose, so that copying it between machines cannot corrupt it.
 #
@@ -50,7 +52,12 @@ command -v "$PY" >/dev/null 2>&1 || \
 PYVER="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 say "Python $PYVER at $(command -v "$PY")"
 case "$PYVER" in
-  3.9|3.10|3.11|3.12) ;;
+  3.10|3.11|3.12) ;;
+  # The macOS built-in python3 is 3.9. The editor is developed on 3.10+, so a
+  # 3.9 build silently misses things like bisect's key= argument -- and when
+  # that blows up inside paintEvent, PyQt5 calls qFatal() and the app just
+  # vanishes. Build with a newer Python: brew install python@3.12
+  3.9) warn "Python 3.9 (probably the macOS built-in). The editor targets 3.10+; 3.9 builds can crash at runtime. Prefer: PYTHON=python3.12 bash build_mac.sh" ;;
   *) warn "Python $PYVER is untested. PyQt5 and audioop are a problem on 3.13+; 3.11 or 3.12 is safer." ;;
 esac
 
@@ -136,12 +143,26 @@ else
   warn "qt_editor/icon.png missing; the app will use a generic icon"
 fi
 
+# --------------------------------------------------------------- version
+# qt_editor/version.py is the single source of truth. The spec reads the same
+# file to name the bundle and fill CFBundleShortVersionString, so this has to
+# read it the same way -- keep the two in step or the check below fails.
+say "Version"
+VERSION="$("$PY" -c "
+import ast
+tree = ast.parse(open('qt_editor/version.py', encoding='utf-8').read())
+print(next(ast.literal_eval(n.value) for n in tree.body
+           if isinstance(n, ast.Assign)
+           and any(getattr(t, 'id', '') == '__version__' for t in n.targets)))
+")" || die "could not read __version__ from qt_editor/version.py"
+echo "$VERSION"
+
 # ----------------------------------------------------------- PyInstaller
 say "PyInstaller"
 "$PY" -m PyInstaller NostalgiaChartEditor-mac.spec --noconfirm \
   --distpath dist_mac --workpath build_tmp_mac || die "PyInstaller failed; the output above says why"
 
-APP="dist_mac/Nos Chart Maker.app"
+APP="dist_mac/Nos Chart Maker $VERSION.app"
 [ -d "$APP" ] || die "no $APP was produced; see the PyInstaller output above"
 
 # --------------------------------------------------------------- signing

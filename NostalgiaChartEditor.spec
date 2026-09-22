@@ -5,9 +5,35 @@ PyInstaller spec for the Nostalgia QT chart editor.
 Build (from the qt_editor/ directory):
     pyinstaller NostalgiaChartEditor.spec
 
-Produces a single-file windowed exe at: dist/NostalgiaChartEditor.exe
+Produces a single-file windowed exe at: dist/NostalgiaChartEditor-<版本>.exe
+（版本取自 qt_editor/version.py，改版只改那一行。）
 """
+import ast
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
+
+
+def _read_version():
+    """從 qt_editor/version.py 取 __version__，不 import 它。
+
+    用讀檔 + ast 而不是 import：不依賴 sys.path 長什麼樣（spec 是被 exec 的，
+    cwd 不一定是專案根目錄），也不會執行到 version.py 以外的任何程式碼。
+    路徑以 SPECPATH（PyInstaller 注入的 spec 所在目錄）為基準。
+    macOS 的 NostalgiaChartEditor-mac.spec 有同一份邏輯，改動請一起改。
+    """
+    path = os.path.join(SPECPATH, 'qt_editor', 'version.py')
+    with open(path, encoding='utf-8') as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == '__version__'
+                for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise SystemExit(f'{path} 裡找不到 __version__')
+
+
+VERSION = _read_version()
 
 # graphic/ 內的音符圖、icon 皆需隨包附帶；程式以 __file__/graphic 與 _MEIPASS/qt_editor 定位
 datas = [
@@ -62,7 +88,9 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='NostalgiaChartEditor',
+    # 檔名帶版本，好和舊版擺在一起。用連字號而不是空白：exe 常常是從
+    # cmd / 捷徑 / 排程叫起來的，路徑有空白就得處處記得加引號。
+    name=f'NostalgiaChartEditor-{VERSION}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

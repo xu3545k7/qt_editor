@@ -1256,6 +1256,79 @@ class ChartView(QWidget):
             self.model.dirty = was_dirty
         return changed
 
+    def nudge_selected_edge_time(self, target: str, delta_ms: int,
+                                 push: bool = True) -> int:
+        """把選取音符的 start 或 end 各自固定位移 `delta_ms`（正=延後、負=提前）。
+
+        和 `align_selected_edge` 的差別是相對位移：不對齊到同一點，每顆各自移，
+        所以選取內部的參差（例如刷弦、裝飾音）會保留下來。另一端不動，音符長度
+        因此會跟著變。完全不看 BPM，適合修 MIDI 匯入的整體偏移。
+        """
+        if not delta_ms:
+            return 0
+        sel_notes = self._selected_notes_for_edge(target)
+        if not sel_notes:
+            return 0
+        deltas = {id(n): int(delta_ms) for n in sel_notes}
+        return self._apply_edge_nudge(target, sel_notes, deltas, push)
+
+    def nudge_selected_edge_by_beats(self, target: str, beats: float,
+                                     push: bool = True) -> int:
+        """同上，但位移量以拍計（正=延後、負=提前）。
+
+        每顆音符用**它自己那個邊所在位置的 BPM** 換算拍長，所以變速譜上「終止
+        時間往後一個八分音符」延的是該處真正的八分音符。
+        """
+        if not beats:
+            return 0
+        sel_notes = self._selected_notes_for_edge(target)
+        if not sel_notes:
+            return 0
+        # 先全部算完再套用：邊算邊改的話，後面查到的會是移動後的位置，同一批
+        # 選取會被算成不同拍長。
+        deltas = {}
+        for n in sel_notes:
+            edge_ms = float(n.start) if target == 'start' else float(n.end)
+            deltas[id(n)] = int(round(self._ms_per_beat_at(edge_ms) * float(beats)))
+        return self._apply_edge_nudge(target, sel_notes, deltas, push)
+
+    def _selected_notes_for_edge(self, target: str) -> List[GNote]:
+        """取目前選取的音符物件，供頭尾位移用（target 不合法就回空）。"""
+        if not self.selected or self.alloc_active:
+            return []
+        if target not in ('start', 'end'):
+            return []
+        # 以物件參考保存選取集，避免 rebuild 後 idx 重編導致選取失效
+        return [n for n in self.model.notes_tree if n.idx in self.selected]
+
+    def _apply_edge_nudge(self, target: str, sel_notes: List[GNote],
+                          deltas: Dict[int, int], push: bool) -> int:
+        """套用頭尾位移並收尾（歷史、重建、狀態列），回傳被改到的音符數。"""
+        if not any(deltas.values()):
+            return 0
+        was_dirty = self.model.dirty
+        if push:
+            self.model.push_history()
+        changed = self.model.nudge_notes_edge(sel_notes, target, deltas)
+
+        if changed:
+            self.model.rebuild_display_cache()
+            self.selected = {n.idx for n in sel_notes}
+            self.update()
+            self.note_edited.emit()
+            # 被夾限的（start 撞到 end-1、end 撞到 start+1）不算在 changed 裡，
+            # 數量不符時講清楚，不然使用者會以為指令沒生效。
+            edge = '起始' if target == 'start' else '終止'
+            msg = '已位移 %d 顆音符的%s時間' % (changed, edge)
+            if changed < len(sel_notes):
+                msg += '；另有 %d 顆已達長度下限，維持原狀' % (len(sel_notes) - changed)
+            self.status_changed.emit(msg)
+        elif push and self.model.undo_stack:
+            # 沒有任何變更 → 撤掉剛剛壓入的歷史紀錄並還原 dirty
+            self.model.discard_last_history()
+            self.model.dirty = was_dirty
+        return changed
+
     # ── 長押長度修整（threshold 分級）──────────────────────────────
     def _ms_per_beat_at(self, ms: float) -> float:
         """回傳指定 ms 位置一拍（四分音符）的毫秒長度，吃小節 BPM / 變速。"""
@@ -6720,6 +6793,86 @@ class ChartView(QWidget):
         if ok:
             self.shift_selected_time(int(ms) * sign)
 
+    def _ctx_edge_nudge_custom_dialog(self, target: str, sign: int) -> None:
+        """自訂頭尾位移量：拍數（支援分數），吃每顆音符所在位置的 BPM。"""
+        from PyQt5.QtWidgets import QMessageBox
+
+        edge = '起始' if target == 'start' else '終止'
+        text, ok = QInputDialog.getText(
+            self, f'{edge}時間位移自訂拍數',
+            f'{edge}時間要{"延後" if sign > 0 else "提前"}幾拍？'
+            '（可用分數，例如 3/4、1 1/2；四分音符 = 1 拍）',
+            text='0.25',
+        )
+        if not ok:
+            return
+        try:
+            beats = _parse_beats_text(text)
+        except ValueError:
+            QMessageBox.warning(self, '輸入錯誤',
+                                '無法解析拍數，請輸入數字或分數，例如 3/4 或 1 1/2。')
+            return
+        if beats <= 0:
+            QMessageBox.warning(self, '輸入錯誤', '拍數必須大於 0。')
+            return
+        self.nudge_selected_edge_by_beats(target, beats * sign)
+
+    def _ctx_edge_nudge_custom_ms_dialog(self, target: str, sign: int) -> None:
+        """自訂頭尾位移量：固定毫秒，不吃 BPM。"""
+        edge = '起始' if target == 'start' else '終止'
+        ms, ok = QInputDialog.getInt(
+            self, f'{edge}時間位移固定時間',
+            f'{edge}時間要{"延後" if sign > 0 else "提前"}幾毫秒？（不吃 BPM）',
+            50, 1, 9_999_999, 1)
+        if ok:
+            self.nudge_selected_edge_time(target, int(ms) * sign)
+
+    def _ctx_build_edge_nudge_menu(self, menu, target: str) -> None:
+        """固定提前／延後：只動 start 或只動 end，另一端不動（長度會變）。
+
+        結構和「整組平移」一樣——音符值 / 整拍 / 固定時間——差別在這裡移的是
+        單一邊，而且每顆各自位移、不會被對齊到同一點。
+        """
+        for title, sign in (('延後（往後）', +1), ('提前（往前）', -1)):
+            sub = menu.addMenu(title)
+            prefix = '+' if sign > 0 else '−'
+
+            for label, beats in self._CTX_SHIFT_VALUES:
+                a = sub.addAction(f'{prefix} {label}')
+                a.triggered.connect(
+                    lambda checked=False, _t=target, _b=beats * sign:
+                    self.nudge_selected_edge_by_beats(_t, _b))
+
+            beat_m = sub.addMenu('整拍')
+            for beats in self._CTX_SHIFT_BEATS:
+                a = beat_m.addAction(f'{prefix} {beats} 拍')
+                a.triggered.connect(
+                    lambda checked=False, _t=target, _b=float(beats) * sign:
+                    self.nudge_selected_edge_by_beats(_t, _b))
+            beat_m.addSeparator()
+            a = beat_m.addAction('自訂拍數…')
+            a.triggered.connect(
+                lambda checked=False, _t=target, _s=sign:
+                self._ctx_edge_nudge_custom_dialog(_t, _s))
+
+            ms_m = sub.addMenu('固定時間')
+            for ms in self._CTX_SHIFT_MS:
+                a = ms_m.addAction(f'{prefix} {ms} ms')
+                a.triggered.connect(
+                    lambda checked=False, _t=target, _ms=ms * sign:
+                    self.nudge_selected_edge_time(_t, _ms))
+            ms_m.addSeparator()
+            a = ms_m.addAction('自訂毫秒…')
+            a.triggered.connect(
+                lambda checked=False, _t=target, _s=sign:
+                self._ctx_edge_nudge_custom_ms_dialog(_t, _s))
+
+            sub.addSeparator()
+            a = sub.addAction('自訂拍數…')
+            a.triggered.connect(
+                lambda checked=False, _t=target, _s=sign:
+                self._ctx_edge_nudge_custom_dialog(_t, _s))
+
     def _ctx_build_shift_menu(self, menu, has_sel: bool) -> None:
         """整組平移：往後（延後）/ 往前（提前），各有音符值 / 整拍 / 固定時間三種。
 
@@ -6949,6 +7102,8 @@ class ChartView(QWidget):
             a = sub.addAction('自訂…')
             a.triggered.connect(
                 lambda checked=False, _t=target: self._ctx_set_edge_custom(_t))
+            self._ctx_build_edge_nudge_menu(
+                sub.addMenu('固定提前／延後'), target)
             if bounds:
                 sub.addSeparator()
                 a = sub.addAction(f'一律對齊到最早  ({bounds[key_min]} ms)')
