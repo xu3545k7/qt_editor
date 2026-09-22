@@ -14,6 +14,7 @@ QPainter 渲染的樂譜編輯器視圖元件，完整功能版。
 滑鼠
   - 左鍵拖曳：框選音符
   - 左鍵單擊 + Ctrl：加選/取消
+  - 放置模式：點空白處＝放音符；點既有音符＝選取它；Ctrl／Shift＝照編輯模式
   - 滾輪：自適應速度捲動
   - Ctrl + 左鍵拖曳：拖曳複製（16分音符 snap）
   - 右鍵：音符屬性對話框
@@ -5703,11 +5704,22 @@ class ChartView(QWidget):
                 return
 
         # ── 放置音符模式 ───────────────────────────────────────────
+        # 放置模式以前是「左鍵一律放音符」，所以選不到任何東西，選取之後才能用
+        # 的功能（框選、整批位移開始／結束、改寬度、裁殘響…）全都得先切回編輯
+        # 模式。現在只有「點空白處」才放音符：
+        #   * 點到既有音符 → 當成編輯（選取它）
+        #   * Ctrl / Shift → 交給編輯模式那套（加選、框選、範圍選取）
+        # 空白處的拖曳仍然是「放一顆並拉長度」，那是這個模式的主要用途。
         if self._note_input_mode and not self.alloc_active:
             if event.button() == Qt.LeftButton:
-                if not self._placement_blocked_at(pos):
+                if self._placement_blocked_at(pos):
+                    return
+                mods = event.modifiers()
+                edit_gesture = bool(mods & (Qt.ControlModifier | Qt.ShiftModifier))
+                if not edit_gesture and self._hit_test(pos) is None:
                     self._place_note_at(pos)
-                return
+                    return
+                # 落到下面的編輯流程
 
         # 預覽模式：允許選取（點擊/框選），其餘互動不開放
         if self.preview_mode:
@@ -5876,7 +5888,12 @@ class ChartView(QWidget):
 
         # 放置音符模式：記錄游標並更新 snap 指示線
         if self._note_input_mode:
-            blocked = self._placement_blocked_at(pos)
+            # 游標停在既有音符上時，按下去是「選取」不是「放置」，所以也不該
+            # 畫放置預覽——畫了會讓人以為按下去會多一顆。
+            blocked = (self._placement_blocked_at(pos)
+                       or (self._input_drag_note is None
+                           and not self._is_rubbing
+                           and self._hit_test(pos) is not None))
             if blocked and self._input_drag_note is None:
                 # 游標在鍵盤／踏板欄／強弱欄上：不畫預覽，按下去也不會放
                 if self._note_input_hover is not None:
