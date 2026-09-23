@@ -66,7 +66,7 @@ from statistics import median
 
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, pyqtSignal
 from PyQt5.QtGui import (
-    QColor, QFont, QImage, QPainter, QPainterPath, QPen, QBrush, QIcon,
+    QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QIcon,
     QKeyEvent, QLinearGradient,
     QMouseEvent, QPaintEvent, QPixmap, QPolygonF, QResizeEvent, QWheelEvent,
 )
@@ -84,6 +84,9 @@ from .models import (
 from .time_mapper import TimeMapper
 from .property_dialog import NotePropertyDialog
 from .i18n import t
+# 「把圖撐到實心尖端貼齊鍵道」的換算放在 `note_icons`：遊戲預覽貼的是同一套
+# 幀，兩邊各留一份的話總有一邊的音符會比另一邊窄。
+from .note_icons import art_fill_rect as _art_fill_rect
 
 # ---------------------------------------------------------------------------
 # 色彩常數
@@ -174,70 +177,6 @@ MIDI_CHANNEL_COLORS = [
     QColor(77, 182, 172),
     QColor(79, 195, 247),
 ]
-
-
-# 原版 note 幀左右尖端外面那圈柔邊要多淡才算「看不見」。w_r_03 最左邊 7 px
-# 的最高 alpha 只有 43，在深色底上肉眼等於沒有東西；到 x=7 才跳到 157。
-ART_SOLID_ALPHA = 128
-_ART_SPAN_CACHE: Dict[int, Tuple[float, float]] = {}
-
-
-def _art_solid_span(img: QPixmap) -> Tuple[float, float]:
-    """圖裡「真的看得見」的那一段佔全圖寬度的比例，回傳 (左, 右)，值域 0~1。
-
-    原版 note 幀是尖頭六邊形，兩端各留了一圈幾乎全透明的柔邊當抗鋸齒。把整張
-    圖貼滿鍵道的話，實心的尖端會停在離鍵道邊界約 5% 的地方，兩顆相鄰的音符
-    中間就永遠合不起來——設成 100% 寬也還是差一點。所以量出實心範圍，繪製時
-    把圖往外撐到讓**實心尖端**落在鍵道邊界上，溢出去的只有那圈看不見的柔邊。
-
-    整張圖掃 alpha 是 O(w×h)，密集譜上每幀做會很痛，但我們只要左右兩個邊界，
-    從兩側往內找到第一根「有實心像素」的直行就可以停，通常十幾行就結束。
-    結果依 `cacheKey()` 快取（同一張 QPixmap 換算一次就好）。
-    """
-    if img.isNull() or img.width() <= 0 or img.height() <= 0:
-        return 0.0, 1.0
-    ck = img.cacheKey()
-    span = _ART_SPAN_CACHE.get(ck)
-    if span is not None:
-        return span
-    qi = img.toImage().convertToFormat(QImage.Format_ARGB32)
-    w, h = qi.width(), qi.height()
-    bpl = qi.bytesPerLine()
-    ptr = qi.constBits()
-    ptr.setsize(bpl * h)
-    buf = bytes(ptr)
-
-    def solid(x: int) -> bool:
-        # ARGB32 在小端機器上的位元組序是 B,G,R,A → alpha 在每個像素的第 4 個
-        base = 4 * x + 3
-        return any(buf[y * bpl + base] >= ART_SOLID_ALPHA for y in range(h))
-
-    lo = 0
-    while lo < w and not solid(lo):
-        lo += 1
-    if lo >= w:                       # 整張都是柔邊/全透明 → 當成滿版
-        span = (0.0, 1.0)
-    else:
-        hi = w - 1
-        while hi > lo and not solid(hi):
-            hi -= 1
-        span = (lo / w, (hi + 1) / w)
-    _ART_SPAN_CACHE[ck] = span
-    return span
-
-
-def _art_fill_rect(rect: QRectF, img: QPixmap) -> QRectF:
-    """把 `rect` 換成「貼上去之後圖的實心部分剛好填滿 rect」的繪製矩形。
-
-    只撐水平方向：使用者要的是左右尖端互相碰到，上下是固定的音符高度，一起
-    撐的話反而會把長押頭撐出格子。
-    """
-    lo, hi = _art_solid_span(img)
-    solid = hi - lo
-    if solid <= 0.0 or solid >= 0.999:
-        return rect
-    width = rect.width() / solid
-    return QRectF(rect.left() - lo * width, rect.top(), width, rect.height())
 
 
 def _note_gradient(base: QColor, rect) -> QLinearGradient:
