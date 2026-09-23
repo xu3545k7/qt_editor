@@ -23,8 +23,7 @@ def note(start, end=None, *, hand=0, nt=0, lo=10, hi=12, hidden=False):
     n.hand = hand
     n.min_key, n.max_key = lo, hi
     n.pitch = 60
-    if hidden:
-        n.hidden = True
+    n.hidden = bool(hidden)
     return n
 
 
@@ -91,10 +90,36 @@ class GeometryTests(_CanvasCase):
 
 
 class WhatIsVisibleTests(_CanvasCase):
+    # ── 隱藏音符 ──────────────────────────────────────────────────────
+    # 隱藏音符不佔按鍵、玩家看不到，預覽的用途就是「這在遊戲裡長怎樣」。要濾
+    # 在入口（建構子與 `set_notes`）而不是繪製的時候：`_visible_notes`、
+    # `_held_lanes` 都各自讀 `self.notes`，一個一個加判斷遲早漏掉一處。
+    # （這幾條原本掛在已刪掉的 preview_window 上，規則跟著搬過來。）
+
     def test_hidden_notes_never_show_up(self):
-        # 隱藏音符只發聲、玩家看不到（和 preview_window 同一個理由）
         c = self.canvas([note(1000), note(1000, hidden=True)])
         self.assertEqual(len(c.notes), 1)
+
+    def test_set_notes_filters_them_too(self):
+        c = self.canvas()
+        c.set_notes([note(0), note(300, hidden=True), note(600)])
+        self.assertEqual(len(c.notes), 2)
+        self.assertFalse(any(getattr(n, 'hidden', False) for n in c.notes))
+
+    def test_a_chart_without_hidden_notes_is_untouched(self):
+        c = self.canvas([note(0), note(300), note(600)])
+        self.assertEqual(len(c.notes), 3)
+
+    def test_notes_without_the_attribute_survive(self):
+        bare = note(0)
+        del bare.hidden
+        self.assertEqual(len(self.canvas([bare]).notes), 1,
+                         'getattr 的預設值要是 False')
+
+    def test_all_hidden_leaves_an_empty_field(self):
+        c = self.canvas([note(0, hidden=True), note(300, hidden=True)])
+        self.assertEqual(c.notes, [])
+        self.assertEqual(c._held_lanes(), set())
 
     def test_notes_beyond_the_view_are_skipped(self):
         c = self.canvas([note(500), note(50_000)])
