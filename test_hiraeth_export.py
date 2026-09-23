@@ -770,14 +770,15 @@ class HoldTailOptionTests(unittest.TestCase):
                  for n in root.iter('note') if n.findtext('note_type') == '2']
         return result, holds
 
-    # 輸出時長押本來就照官方比例縮成 80%（見 build_pan_xml 的 hold_scale）
+    # 長押照畫面上的長度輸出，只有下一顆音符要求的間距會裁到它（以前這裡還會
+    # 再乘 80%，見 build_pan_xml 的說明）
     def test_default_trims_the_tail(self):
         _result, holds = self.build(80)
-        self.assertEqual(holds, [352])              # (4520 − 80 − 4000) × 0.8
+        self.assertEqual(holds, [440])              # 4520 − 80 − 4000
 
     def test_off_leaves_holds_as_they_are(self):
         result, holds = self.build(H.NO_HOLD_PROCESSING)
-        self.assertEqual(holds, [400])              # 500 × 0.8，沒有裁
+        self.assertEqual(holds, [500])              # 原本的長度，沒有裁
         self.assertTrue(any('沒有處理長條尾端' in line for line in result.notes), result.notes)
 
     def test_setting_helper(self):

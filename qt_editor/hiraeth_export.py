@@ -286,7 +286,7 @@ def copy_model(model: Any) -> Any:
     os.close(handle)
     saved = (model.current_file, model.dirty, model.file_format, getattr(model, 'pan_xml', False))
     try:
-        model.save_json(temp)          # hold_lengths_official 會一起寫進 JSON
+        model.save_json(temp)
         return load_chart(temp)
     finally:
         (model.current_file, model.dirty, model.file_format, model.pan_xml) = saved

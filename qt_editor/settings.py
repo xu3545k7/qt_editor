@@ -155,8 +155,6 @@ _DEFAULTS: dict[str, object] = {
     'hiraeth_process_hold_tails': True,
     # 輸出 ZIP 時譜面開頭要空幾小節（官方譜中位數就是 1 小節）
     'hiraeth_lead_in_bars': 1,
-    # 轉成官方格式（PAN XML、Hiraeth ZIP）時長押長度的比例（%）。JSON 不受影響。
-    'official_hold_length_pct': 80,
     # 曲庫管理：上次管理的曲庫、打包好的遊戲 exe
     'song_library_root': '',
     'game_exe_path': '',

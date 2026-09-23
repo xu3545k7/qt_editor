@@ -1409,10 +1409,6 @@ class NoteModel:
         # PAN 沒有的功能（Soft／Staccato、踏板、強弱記號）在介面上關掉。
         # JSON 才是原始檔，什麼都存得下。
         self.pan_xml: bool = False
-        # 記憶體裡的長押長度是不是「官方長度」：從官方格式 XML 讀進來的就是，
-        # JSON／MIDI／新譜不是。轉成官方格式時只有後者要縮（見 official_hold_scale），
-        # 不然開一份 XML 再存回 XML，每存一次就短一截。
-        self.hold_lengths_official: bool = False
         # 譜面事件 [[ms, type, value], ...]，照時間排序。type 0 是速度（value =
         # BPM × 100000），1～8 是音效參數，9 是區段標記，見 pan_format.EVENT_TYPES。
         self.events: List[List[int]] = []
@@ -2882,7 +2878,6 @@ class NoteModel:
 
         self.notes_tree = [GNote(ne, i) for i, ne in enumerate(nd.findall('note'))]
         self.pan_xml = True
-        self.hold_lengths_official = True
         self.events = self._read_events_from_xml()
         self._read_pedal_data_from_xml()
         self._read_dynamics_data_from_xml()
@@ -2977,8 +2972,6 @@ class NoteModel:
 
         self.file_format = 'json'
         self.pan_xml = False
-        self.hold_lengths_official = bool(
-            isinstance(data, dict) and data.get('hold_lengths_official'))
         self.root = None
         self.tree = None
         self.midi_data = None
@@ -3731,7 +3724,6 @@ class NoteModel:
         mid = open_midi(path)
         self.file_format = 'midi'
         self.pan_xml = False
-        self.hold_lengths_official = False
         self.events = []
         self.root = None
         self.tree = None
@@ -5940,29 +5932,15 @@ class NoteModel:
                 cleaned.append(ms)
         return cleaned
 
-    def official_hold_scale(self) -> float:
-        """轉成官方格式時長押長度要乘多少。
-
-        MIDI／JSON 的長度是聲音的長度，官方譜的長押比那短。預設 80%，偏好設定
-        可以改；已經是官方長度的（從官方 XML 讀進來）不縮，JSON 本身也不動。
-        """
-        if self.hold_lengths_official:
-            return 1.0
-        try:
-            from .settings import settings as _st
-            pct = float(_st.get('official_hold_length_pct', 80))
-        except Exception:                       # noqa: BLE001
-            pct = 80.0
-        return max(0.1, min(1.0, pct / 100.0))
-
-    def build_pan_xml(self, hold_scale: Optional[float] = None) -> ET.Element:
+    def build_pan_xml(self) -> ET.Element:
         """組出 PAN 相容的整棵 XML（不動 self.root，也不改音符類型與長度）。
 
-        `hold_scale` 不給就用 `official_hold_scale()`：長押（note_type 帶 0x02）
-        的長度乘上這個比例，只影響寫出去的檔案。
+        長押的長度**照畫面上的樣子寫出去**。以前這裡會把非官方來源的譜乘上
+        `official_hold_length_pct`（預設 80%），理由是「MIDI 的長度是聲音長度、
+        官方譜的長押比較短」；但這讓製譜器變成不是所見即所得——把長條尾端對齊
+        小節線，進遊戲卻短了 20%（一小節 2000ms 的長條差 400ms），而且畫面上
+        每一條長押都比遊戲裡長 25%。
         """
-        if hold_scale is None:
-            hold_scale = self.official_hold_scale()
         from .pan_format import (DEFAULT_TRACKS, FIELDS, default_track_for_hand,
                                  pan_note_type, typed)
 
@@ -6031,8 +6009,6 @@ class NoteModel:
                 lo, hi = min(lo, hi), max(lo, hi)
                 start, end = int(n.start), max(int(n.start), int(n.end))
                 nt = pan_note_type(n.note_type)
-                if nt & 0x02 and hold_scale < 1.0 and end > start:
-                    end = start + max(1, int(round((end - start) * hold_scale)))
                 slide = bool(nt & 0x04)
                 hand = int(n.hand) if int(n.hand) in (0, 1, 2) else 0
                 sp = pitch_index(n)
@@ -6233,11 +6209,6 @@ class NoteModel:
             }
         else:
             meta.pop('dynamics_data', None)
-
-        if self.hold_lengths_official:
-            meta['hold_lengths_official'] = True
-        else:
-            meta.pop('hold_lengths_official', None)
 
         if self.events:
             meta['event_data'] = [{'ms': int(ms), 'type': int(ty), 'value': int(value)}
@@ -6738,7 +6709,6 @@ class NoteModel:
         model = cls()
         model.file_format   = 'xml'
         model.pan_xml       = False          # 新譜預設存 JSON
-        model.hold_lengths_official = False
         model.events        = []
         model.current_file  = None
         model.xml_lane_index_base = EXTERNAL_LANE_BASE

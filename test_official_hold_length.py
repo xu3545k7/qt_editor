@@ -1,7 +1,10 @@
-"""轉成官方格式（PAN XML／Hiraeth ZIP）時長押長度預設縮成 80%，JSON 不變。
+"""長押的長度照畫面上的樣子寫出去：製譜器是所見即所得。
 
-JSON／MIDI 的長度是聲音的長度，官方譜的長押比較短。只縮「長度還不是官方長度」
-的譜：從官方 XML 讀進來的不縮，否則開 XML 再存回去每存一次短 20%。
+以前轉成官方格式（PAN XML／Hiraeth ZIP）時會把「長度還不是官方長度」的譜
+乘上 `official_hold_length_pct`（預設 80%），理由是 MIDI 的長度是聲音長度、
+官方譜的長押比較短。代價是製譜器不再所見即所得：使用者把長條尾端對齊小節線，
+進遊戲卻短 20%（一小節 2000ms 的長條差 400ms），而且畫面上每條長押都比遊戲裡
+長 25%。現在不縮了，所以這裡測的是「長度一個 ms 都不能動」。
 """
 
 import json
@@ -12,7 +15,6 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from qt_editor.models import GNote, NoteModel
-from qt_editor.settings import settings
 
 
 def chart():
@@ -37,24 +39,40 @@ def durations(path):
             for n in root.iter('note')]
 
 
-class OfficialHoldLengthTests(unittest.TestCase):
+def ends(path):
+    root = ET.parse(path).getroot()
+    return [int(n.findtext('end_timing_msec')) for n in root.iter('note')]
+
+
+class HoldLengthIsWhatYouSeeTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self._saved = settings._data.get('official_hold_length_pct')
-        settings._data['official_hold_length_pct'] = 80
 
     def tearDown(self):
-        settings._data['official_hold_length_pct'] = self._saved if self._saved is not None else 80
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def path(self, name):
         return os.path.join(self.dir, name)
 
-    def test_holds_are_80_percent_in_xml(self):
+    def test_xml_keeps_the_lengths_on_screen(self):
         m = chart()
         m.save_xml(self.path('a.xml'))
         self.assertEqual(durations(self.path('a.xml')),
-                         [(2, 800), (0, 100), (4, 1000), (10, 800)])
+                         [(2, 1000), (0, 100), (4, 1000), (10, 1000)])
+
+    def test_a_tail_on_a_barline_stays_on_the_barline(self):
+        """使用者回報的情況：對齊小節線的長條，進遊戲卻沒對齊。"""
+        m = NoteModel.create_new('t', 120.0, 20.0, 4)       # 一小節 2000ms
+        n = GNote(None, 0)
+        n.start, n.end, n.gate = 2000, 4000, 2000
+        n.pitch, n.hand, n.note_type = 60, 0, 2
+        n.min_key, n.max_key = 10, 12
+        m.notes_tree = [n]
+        m.rebuild_display_cache()
+        bar_start, bar_end = m.get_measure_time_range(1)
+        self.assertEqual((bar_start, bar_end), (2000, 4000))
+        m.save_xml(self.path('a.xml'))
+        self.assertEqual(ends(self.path('a.xml')), [bar_end])
 
     def test_the_chart_in_memory_and_json_are_untouched(self):
         m = chart()
@@ -65,35 +83,40 @@ class OfficialHoldLengthTests(unittest.TestCase):
             notes = json.load(fh)['notes']
         self.assertEqual(notes[0]['endTime'] - notes[0]['startTime'], 1000)
 
-    def test_saving_xml_again_does_not_shrink_twice(self):
+    def test_round_trips_never_change_a_length(self):
         m = chart()
         m.save_xml(self.path('a.xml'))
-        m.save_xml(self.path('a.xml'))                  # 同一份（記憶體還是 JSON 長度）
-        self.assertEqual(durations(self.path('a.xml'))[0], (2, 800))
-        back = NoteModel()
-        back.load_xml(self.path('a.xml'))               # 讀進來的是官方長度
-        back.save_xml(self.path('b.xml'))
-        self.assertEqual(durations(self.path('b.xml'))[0], (2, 800))
+        first = durations(self.path('a.xml'))
 
-    def test_xml_to_json_to_xml_does_not_shrink_twice(self):
-        m = chart()
-        m.save_xml(self.path('a.xml'))
-        back = NoteModel()
+        m.save_xml(self.path('a.xml'))                  # 同一份存兩次
+        self.assertEqual(durations(self.path('a.xml')), first)
+
+        back = NoteModel()                              # XML → XML
         back.load_xml(self.path('a.xml'))
-        back.save_json(self.path('b.json'))
+        back.save_xml(self.path('b.xml'))
+        self.assertEqual(durations(self.path('b.xml')), first)
+
+        back.save_json(self.path('b.json'))             # XML → JSON → XML
         again = NoteModel()
         again.load_json(self.path('b.json'))
         again.save_xml(self.path('c.xml'))
-        self.assertEqual(durations(self.path('c.xml'))[0], (2, 800))
+        self.assertEqual(durations(self.path('c.xml')), first)
 
-    def test_the_setting_controls_the_ratio(self):
-        settings._data['official_hold_length_pct'] = 100
-        m = chart()
-        m.save_xml(self.path('a.xml'))
-        self.assertEqual(durations(self.path('a.xml'))[0], (2, 1000))
+    def test_no_stale_setting_can_shrink_holds_again(self):
+        """舊的 settings.json 裡還留著 80 的話，也不能再影響輸出。"""
+        from qt_editor.settings import settings
 
-    def test_hiraeth_zip_uses_it_too(self):
+        settings._data['official_hold_length_pct'] = 50
+        try:
+            m = chart()
+            m.save_xml(self.path('a.xml'))
+            self.assertEqual(durations(self.path('a.xml'))[0], (2, 1000))
+        finally:
+            settings._data.pop('official_hold_length_pct', None)
+
+    def test_hiraeth_zip_keeps_them_too(self):
         import zipfile
+
         from qt_editor import hiraeth_export as H
         m = chart()
         m.notes_tree = m.notes_tree[:2]                  # 長押 + tap
@@ -108,7 +131,7 @@ class OfficialHoldLengthTests(unittest.TestCase):
         self.assertEqual(result.error, '')
         with zipfile.ZipFile(result.zip_path) as archive:
             archive.extract('expert.xml', self.dir)
-        self.assertEqual(durations(os.path.join(self.dir, 'expert.xml'))[0], (2, 800))
+        self.assertEqual(durations(os.path.join(self.dir, 'expert.xml'))[0], (2, 1000))
 
 
 if __name__ == '__main__':

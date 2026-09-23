@@ -198,14 +198,8 @@ class SettingsDialog(QDialog):
             bool(settings.get('export_auto_process_audio', True)))
         files.addRow(QLabel('匯出音訊處理'), self._audio_auto_chk)
 
-        self._hold_pct_spin = QSpinBox()
-        self._hold_pct_spin.setRange(10, 100)
-        self._hold_pct_spin.setSuffix(' %')
-        self._hold_pct_spin.setValue(int(settings.get('official_hold_length_pct', 80)))
-        self._hold_pct_spin.setToolTip(
-            '存成 XML（PAN 相容）或輸出 Hiraeth ZIP 時，長押長度乘上這個比例。' + chr(10) +
-            'JSON 原始檔不受影響；本來就是從官方 XML 讀進來的譜不會再縮。')
-        files.addRow(QLabel('轉官方格式的長押長度'), self._hold_pct_spin)
+        # 這裡以前有「轉官方格式的長押長度」（預設 80%）。長押現在照畫面上的
+        # 長度寫出去、不再縮短，製譜器就是所見即所得（見 `build_pan_xml`）。
 
         advanced = section(general, '進階')
 
@@ -591,7 +585,6 @@ class SettingsDialog(QDialog):
         settings.set('undo_memory_mb', int(self._undo_spin.value()))
         settings.set('autosave_enabled', bool(self._autosave_chk.isChecked()))
         settings.set('autosave_interval_min', int(self._autosave_spin.value()))
-        settings.set('official_hold_length_pct', int(self._hold_pct_spin.value()))
         settings.set('audio_latency_ms', int(self._latency_spin.value()))
         # 深色模式即時套用，不需重開
         dark = bool(self._dark_chk.isChecked())

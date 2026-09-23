@@ -292,15 +292,23 @@ class RoundTripTests(unittest.TestCase):
         again = self.notes_of(os.path.join(folder_out, 'real.xml'))
         self.assertEqual(again, original, '搬回來再送回去，音符時間和長度要一模一樣')
 
-    def test_the_official_flag_is_kept_in_the_json(self):
+    def test_the_json_in_the_library_keeps_the_lengths(self):
+        """搬進曲庫的 JSON 要留住原本的長度。
+
+        以前這裡驗的是 JSON 裡有沒有 `hold_lengths_official` 旗標——那個旗標只
+        為了「輸出時不要把長押縮兩次」而存在。長押現在照畫面上的長度輸出、完全
+        不縮，旗標也就沒了，真正要守的是長度本身。
+        """
         import json as _json
+        original = self.notes_of(chart_xml(self.hiraeth))
         S.sync(self.library_root, self.hiraeth, library=self.lib,
                renderer=lambda model: (b'\0\0\0\0' * 44100, 44100))
         chart = os.path.join(self.library_root, 'ハノン 120', 'Real', 'ハノン 120.json')
         with io.open(chart, encoding='utf-8') as fh:
             data = _json.load(fh)
-        self.assertTrue(data.get('hold_lengths_official'),
-                        '從官方 XML 轉來的譜要標記起來，再輸出才不會又縮一次長押')
+        self.assertNotIn('hold_lengths_official', data)
+        self.assertEqual([(int(n['startTime']), int(n['endTime'])) for n in data['notes']],
+                         original)
 
 
 class GamePickerTests(unittest.TestCase):
