@@ -55,6 +55,7 @@ from .new_chart_dialog import NewChartDialog
 from .playback_offset_dialog import PlaybackOffsetDialog
 from .align_time_dialog import AlignTimeDialog
 from .hold_length_dialog import HoldLengthDialog
+from .measure_count_dialog import MeasureCountDialog
 from .export_song_dialog import ExportSongDialog, SONGS_ROOT
 
 # 可選：MIDI 轉換器
@@ -2687,7 +2688,7 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def add_measure_dialog(self) -> None:
-        """新增小節：詢問新小節的 BPM，然後在末尾追加。"""
+        """新增小節：詢問要幾個、新小節的 BPM，然後在末尾追加。"""
         m = self.view.model
         # 只看有沒有拍點資料。以前還檢查 `m.root is None`，等於把 JSON 譜面
         # （遊戲匯出的 .json，拍點存在 json_meta['beat_timings']）整個擋掉——
@@ -2698,24 +2699,26 @@ class MainWindow(QMainWindow):
             return
 
         cur_bpm = m.bpm
-        bpm, ok = QInputDialog.getDouble(
-            self,
-            t('dlg_add_measure_title'),
-            t('dlg_add_measure_label', cur_bpm),
-            cur_bpm, 10.0, 999.0, 2,
-        )
-        if not ok:
+        dlg = MeasureCountDialog(
+            self, t('dlg_add_measure_title'),
+            t('dlg_add_measure_prompt', m.measure_count(), cur_bpm),
+            bpm=cur_bpm)
+        if dlg.exec_() != QDialog.Accepted:
             return
+        count = dlg.count()
         try:
-            m.add_measure(bpm)
+            m.push_history()
+            m.add_measure(dlg.bpm(), count=count)
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.update()
+            self.view.note_edited.emit()
+            self.statusBar().showMessage(t('status_measures_added', count), 5000)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
 
     def insert_measure_at(self, measure_idx: int) -> None:
-        """在指定小節**之前**插入一個空白小節，後面整段往後推（右鍵小節選單）。
+        """在指定小節**之前**插入空白小節（可一次插多個），後面整段往後推。
 
         和工具列的「新增小節」不同：那個是接在譜尾，這個是插在中間。
         """
@@ -2731,17 +2734,16 @@ class MainWindow(QMainWindow):
         if cur_bpm <= 0:
             cur_bpm = float(m.bpm)
 
-        bpm, ok = QInputDialog.getDouble(
-            self, '插入空白小節',
-            f'插在第 {measure_idx + 1} 小節之前。新小節的 BPM（決定小節長度）：',
-            cur_bpm, 10.0, 999.0, 2,
-        )
-        if not ok:
+        dlg = MeasureCountDialog(
+            self, t('dlg_insert_measure_title'),
+            t('dlg_insert_measure_prompt', measure_idx + 1), bpm=cur_bpm)
+        if dlg.exec_() != QDialog.Accepted:
             return
+        count = dlg.count()
         was_dirty = m.dirty
         m.push_history()
         try:
-            if not m.insert_measure(measure_idx, bpm):
+            if not m.insert_measure(measure_idx, dlg.bpm(), count=count):
                 m.discard_last_history()
                 m.dirty = was_dirty
                 QMessageBox.warning(self, t('dlg_warn'), '無法插入小節。')
@@ -2752,7 +2754,7 @@ class MainWindow(QMainWindow):
             self.view.note_edited.emit()
             self._rebuild_hit_times()
             self.statusBar().showMessage(
-                '已在第 %d 小節前插入空白小節' % (measure_idx + 1), 5000)
+                t('status_measures_inserted', measure_idx + 1, count), 5000)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
 
@@ -2769,7 +2771,7 @@ class MainWindow(QMainWindow):
         self.delete_measure_at(m.get_measure_at_ms(center_ms))
 
     def delete_measure_at(self, measure_idx: int) -> None:
-        """刪除指定小節（含其中音符），後面整段往前補上。"""
+        """從指定小節起刪除小節（可一次刪多個，含其中音符），後面整段往前補上。"""
         m = self.view.model
         if not m.get_beat_entries():        # XML / JSON 都可以，只要有拍點
             QMessageBox.warning(self, t('dlg_warn'),
@@ -2782,33 +2784,34 @@ class MainWindow(QMainWindow):
                                 t('dlg_delete_measure_no_data'))
             return
 
-        # 計算小節內的音符數
-        n_notes = sum(
-            1 for n in m.notes_tree
-            if start_ms <= n.start < end_ms
-        )
+        total = m.measure_count()
         display_bar = measure_idx + 1   # 1-indexed
 
-        if n_notes > 0:
-            msg = t('dlg_delete_measure_msg',
-                    display_bar, start_ms, end_ms, n_notes)
-        else:
-            msg = t('dlg_delete_measure_empty',
-                    display_bar, start_ms, end_ms)
+        def summary(count: int) -> str:
+            """這個數量會刪到哪一段、掃掉幾顆音符（隨 spinbox 即時更新）。"""
+            last = min(total - 1, measure_idx + count - 1)
+            _s, last_end = m.get_measure_time_range(last)
+            stop_ms = last_end if last_end is not None else end_ms
+            n_notes = sum(1 for n in m.notes_tree
+                          if start_ms <= n.start < stop_ms)
+            key = ('dlg_delete_measure_range' if n_notes
+                   else 'dlg_delete_measure_range_empty')
+            args = [display_bar, last + 1, int(start_ms), int(stop_ms)]
+            if n_notes:
+                args.append(n_notes)
+            return t(key, *args)
 
-        reply = QMessageBox.question(
-            self,
-            t('dlg_delete_measure_title'),
-            msg,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+        dlg = MeasureCountDialog(
+            self, t('dlg_delete_measure_title'),
+            t('dlg_delete_measure_prompt', display_bar),
+            max_count=max(1, total - measure_idx), summary=summary)
+        if dlg.exec_() != QDialog.Accepted:
             return
+        count = dlg.count()
 
         try:
             m.push_history()
-            deleted = m.delete_measure(measure_idx)
+            deleted = m.delete_measure(measure_idx, count=count)
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.selected.clear()
@@ -2817,7 +2820,7 @@ class MainWindow(QMainWindow):
             self.view.selection_changed.emit(0)
             self._rebuild_hit_times()
             self.statusBar().showMessage(
-                '已刪除第 %d 小節（含 %d 顆音符）' % (display_bar, deleted or 0), 5000)
+                t('status_measures_deleted', display_bar, count, deleted or 0), 5000)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
 
