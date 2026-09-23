@@ -7,4 +7,4 @@ spec 是用讀檔 + ast 的方式取值、不是 import 這個模組，所以這
 需要第三方套件的東西（打包時 PyInstaller 的環境不一定載得動 PyQt5）。
 """
 
-__version__ = '1.0.7'
+__version__ = '1.0.8'
