@@ -648,10 +648,12 @@ def wav_path_for(audio_path: str) -> str:
 
 def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
                log: Log, progress: Progress, device: str = 'auto',
-               root: Optional[str] = None) -> Dict:
+               root: Optional[str] = None, want_wav: bool = True) -> Dict:
     """音檔 → MIDI。回傳 worker 的 done 訊息（notes / pedals / device / elapsed…）。
 
     非 WAV 的輸入順便輸出一份同名 WAV（已經有了就不覆蓋），結果的 `wav` 欄位是它。
+    `want_wav=False` 就不解那份 WAV——只想要 MIDI 檔的時候，沒必要在人家的音樂
+    資料夾裡留一個幾十 MB 的副產物；`wav` 欄位仍然指向已經存在的同名 WAV。
     """
     root = root or env_root()
     if not is_installed(root):
@@ -692,7 +694,7 @@ def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
             '--device', device]
     wav = wav_path_for(audio_path)
     tmp_wav = ''
-    if wav != audio_path and not os.path.isfile(wav):
+    if want_wav and wav != audio_path and not os.path.isfile(wav):
         tmp_wav = wav + '.part.wav'
         args += ['--wav-out', tmp_wav]
     code = _Proc(cancel).run(args, on_line)

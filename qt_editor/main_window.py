@@ -1201,6 +1201,9 @@ class MainWindow(QMainWindow):
         # 音檔 → MIDI（ByteDance 鋼琴轉譜模型），轉完走一般的 MIDI 匯入
         ai_sub = file_m.addMenu('AI 轉譜（音檔 → 譜面）')
         self._add_action(ai_sub, '從音檔轉譜（mp3／wav…）…', self.transcribe_audio_ai)
+        # 同一個模型，但停在 MIDI：拿去別的 DAW 用，或先存著以後再排譜
+        self._add_action(ai_sub, '只轉成 MIDI 檔（mp3／wav… → .mid）…',
+                         self.convert_audio_to_midi)
         self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe)
         file_m.addSeparator()
         self._add_action(file_m, t('action_save'), self.save_file, QKeySequence.Save)
@@ -3552,6 +3555,80 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, t('dlg_load_fail_title'), t('dlg_load_fail_msg', e))
 
+    def _pick_transcribe_audio(self, title: str) -> str:
+        """確認轉譜環境、選一個音檔、擋掉明顯不能轉的。取消或不能用時回空字串。
+
+        `title` 是出錯時對話框的標題（純轉檔與轉成譜面是兩個不同的入口）。
+        """
+        from .ai_transcribe_dialog import ensure_installed
+
+        if not ensure_installed(self):
+            return ''
+        start_dir = os.path.dirname(getattr(self.audio, 'audio_path', '') or
+                                    self.view.model.current_file or '')
+        path, _ = QFileDialog.getOpenFileName(
+            self, '選擇要轉譜的音檔', start_dir,
+            '音檔 (*.wav *.flac *.ogg *.mp3);;All files (*)')
+        if not path:
+            return ''
+        if os.path.isfile(path) and os.path.getsize(path) == 0:
+            QMessageBox.warning(
+                self, title,
+                '這個音檔是空的（0 位元組），多半是下載沒有成功，請重新下載：\n\n%s' % path)
+            return ''
+
+        # 模型只認獨奏鋼琴：挑了整首混音、旁邊卻有鋼琴分軌時建議改用分軌
+        stem, ext = os.path.splitext(path)
+        piano_stem = stem + '_piano' + ext
+        if not stem.lower().endswith('_piano') and os.path.isfile(piano_stem):
+            reply = QMessageBox.question(
+                self, title,
+                '同一個資料夾裡有鋼琴分軌：\n\n　%s\n\n模型只認獨奏鋼琴，用分軌轉出來會乾淨很多。'
+                '要改用分軌嗎？' % os.path.basename(piano_stem),
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+            if reply == QMessageBox.Cancel:
+                return ''
+            if reply == QMessageBox.Yes:
+                path = piano_stem
+        return path
+
+    def convert_audio_to_midi(self) -> None:
+        """mp3／wav… → MIDI 檔，就這樣：不設 BPM、不吸附小節線、不載入編輯器。
+
+        `transcribe_audio_ai` 是「要一份能編的譜」，這支是「只要那個 .mid」——
+        拿去別的 DAW 用、或先存起來以後再排譜。存檔位置自己挑（預設和音檔同
+        一個資料夾），也不會順便解出一份 WAV 佔空間。
+        """
+        from . import ai_transcribe as AT
+        from .ai_transcribe_dialog import run_transcribe
+
+        path = self._pick_transcribe_audio('音檔轉 MIDI')
+        if not path:
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, '轉出的 MIDI 存到哪裡',
+            os.path.splitext(path)[0] + '.ai.mid', 'MIDI (*.mid);;All files (*)')
+        if not out:
+            return
+        if not os.path.splitext(out)[1]:
+            out += '.mid'
+        try:
+            result = run_transcribe(self, path, out, want_wav=False)
+        except OSError as exc:                  # 選的資料夾寫不進去之類
+            QMessageBox.critical(self, '音檔轉 MIDI 失敗', str(exc))
+            return
+        if not result:
+            return                              # 取消或失敗，run_transcribe 已經報過了
+        if not result.get('notes'):
+            QMessageBox.information(
+                self, '音檔轉 MIDI', '沒有轉出任何音符（音檔裡可能沒有鋼琴聲）。')
+            return
+        QMessageBox.information(
+            self, '音檔轉 MIDI',
+            '已轉出 %d 顆音、%d 段踏板（%s，%.0f 秒）：\n\n%s' % (
+                result['notes'], result.get('pedals', 0),
+                AT.device_label(result.get('device', '')), result.get('elapsed', 0), out))
+
     def transcribe_audio_ai(self) -> None:
         """音檔 → AI 鋼琴轉譜成 MIDI → 設 BPM／吸附小節線 → 走一般的開 MIDI 流程。
 
@@ -3559,38 +3636,15 @@ class MainWindow(QMainWindow):
         設了 BPM 的話改寫成 `歌名.ai.<BPM>bpm.mid`，音檔開頭補靜音（`_lead+N.wav`）
         讓第一小節落在小節線上；mp3 等格式轉譜時已順便解碼成同名 WAV。
         載入後把那份 WAV 掛成背景音樂，一開就對得上。
+
+        只想要 MIDI 檔、不要譜面的話用 `convert_audio_to_midi`。
         """
         from . import ai_transcribe as AT
-        from .ai_transcribe_dialog import ensure_installed, run_transcribe
+        from .ai_transcribe_dialog import run_transcribe
 
-        if not ensure_installed(self):
-            return
-        start_dir = os.path.dirname(getattr(self.audio, 'audio_path', '') or
-                                    self.view.model.current_file or '')
-        path, _ = QFileDialog.getOpenFileName(
-            self, '選擇要轉譜的音檔', start_dir,
-            '音檔 (*.wav *.flac *.ogg *.mp3);;All files (*)')
+        path = self._pick_transcribe_audio('AI 轉譜')
         if not path:
             return
-        if os.path.isfile(path) and os.path.getsize(path) == 0:
-            QMessageBox.warning(
-                self, 'AI 轉譜',
-                '這個音檔是空的（0 位元組），多半是下載沒有成功，請重新下載：\n\n%s' % path)
-            return
-
-        # 模型只認獨奏鋼琴：挑了整首混音、旁邊卻有鋼琴分軌時建議改用分軌
-        stem, ext = os.path.splitext(path)
-        piano_stem = stem + '_piano' + ext
-        if not stem.lower().endswith('_piano') and os.path.isfile(piano_stem):
-            reply = QMessageBox.question(
-                self, 'AI 轉譜',
-                '同一個資料夾裡有鋼琴分軌：\n\n　%s\n\n模型只認獨奏鋼琴，用分軌轉出來會乾淨很多。'
-                '要改用分軌嗎？' % os.path.basename(piano_stem),
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
-            if reply == QMessageBox.Cancel:
-                return
-            if reply == QMessageBox.Yes:
-                path = piano_stem
 
         out = AT.default_output_path(path)
         reuse = False

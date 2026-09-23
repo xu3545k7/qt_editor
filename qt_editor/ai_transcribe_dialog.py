@@ -239,12 +239,17 @@ def run_install(parent, variant: Optional[str] = None) -> bool:
     return True
 
 
-def run_transcribe(parent, audio_path: str, output_path: str) -> Optional[Dict]:
-    """跑轉譜；成功回傳 worker 的結果（notes / pedals / device / elapsed），否則 None。"""
+def run_transcribe(parent, audio_path: str, output_path: str,
+                   want_wav: bool = True) -> Optional[Dict]:
+    """跑轉譜；成功回傳 worker 的結果（notes / pedals / device / elapsed），否則 None。
+
+    `want_wav=False`：非 WAV 的輸入不順便解一份同名 WAV（只要 MIDI 檔的時候用）。
+    """
     hint = '%s\n\n%s' % (os.path.basename(audio_path), SOLO_PIANO_HINT)
     dlg = TaskDialog(parent, 'AI 轉譜', hint,
-                     lambda cancel, log, progress: AT.transcribe(audio_path, output_path,
-                                                                 cancel, log, progress))
+                     lambda cancel, log, progress: AT.transcribe(
+                         audio_path, output_path, cancel, log, progress,
+                         want_wav=want_wav))
     dlg.exec_()
     if dlg.result_value is None and dlg.error:
         # 失敗時視窗留著讓使用者看紀錄，關掉後再給一個簡短的錯誤框

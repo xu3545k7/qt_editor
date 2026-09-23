@@ -144,6 +144,38 @@ class TranscribeProtocolTests(_FakeEnv):
             self.assertEqual(fh.read(), b'RIFF')
         self.assertFalse(os.path.exists(wav + '.part.wav'))
 
+    def test_want_wav_false_leaves_no_wav_beside_the_mp3(self):
+        # 「只轉成 MIDI 檔」：使用者的音樂資料夾裡不該多出一個幾十 MB 的副產物
+        mp3 = os.path.join(self.root, 'song.mp3')
+        with open(mp3, 'wb') as fh:
+            fh.write(b'ID3')
+        with open(mp3 + '.mode', 'w') as fh:
+            fh.write('ok')
+        out = os.path.join(self.root, '轉出來的.mid')
+        result = AT.transcribe(mp3, out, threading.Event(), self.logs.append,
+                               lambda *a: None, root=self.root, want_wav=False)
+        self.assertTrue(os.path.isfile(out))
+        self.assertEqual(result['notes'], 12)
+        self.assertEqual(result['wav'], '')
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'song.wav')))
+
+    def test_want_wav_false_still_reports_an_existing_wav(self):
+        # 上次轉過留下的 WAV 還在：不重解，但仍然告訴呼叫端它在哪
+        mp3 = os.path.join(self.root, 'song.mp3')
+        with open(mp3, 'wb') as fh:
+            fh.write(b'ID3')
+        with open(mp3 + '.mode', 'w') as fh:
+            fh.write('ok')
+        wav = os.path.join(self.root, 'song.wav')
+        with open(wav, 'wb') as fh:
+            fh.write(b'mine')
+        result = AT.transcribe(mp3, os.path.join(self.root, 'x.mid'), threading.Event(),
+                               self.logs.append, lambda *a: None, root=self.root,
+                               want_wav=False)
+        self.assertEqual(result['wav'], wav)
+        with open(wav, 'rb') as fh:
+            self.assertEqual(fh.read(), b'mine')
+
     def test_existing_wav_is_not_overwritten(self):
         mp3 = os.path.join(self.root, 'song.mp3')
         with open(mp3, 'wb') as fh:
