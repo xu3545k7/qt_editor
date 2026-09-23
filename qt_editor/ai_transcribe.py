@@ -209,11 +209,15 @@ def estimated_download_mb(variant: str) -> int:
 
 
 def estimated_disk_mb(variant: str) -> int:
-    """裝好後的大小（CUDA 版實測 torch 2.11+cu128 約 4.9GB，CUDA 函式庫佔大半）。"""
+    """裝好後的大小。
+
+    CUDA 版實測 torch 2.11+cu128 約 4.9GB（CUDA 函式庫佔大半）；mac 版實測
+    torch 2.8 約 818MB，留一點餘裕寫 900。
+    """
     if variant == 'cuda':
         return 5000
     if P.IS_MAC:
-        return 1600
+        return 900
     return 1500
 
 
@@ -324,7 +328,7 @@ def _host_python_version(exe: str) -> tuple:
     try:
         out = subprocess.run(
             [exe, '-c', 'import venv, sys; print("%d.%d" % sys.version_info[:2])'],
-            capture_output=True, text=True, timeout=60, env=_child_env(),
+            capture_output=True, text=True, timeout=20, env=_child_env(),
             creationflags=_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return ()
@@ -388,23 +392,25 @@ def _install_venv(root: str, cancel: threading.Event, log: Log, progress: Progre
     exe = python_exe(root)
     if os.path.isfile(exe):
         log('Python 虛擬環境已存在，略過。')
-        return
-    host = find_host_python()
-    if not host:
-        raise RuntimeError(
-            '找不到可以用的 Python %d.%d 以上（轉譜環境要拿它建虛擬環境）。\n'
-            'macOS 請先裝一個，例如：brew install python@3.12' % MIN_HOST_PYTHON)
-    target = os.path.dirname(os.path.dirname(exe))
-    log('用 %s 建立虛擬環境…' % host)
-    progress('python', 0, 0)
-    if os.path.isdir(target):
-        shutil.rmtree(target)           # 上次建到一半的不要留著
-    code = _Proc(cancel).run([host, '-m', 'venv', target], log)
-    if code != 0:
-        raise RuntimeError('建立虛擬環境失敗（代碼 %d）。' % code)
-    if not os.path.isfile(exe):
-        raise RuntimeError('虛擬環境建好了卻找不到直譯器：%s' % exe)
-    # 系統附的 pip 可能太舊，認不出新的輪子標籤
+    else:
+        host = find_host_python()
+        if not host:
+            raise RuntimeError(
+                '找不到可以用的 Python %d.%d 以上（轉譜環境要拿它建虛擬環境）。\n'
+                'macOS 請先裝一個，例如：brew install python@3.12' % MIN_HOST_PYTHON)
+        target = os.path.dirname(os.path.dirname(exe))
+        log('用 %s 建立虛擬環境…' % host)
+        progress('python', 0, 0)
+        if os.path.isdir(target):
+            shutil.rmtree(target)       # 上次建到一半的不要留著
+        code = _Proc(cancel).run([host, '-m', 'venv', target], log)
+        if code != 0:
+            raise RuntimeError('建立虛擬環境失敗（代碼 %d）。' % code)
+        if not os.path.isfile(exe):
+            raise RuntimeError('虛擬環境建好了卻找不到直譯器：%s' % exe)
+    # 系統附的 pip 可能太舊，認不出新的輪子標籤（Python 3.9 帶的是 21.x）。
+    # 這一步要在「venv 已經存在」的續裝路徑上也跑到——放在上面的 else 裡面的
+    # 話，中途失敗再裝一次就永遠跳過，舊 pip 會一直留著。
     _pip(root, ['--upgrade', 'pip'], cancel, log, progress, 'pip')
 
 

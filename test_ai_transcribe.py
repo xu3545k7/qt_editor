@@ -286,12 +286,17 @@ class InstallPythonTests(unittest.TestCase):
             exe = AT.python_exe(self.root)
             os.makedirs(os.path.dirname(exe))
             open(exe, 'wb').close()
-            looked = []
+            looked, pip_args = [], []
             with mock.patch.object(AT, 'find_host_python',
-                                   lambda: looked.append(1) or ''):
+                                   lambda: looked.append(1) or ''), \
+                    mock.patch.object(AT, '_pip',
+                                      lambda root, args, *a: pip_args.append(args)):
                 AT._install_python(self.root, threading.Event(), lambda m: None,
                                    lambda *a: None)
         self.assertEqual(looked, [])
+        # 續裝（venv 已存在）時 pip 的升級還是要跑：放在建立分支裡面的話，
+        # 第一次裝到一半失敗後就永遠跳過，舊 pip 會一直留著
+        self.assertIn(['--upgrade', 'pip'], pip_args)
 
 
 class PipFlagTests(unittest.TestCase):

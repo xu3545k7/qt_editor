@@ -7167,50 +7167,51 @@ class NoteModel:
         插入點之後的音符與拍點整段往後推，所以已經排好的譜不會錯位。
         `measure_idx` 超出目前小節數時等同 `add_measure`（接在譜尾）。
 
-        `count` 個小節是一次做完、最後才重建快取（插 32 個小節不該重建 32 次）。
+        `count` 個小節是**單趟**改寫完的，不是插 count 次：每次插入都要重建整份
+        拍點清單與 `<beat_data>`，插 128 個小節就變成 O(N×count)（實測 1700 筆
+        拍點的譜要 1.9 秒、介面全凍）。
         回傳是否真的插入了。
         """
-        ok = False
-        for _ in range(max(1, int(count))):
-            # 每一輪重新看格線：前一輪插進去的小節已經成為 measure_idx 的內容
-            if not self._insert_measure_once(measure_idx, new_bpm):
-                break
-            ok = True
-        if ok:
-            self.rebuild_display_cache()
-        return ok
+        if not self._insert_measures(measure_idx, new_bpm, max(1, int(count))):
+            return False
+        self.rebuild_display_cache()
+        return True
 
-    def _insert_measure_once(self, measure_idx: int,
-                             new_bpm: Optional[float] = None) -> bool:
+    def _insert_measures(self, measure_idx: int, new_bpm: Optional[float],
+                         count: int) -> bool:
         beats = self.get_beat_entries()
         measure_idx = max(0, int(measure_idx))
         if not beats or measure_idx >= self.count_measures():
-            self._add_measure_once(new_bpm)
+            for _ in range(count):
+                self._add_measure_once(new_bpm)
             return True
 
         start_ms, _end_ms = self.get_measure_time_range(measure_idx)
         if start_ms is None:
-            self._add_measure_once(new_bpm)
+            for _ in range(count):
+                self._add_measure_once(new_bpm)
             return True
 
         bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
         insert_ms = int(start_ms)
         # 長度照插入點當地的拍號算，才和下面照當地格線鋪的 index 對得上
-        dur_ms = int(round(self._bar_ms_at_ms(insert_ms, bpm_use)))
-        if dur_ms <= 0:
+        bar_ms = int(round(self._bar_ms_at_ms(insert_ms, bpm_use)))
+        if bar_ms <= 0:
             return False
+        total_ms = bar_ms * count
 
         # 1. 插入點之後的音符整段往後推（長度不變）
         for n in self.notes_tree:
             if int(n.start) >= insert_ms:
                 length = max(1, int(n.end) - int(n.start))
-                n.start = int(n.start) + dur_ms
+                n.start = int(n.start) + total_ms
                 n.end = n.start + length
                 n.gate = length
 
-        # 2. 拍點：在這一小節的第一筆 entry 前插入一個小節的 entry，之後的往後推。
-        #    形狀與 index 跨度都照這個小節自己的格線（見 `_measure_index_shape`），
-        #    這樣譜面的 index 刻度不會被改掉，也不會出現非整拍的 index。
+        # 2. 拍點：在這一小節的第一筆 entry 前插入 count 個小節的 entry，之後的
+        #    往後推。形狀與 index 跨度都照這個小節自己的格線（見
+        #    `_measure_index_shape`），這樣譜面的 index 刻度不會被改掉，也不會
+        #    出現非整拍的 index。
         # 以 ms 反查插入點，不能用 measure_idx*epb（見 _measure_entry_slice）
         ins_at = self._measure_entry_slice(measure_idx)[0]
         offsets, idx_span = self._measure_index_shape(measure_idx)
@@ -7218,20 +7219,21 @@ class NoteModel:
         entries: List[Tuple[int, int]] = []
         for i, (bidx, bms) in enumerate(beats):
             if i == ins_at:
-                for off in offsets:
-                    entries.append((base_idx + off,
-                                    insert_ms + int(round(dur_ms * off
-                                                          / float(idx_span)))))
+                for k in range(count):
+                    for off in offsets:
+                        entries.append((base_idx + k * idx_span + off,
+                                        insert_ms + k * bar_ms
+                                        + int(round(bar_ms * off / float(idx_span)))))
             if i >= ins_at:
-                entries.append((int(bidx) + idx_span, int(bms) + dur_ms))
+                entries.append((int(bidx) + count * idx_span, int(bms) + total_ms))
             else:
                 entries.append((int(bidx), int(bms)))
         self._write_beat_entries(entries)
         # 插入點之後的拍號標記也要往後推（絕對 ms）
-        self._retime_time_sig_changes(insert_ms, insert_ms, 1.0, dur_ms)
+        self._retime_time_sig_changes(insert_ms, insert_ms, 1.0, total_ms)
 
         # 3. 更新 music_finish_time_msec
-        self._set_music_end_ms(float(self.music_end_ms) + dur_ms)
+        self._set_music_end_ms(float(self.music_end_ms) + total_ms)
 
         self.dirty = True
         return True
@@ -7240,21 +7242,25 @@ class NoteModel:
         """從第 measure_idx 小節（0-indexed）起刪除 `count` 個小節與其中所有音符，
         並將後續音符/拍子時間往前平移填補間距。
 
-        每刪掉一個，後面的小節就遞補到同一個編號，所以連續刪除就是對同一個
-        index 重複執行。`count` 個一次做完、最後才重建快取。
+        每刪掉一個，後面的小節就遞補到同一個編號，所以「連刪 count 個」就是刪掉
+        第 measure_idx 起連續 count 個小節。和 `insert_measure` 一樣是單趟改寫，
+        不逐個刪（那會把整份拍點重建 count 次）。要刪的比剩下的多時就刪到譜尾。
         回傳刪除的音符總數。"""
-        total = 0
-        for _ in range(max(1, int(count))):
-            if self.count_measures() <= 0:
-                break
-            total += self._delete_measure_once(measure_idx)
+        deleted = self._delete_measures(max(0, int(measure_idx)), max(1, int(count)))
+        if deleted is None:
+            return 0                            # 索引超出範圍：什麼都沒動
         self.rebuild_display_cache()
-        return total
+        return deleted
 
-    def _delete_measure_once(self, measure_idx: int) -> int:
-        start_ms, end_ms = self.get_measure_time_range(measure_idx)
+    def _delete_measures(self, measure_idx: int, count: int) -> Optional[int]:
+        total_measures = self.count_measures()
+        if measure_idx >= total_measures:
+            return None
+        last_idx = min(total_measures - 1, measure_idx + count - 1)
+        start_ms, _first_end = self.get_measure_time_range(measure_idx)
+        _last_start, end_ms = self.get_measure_time_range(last_idx)
         if start_ms is None or end_ms is None:
-            return 0
+            return None
         dur_ms = end_ms - start_ms
 
         # 1. 刪除音符
@@ -7272,15 +7278,16 @@ class NoteModel:
                 n.end   = max(n.start + 1, n.end - dur_ms)
                 n.gate  = n.end - n.start
 
-        # 3. 拍點：刪除這一小節涵蓋的 entries
+        # 3. 拍點：刪除這一段小節涵蓋的 entries
         all_beats = self.get_beat_entries()   # [(idx, ms), ...]
         # 以 ms 反查，不能假設每小節剛好 epb 筆（見 _measure_entry_slice）
-        del_start, del_end = self._measure_entry_slice(measure_idx)
+        del_start = self._measure_entry_slice(measure_idx)[0]
+        del_end = max(del_start, self._measure_entry_slice(last_idx)[1])
 
         # 重建 beat 清單：跳過 [del_start, del_end)，後續 ms 與 index 都往前
-        # 補上這一小節的量。index 照原刻度平移，不能重編號——重編號會把
+        # 補上這一段的量。index 照原刻度平移，不能重編號——重編號會把
         # beat index 的刻度打掉，explicit beat units 的譜會整個換一套小節切法。
-        # 平移量就是被刪掉那個小節實際占的 index 跨度（`insert_measure` 的反向）。
+        # 平移量就是被刪掉那幾個小節實際占的 index 跨度（`insert_measure` 的反向）。
         # 以前用 `bar_units_at_ms * scale` 推，在 per-bar 的譜上會算成 bpb、
         # 一刪就把後面的 index 拉成負數（見 `_beat_index_step`）。
         if del_end < len(all_beats):

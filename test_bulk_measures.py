@@ -217,6 +217,29 @@ class BulkEqualsRepeatedSingleTests(unittest.TestCase):
         self.assertGreaterEqual(m.measure_count(), 0)
         self.assertEqual([n for n in m.notes], [])
 
+    def test_deleting_past_the_end_changes_nothing(self):
+        m = per_bar_model()
+        entries = m.get_beat_entries()
+        self.assertEqual(m.delete_measure(m.measure_count() + 3), 0)
+        self.assertEqual(m.get_beat_entries(), entries)
+
+    def test_a_big_batch_is_a_single_rewrite(self):
+        """插 128 個小節不能是「插 128 次」：那是 O(N×count)，介面會凍住。"""
+        m = per_beat_model(bars=200)
+        writes = []
+        original = type(m)._write_beat_entries
+        try:
+            type(m)._write_beat_entries = (
+                lambda self, beats, mark_precise=False:
+                writes.append(len(beats)) or original(self, beats, mark_precise))
+            m.insert_measure(0, count=128)
+            self.assertEqual(len(writes), 1)
+            writes.clear()
+            m.delete_measure(0, count=128)
+            self.assertEqual(len(writes), 1)
+        finally:
+            type(m)._write_beat_entries = original
+
 
 class BulkIsOneUndoStepTests(unittest.TestCase):
     """批次是一步 undo：撤回一次就回到原狀（以前插 16 個要撤 16 次）。"""
@@ -339,6 +362,38 @@ class MainWindowWiringTests(unittest.TestCase):
         before = m.measure_count()
         self._run(self.win.add_measure_dialog, 9, m)
         self.assertEqual(m.measure_count(), before + 9)
+
+    def test_the_delete_dialog_never_offers_to_empty_the_chart(self):
+        """刪光的譜沒有拍點資料，連「新增小節」都會拒絕——至少留一個小節。"""
+        from unittest import mock
+
+        from PyQt5.QtWidgets import QDialog
+
+        from qt_editor import main_window as MW
+
+        m = per_bar_model()
+        self.win.view.model = m
+        total = m.measure_count()
+        seen = {}
+        stub = mock.Mock()
+        stub.exec_.return_value = QDialog.Rejected
+
+        def spy(_parent, _title, _prompt, **kw):
+            seen.update(kw)
+            return stub
+
+        with mock.patch.object(MW, 'MeasureCountDialog', spy):
+            self.win.delete_measure_at(0)
+        self.assertEqual(seen['max_count'], total - 1)
+
+    def test_the_status_line_reports_what_really_happened(self):
+        # 要求刪 999 個、實際只剩這麼多：回報的是真的刪掉的數量
+        m = per_bar_model(bars=6)
+        total = m.measure_count()
+        self._run(lambda: self.win.delete_measure_at(0), 999, m)
+        self.assertEqual(self.win.statusBar().currentMessage().count('999'), 0)
+        self.assertIn(str(total - m.measure_count()),
+                      self.win.statusBar().currentMessage())
 
     def test_a_cancelled_dialog_changes_nothing(self):
         from unittest import mock

@@ -16,7 +16,25 @@ from typing import Optional
 from PyQt5.QtCore import QObject
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
+try:
+    from PyQt5 import sip
+except ImportError:                                 # 舊版 PyQt5 的 sip 在最上層
+    try:
+        import sip                                  # type: ignore[no-redef]
+    except ImportError:
+        sip = None                                  # type: ignore[assignment]
+
 SERVER_NAME = 'NosMania.ChartEditor'
+
+
+def _deleted(obj) -> bool:
+    """這個 QObject 底下的 C++ 物件是不是已經被刪掉了（Python 這邊還拿得到 wrapper）。"""
+    if sip is None:
+        return False
+    try:
+        return bool(sip.isdeleted(obj))
+    except (TypeError, RuntimeError):
+        return False
 
 
 def allow_foreground() -> None:
@@ -59,7 +77,24 @@ class EditorServer(QObject):
         return self._server.isListening()
 
     def close(self) -> None:
+        """不再接受連線，並把還連著的 socket 的訊號斷開。
+
+        socket 是排程刪除（`deleteLater`）的，可能活得比伺服器久；訊號留著沒斷，
+        之後才送到的 `disconnected` 會叫回已經沒有 C++ 物件的自己身上 —— 關掉
+        製譜器視窗時就是一聲 RuntimeError。
+        """
+        for sock in list(self._buffers):
+            self._detach(sock)
         self._server.close()
+
+    def _detach(self, sock: QLocalSocket) -> None:
+        """這個 socket 處理完了：忘掉它的緩衝，也不要再收它的訊號。"""
+        self._buffers.pop(sock, None)
+        try:
+            sock.readyRead.disconnect()
+            sock.disconnected.disconnect()
+        except (RuntimeError, TypeError):            # 已被刪掉，或本來就沒接上
+            pass
 
     def _on_connection(self) -> None:
         while self._server.hasPendingConnections():
@@ -69,13 +104,17 @@ class EditorServer(QObject):
             sock.disconnected.connect(lambda s=sock: self._on_ready(s, final=True))
 
     def _on_ready(self, sock: QLocalSocket, final: bool = False) -> None:
+        # 視窗關掉之後才送到的訊號：這時碰 self 的任何屬性都會丟 RuntimeError
+        # （wrapper 還在、C++ 物件沒了）。什麼都不做就好。
+        if _deleted(self) or _deleted(sock):
+            return
         data = self._buffers.get(sock, b'') + bytes(sock.readAll())
         *lines, rest = data.split(b'\n')
         self._buffers[sock] = rest
         if final:
             if rest.strip():
                 lines.append(rest)
-            self._buffers.pop(sock, None)
+            self._detach(sock)
             sock.deleteLater()
         for line in lines:
             self.handle(line)

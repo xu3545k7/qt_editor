@@ -21,7 +21,7 @@ from .ui_text import tr
 
 _STAGE_TEXT = {
     'python': '下載 Python' if PS.IS_WINDOWS else '建立 Python 虛擬環境',
-    'pip': '下載 pip',
+    'pip': '下載 pip' if PS.IS_WINDOWS else '升級 pip',
     'torch': '下載 torch',
     'packages': '下載轉譜套件',
     'model': '下載模型權重',

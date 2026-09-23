@@ -53,7 +53,7 @@ macOS 會擋沒有 Apple 開發者簽章的 App：
 ## AI 轉譜（mp3／wav → MIDI → 譜面）
 
 「檔案 → AI 轉譜（音檔 → 譜面）→ 從音檔轉譜…」吃 mp3、wav、flac、ogg。
-第一次用會問要不要安裝轉譜環境（約 0.4 GB 下載、1.6 GB 空間），裝在
+第一次用會問要不要安裝轉譜環境（約 0.4 GB 下載，裝好實測佔 818 MB），裝在
 `~/Library/Application Support/NostalgiaChartEditor/ai_transcribe/`，
 中途取消下次會接著裝。
 

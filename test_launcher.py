@@ -99,6 +99,30 @@ class EditorIpcTests(unittest.TestCase):
         self.assertTrue(window.enter_editor.called)
         self.assertIsNone(server.handle(b'not json'))
 
+    def test_a_signal_arriving_after_the_window_is_gone_is_ignored(self):
+        """socket 是 `deleteLater` 排程刪除的，可能活得比伺服器久。
+
+        它的 `disconnected` 在伺服器的 C++ 物件被刪掉之後才送到時，碰 self 的
+        任何屬性都會丟 RuntimeError（PyQt 的 wrapper 已失效）——關掉製譜器視窗
+        時就是一聲崩潰。
+        """
+        from PyQt5.QtCore import QObject
+        from PyQt5.QtNetwork import QLocalSocket
+
+        from qt_editor import editor_ipc
+
+        window = QObject()
+        server = editor_ipc.EditorServer(
+            window, name='NosMania.Test.dead.%d' % os.getpid())
+        sock = QLocalSocket()
+        server._buffers[sock] = b''
+        server.close()
+        # close() 要把訊號斷開、緩衝清掉，這樣根本不會再被叫到
+        self.assertEqual(server._buffers, {})
+        editor_ipc.sip.delete(server)               # 模擬視窗連帶被刪掉
+        self.assertTrue(editor_ipc._deleted(server))
+        server._on_ready(sock, final=True)          # 不能丟 RuntimeError
+
     def test_round_trip_over_local_socket(self):
         from PyQt5.QtCore import QEventLoop, QObject, QTimer
         from qt_editor import editor_ipc

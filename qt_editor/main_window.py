@@ -2705,10 +2705,11 @@ class MainWindow(QMainWindow):
             bpm=cur_bpm)
         if dlg.exec_() != QDialog.Accepted:
             return
-        count = dlg.count()
+        before = m.measure_count()
         try:
             m.push_history()
-            m.add_measure(dlg.bpm(), count=count)
+            m.add_measure(dlg.bpm(), count=dlg.count())
+            count = m.measure_count() - before      # 真的加了幾個
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.update()
@@ -2739,11 +2740,11 @@ class MainWindow(QMainWindow):
             t('dlg_insert_measure_prompt', measure_idx + 1), bpm=cur_bpm)
         if dlg.exec_() != QDialog.Accepted:
             return
-        count = dlg.count()
+        before = m.measure_count()
         was_dirty = m.dirty
         m.push_history()
         try:
-            if not m.insert_measure(measure_idx, dlg.bpm(), count=count):
+            if not m.insert_measure(measure_idx, dlg.bpm(), count=dlg.count()):
                 m.discard_last_history()
                 m.dirty = was_dirty
                 QMessageBox.warning(self, t('dlg_warn'), '無法插入小節。')
@@ -2754,7 +2755,8 @@ class MainWindow(QMainWindow):
             self.view.note_edited.emit()
             self._rebuild_hit_times()
             self.statusBar().showMessage(
-                t('status_measures_inserted', measure_idx + 1, count), 5000)
+                t('status_measures_inserted', measure_idx + 1,
+                  m.measure_count() - before), 5000)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
 
@@ -2801,17 +2803,18 @@ class MainWindow(QMainWindow):
                 args.append(n_notes)
             return t(key, *args)
 
+        # 留一個小節：整份刪光的譜沒有拍點資料，連「新增小節」都會拒絕
         dlg = MeasureCountDialog(
             self, t('dlg_delete_measure_title'),
             t('dlg_delete_measure_prompt', display_bar),
-            max_count=max(1, total - measure_idx), summary=summary)
+            max_count=max(1, min(total - measure_idx, total - 1)), summary=summary)
         if dlg.exec_() != QDialog.Accepted:
             return
-        count = dlg.count()
 
         try:
             m.push_history()
-            deleted = m.delete_measure(measure_idx, count=count)
+            deleted = m.delete_measure(measure_idx, count=dlg.count())
+            count = total - m.measure_count()        # 真的刪掉幾個
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.selected.clear()
