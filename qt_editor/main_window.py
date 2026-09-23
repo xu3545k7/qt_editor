@@ -1168,10 +1168,8 @@ class MainWindow(QMainWindow):
         self._add_action(midi_sub, t('action_open_midi_overlay'), self._open_midi_overlay)
         # 音檔 → MIDI（ByteDance 鋼琴轉譜模型），轉完走一般的 MIDI 匯入
         ai_sub = file_m.addMenu('AI 轉譜（音檔 → 譜面）')
-        self._add_action(ai_sub, '從音檔轉譜…', self.transcribe_audio_ai,
-                         feature='ai_transcribe')
-        self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe,
-                         feature='ai_transcribe')
+        self._add_action(ai_sub, '從音檔轉譜（mp3／wav…）…', self.transcribe_audio_ai)
+        self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe)
         file_m.addSeparator()
         self._add_action(file_m, t('action_save'), self.save_file, QKeySequence.Save)
         self._add_action(file_m, t('action_save_as'), self.save_file_as, 'Ctrl+Shift+S')
@@ -1492,7 +1490,7 @@ class MainWindow(QMainWindow):
     def _add_action(self, menu, label: str, slot, shortcut=None, keys=None,
                     feature: str = '') -> QAction:
         """`feature` 給的話，在做不到那件事的平台上這個項目會變灰並寫出原因
-        （例如 AI 轉譜的執行環境只有 Windows 版），而不是按下去才壞掉。"""
+        （例如 Hiraeth 工具只有 Windows 版），而不是按下去才壞掉。"""
         act = QAction(label, self)
         if shortcut is not None:
             act.setShortcut(QKeySequence(shortcut) if isinstance(shortcut, str) else shortcut)
@@ -3580,7 +3578,7 @@ class MainWindow(QMainWindow):
                 return
             summary = '轉出 %d 顆音、%d 段踏板（%s，%.0f 秒）' % (
                 result['notes'], result.get('pedals', 0),
-                'GPU' if result.get('device') == 'cuda' else 'CPU', result.get('elapsed', 0))
+                AT.device_label(result.get('device', '')), result.get('elapsed', 0))
 
         # BPM 與小節線：改寫成指定 BPM 的 MIDI，音檔開頭補靜音讓第一小節對上小節線
         from . import ai_grid as G

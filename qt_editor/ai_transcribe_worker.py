@@ -28,11 +28,67 @@ def emit(kind, **fields):
     sys.stdout.flush()
 
 
+def _apple_chip_name():
+    """晶片型號（例如 `Apple M4`）。CUDA 那邊回報的是顯卡名字，這裡對應。"""
+    import subprocess
+
+    try:
+        out = subprocess.run(['/usr/sbin/sysctl', '-n', 'machdep.cpu.brand_string'],
+                             capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return 'MPS'
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else 'MPS'
+
+
+def _mps_available(torch):
+    backend = getattr(torch.backends, 'mps', None)
+    try:
+        return bool(backend is not None and backend.is_available())
+    except Exception:                           # noqa: BLE001
+        return False
+
+
+def _mps_mismatch(torch):
+    """拿 CPU 當基準對一遍 MPS 的結果，不一致就回傳原因（一致回空字串）。
+
+    MPS 的 kernel 不像 CUDA 那麼成熟，模型用到的卷積與雙向 GRU 在某些 torch
+    版本上會算錯（不是報錯，是安靜地算出別的數字）。轉出一整首錯的譜比慢一點
+    糟糕得多，所以先用同一組權重跑這兩種運算比對。
+    """
+    from torch import nn
+
+    torch.manual_seed(0)
+    image = torch.randn(1, 1, 16, 16)
+    sequence = torch.randn(1, 12, 8)
+    conv = nn.Conv2d(1, 4, 3)
+    gru = nn.GRU(8, 8, batch_first=True, bidirectional=True)
+    device = torch.device('mps')
+    with torch.no_grad():
+        want = (conv(image), gru(sequence)[0])
+        got = (conv.to(device)(image.to(device)),
+               gru.to(device)(sequence.to(device))[0])
+        for expected, actual in zip(want, got):
+            gap = (expected - actual.cpu()).abs().max().item()
+            if gap > 1e-3:
+                return '最大誤差 %.4g' % gap
+    return ''
+
+
 def pick_device(requested):
     import torch
 
     if requested == 'cpu':
         return 'cpu', ''
+    if requested in ('auto', 'mps') and _mps_available(torch):
+        try:
+            mismatch = _mps_mismatch(torch)
+        except Exception as exc:                # noqa: BLE001
+            return 'cpu', 'MPS 無法執行（%s），改用 CPU' % str(exc).splitlines()[0]
+        if mismatch:
+            return 'cpu', 'MPS 算出來的結果和 CPU 不一致（%s），改用 CPU' % mismatch
+        return 'mps', _apple_chip_name()
+    if requested == 'mps':
+        return 'cpu', 'torch 看不到 MPS，改用 CPU'
     if not torch.cuda.is_available():
         if requested == 'cuda':
             return 'cpu', 'torch 看不到 CUDA，改用 CPU'
@@ -46,6 +102,11 @@ def pick_device(requested):
     except Exception as exc:                    # noqa: BLE001
         return 'cpu', 'GPU 無法執行（%s），改用 CPU' % str(exc).splitlines()[0]
     return 'cuda', torch.cuda.get_device_name(0)
+
+
+def _default_batch(device):
+    """一次推幾段。MPS 的記憶體和系統共用，批次開太大會被換頁拖慢。"""
+    return {'cuda': 8, 'mps': 4}.get(device, 1)
 
 
 def load_audio(path, sample_rate):
@@ -104,7 +165,8 @@ def transcribe(args):
     started = time.time()
     device, note = pick_device(args.device)
     if note:
-        emit('log', message=('使用 GPU：%s' % note) if device == 'cuda' else note)
+        emit('log', message=('使用 %s：%s' % (device.upper(), note))
+             if device != 'cpu' else note)
     emit('progress', stage='load_audio', done=0, total=1)
     audio, native_rate, seconds, original = load_audio(args.input, sample_rate)
     emit('log', message='音檔 %.1f 秒（%d Hz）' % (seconds, native_rate))
@@ -131,7 +193,12 @@ def transcribe(args):
     finally:
         torch.load = original_load
 
-    batch = args.batch if args.batch > 0 else (8 if device == 'cuda' else 1)
+    # 套件只認得 'cuda' 和 'cpu'（它拿字串比對），給它 mps 會被當成 CPU。自己把
+    # 模型搬過去就好：推論的批次是照模型所在的裝置建的（見 make_forward）。
+    transcriptor.model.to(torch.device(device))
+    transcriptor.device = torch.device(device)
+
+    batch = args.batch if args.batch > 0 else _default_batch(device)
     inference.forward = make_forward(batch)
     result = transcriptor.transcribe(audio, args.output)
     emit('done', output=args.output, notes=len(result['est_note_events']),
@@ -145,7 +212,7 @@ def main():
     parser.add_argument('--input')
     parser.add_argument('--output')
     parser.add_argument('--checkpoint')
-    parser.add_argument('--device', default='auto', choices=('auto', 'cuda', 'cpu'))
+    parser.add_argument('--device', default='auto', choices=('auto', 'cuda', 'mps', 'cpu'))
     parser.add_argument('--batch', type=int, default=0)
     parser.add_argument('--wav-out', dest='wav_out')
     args = parser.parse_args()

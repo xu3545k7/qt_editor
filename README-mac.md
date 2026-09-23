@@ -50,11 +50,33 @@ macOS 會擋沒有 Apple 開發者簽章的 App：
 
 要發給別人而不被擋，需要 Apple Developer ID 憑證與 `notarytool` 公證。
 
+## AI 轉譜（mp3／wav → MIDI → 譜面）
+
+「檔案 → AI 轉譜（音檔 → 譜面）→ 從音檔轉譜…」吃 mp3、wav、flac、ogg。
+第一次用會問要不要安裝轉譜環境（約 0.4 GB 下載、1.6 GB 空間），裝在
+`~/Library/Application Support/NostalgiaChartEditor/ai_transcribe/`，
+中途取消下次會接著裝。
+
+Mac 版不像 Windows 版會自己下載嵌入式 Python，而是**拿系統上的 Python 建 venv**：
+
+- 需要 Python 3.9 以上；建議 3.11 或 3.12（`brew install python@3.12`），
+  torch 的輪子最齊。找不到可用的 Python 時會直接說要先裝哪一個。
+- 挑直譯器時版本新的優先，並且避開 Xcode 內附的那份（venv 會連回建立它的
+  直譯器，Xcode 一更新搬家環境就壞了）。實際挑到哪一個會寫在安裝確認的視窗上。
+- Apple 晶片用 GPU（MPS）轉譜；Intel Mac 用 CPU。M5 Pro 實測 2.5 分鐘的曲子
+  約 20 秒（同一台用 CPU 約 29 秒），兩者轉出來的音符完全相同。十秒左右的短
+  片段反而是 CPU 快——MPS 要暖機。
+- 用 MPS 之前會拿 CPU 當基準比對卷積與雙向 GRU 的結果，不一致就自動改用 CPU
+  ——安靜算錯的譜比慢的譜麻煩得多。
+
+模型（ByteDance 的高解析度鋼琴轉譜）只用**獨奏鋼琴**訓練過，整首混音會轉出
+大量雜音，有鋼琴分軌（`*_piano.wav`）請用分軌。mp3 這類非 WAV 的輸入會順便
+解碼一份同名 WAV 放旁邊，載入譜面後直接掛成背景音樂。
+
 ## Mac 版沒有的功能
 
 | 功能 | 為什麼 |
 |---|---|
-| AI 轉譜（音檔 → 譜面） | 轉譜環境裝的是 Windows 的嵌入式 Python，要重做成 venv 版 |
 | 啟動遊戲、曲庫連結、更新 | 遊戲是 Windows 的 Unity build，找遊戲靠 `.exe`、連曲庫靠 NTFS junction |
 | Hiraeth 工具（管理器、啟動街機版） | 那套工具整個是 Windows 專用的第三方環境 |
 

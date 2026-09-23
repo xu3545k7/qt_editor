@@ -1,18 +1,26 @@
 """AI 鋼琴轉譜：安裝轉譜環境、呼叫轉譜程序。
 
-製譜器打包成單檔 exe，torch（GPU 版裝好約 5GB）不可能包進去——每次啟動都要
-解壓一次。所以轉譜跑在另外安裝的環境裡：
+製譜器打包成單檔 exe / .app，torch（CUDA 版裝好約 5GB）不可能包進去——每次
+啟動都要解壓一次。所以轉譜跑在另外安裝的環境裡（位置見 `env_root`）：
 
-    %LOCALAPPDATA%\\NostalgiaChartEditor\\ai_transcribe\\
-        python\\          Python 3.11 embeddable + torch + piano_transcription_inference
-        models\\          模型權重（安裝時驗 SHA256）
+    <使用者資料夾>/ai_transcribe/
+        python/           獨立的 Python + torch + piano_transcription_inference
+        models/           模型權重（安裝時驗 SHA256）
         worker.py         從製譜器複製過去的 ai_transcribe_worker.py
         installed.json    裝好的標記（版本、torch、裝置）
 
 第一次用的時候由製譜器自己下載安裝，各步驟都可以重跑（已完成的會跳過），
-中途取消或斷線下次接著裝。有 NVIDIA 顯卡就裝 CUDA 12.8 版的 torch
-（RTX 50 系列最低要這版；RTX 5080 實測兩三分鐘的曲子約 6 秒），
-沒有就裝 CPU 版（小很多；16 執行緒的 CPU 實測約音檔長度的三分之一）。
+中途取消或斷線下次接著裝。
+
+`python/` 怎麼來的分兩種平台：
+
+* Windows：下載官方的 embeddable 壓縮檔，製譜器完全自帶，不靠系統有沒有
+  裝 Python。有 NVIDIA 顯卡就裝 CUDA 12.8 版的 torch（RTX 50 系列最低要這
+  版；RTX 5080 實測兩三分鐘的曲子約 6 秒），沒有就裝 CPU 版。
+* macOS／Linux：沒有 embeddable 版，改用系統上的 Python 3.9+ 建 venv
+  （`find_host_python`）。mac 的 torch 輪子在 PyPI 就帶 Apple 晶片的 GPU
+  加速（MPS），不必另外挑索引。M5 Pro 實測 2.5 分鐘的曲子約 20 秒
+  （同一台的 CPU 約 29 秒），兩種裝置轉出來的音符完全相同。
 
 這支不碰 Qt：安裝與轉譜都吃 log / progress 回呼和一個取消旗標，
 介面在 ai_transcribe_dialog。
@@ -21,6 +29,7 @@
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -29,6 +38,8 @@ import urllib.request
 import zipfile
 from typing import Callable, Dict, List, Optional
 
+from . import platform_support as P
+
 #: 環境格式改了（換 Python 版本、換套件組合）就加一，舊環境會被當成沒裝。
 ENV_VERSION = 1
 
@@ -36,10 +47,21 @@ PYTHON_VERSION = '3.11.9'
 PYTHON_URL = ('https://www.python.org/ftp/python/%s/python-%s-embed-amd64.zip'
               % (PYTHON_VERSION, PYTHON_VERSION))
 GET_PIP_URL = 'https://bootstrap.pypa.io/get-pip.py'
+#: 只有 Windows／Linux 要挑索引；mac 的輪子在 PyPI（見 `_torch_args`）。
 TORCH_INDEX = {
     'cuda': 'https://download.pytorch.org/whl/cu128',
     'cpu': 'https://download.pytorch.org/whl/cpu',
 }
+
+#: 建 venv 要用的系統 Python：偏好 3.12／3.11（torch 的輪子最齊）。
+HOST_PYTHON_NAMES = ('python3.12', 'python3.11', 'python3.13', 'python3.10',
+                     'python3.9', 'python3')
+#: PATH 之外也找一下這幾個地方（.app 啟動時的 PATH 不含 Homebrew）。
+HOST_PYTHON_DIRS = ('/opt/homebrew/bin', '/usr/local/bin', '/usr/bin')
+#: torch 2.x 最低要 3.9。
+MIN_HOST_PYTHON = (3, 9)
+#: `--progress-bar raw`（機器可讀的進度，拿來畫進度條）是 pip 22.1 才有的選項。
+PIP_RAW_PROGRESS_MIN = (22, 1)
 #: 套件本身只宣告了名稱沒鎖版本；鎖住確定可用的組合。
 PACKAGES = [
     'piano_transcription_inference==0.0.6',
@@ -76,14 +98,16 @@ class Cancelled(Exception):
 # ── 路徑 ────────────────────────────────────────────────────────────────
 
 def env_root() -> str:
-    base = os.environ.get('LOCALAPPDATA')
-    if not base:
-        base = os.path.join(os.path.expanduser('~'), '.local', 'share')
-    return os.path.join(base, 'NostalgiaChartEditor', 'ai_transcribe')
+    """轉譜環境放哪裡（Windows 是 LOCALAPPDATA，mac 是 Application Support）。"""
+    return os.path.join(P.user_data_dir(), 'ai_transcribe')
 
 
 def python_exe(root: Optional[str] = None) -> str:
-    return os.path.join(root or env_root(), 'python', 'python.exe')
+    """轉譜環境裡的直譯器。Windows 是 embeddable 的 python.exe，其他平台是 venv。"""
+    folder = os.path.join(root or env_root(), 'python')
+    if P.IS_WINDOWS:
+        return os.path.join(folder, 'python.exe')
+    return os.path.join(folder, 'bin', 'python3')
 
 
 def checkpoint_path(root: Optional[str] = None) -> str:
@@ -131,6 +155,8 @@ def is_installed(root: Optional[str] = None) -> bool:
 
 
 def has_nvidia_gpu() -> bool:
+    if P.IS_MAC:
+        return False                    # Apple 晶片走 MPS，不會有 CUDA
     exe = shutil.which('nvidia-smi')
     if not exe:
         return False
@@ -142,14 +168,53 @@ def has_nvidia_gpu() -> bool:
     return out.returncode == 0 and 'GPU' in out.stdout
 
 
+def has_apple_gpu() -> bool:
+    """Apple 晶片（arm64）的 Mac 才有 MPS 可以用；Intel Mac 只能 CPU。"""
+    return P.IS_MAC and platform.machine().lower() in ('arm64', 'aarch64')
+
+
+def default_variant() -> str:
+    """這台機器該裝哪一種 torch：`cuda` / `mps` / `cpu`。"""
+    if has_nvidia_gpu():
+        return 'cuda'
+    if has_apple_gpu():
+        return 'mps'
+    return 'cpu'
+
+
+#: 安裝時寫進紀錄的 torch 版本說明。
+VARIANT_TEXT = {
+    'cuda': 'CUDA 12.8（NVIDIA 顯卡）',
+    'mps': 'Apple 晶片 GPU（MPS）',
+    'cpu': 'CPU',
+}
+
+
+def device_label(device: str) -> str:
+    """轉譜實際用的裝置，講給使用者看。"""
+    if device == 'cuda':
+        return 'GPU'
+    if device == 'mps':
+        return 'Apple 晶片 GPU'
+    return 'CPU'
+
+
 def estimated_download_mb(variant: str) -> int:
     """給安裝前的確認對話框用的大概數字（實際依 torch 版本而定）。"""
-    return 3300 if variant == 'cuda' else 500
+    if variant == 'cuda':
+        return 3300
+    if P.IS_MAC:
+        return 400                      # mac 的 torch 輪子小很多，也沒有 CUDA 函式庫
+    return 500
 
 
 def estimated_disk_mb(variant: str) -> int:
-    """裝好後的大小（GPU 版實測 torch 2.11+cu128 約 4.9GB，CUDA 函式庫佔大半）。"""
-    return 5000 if variant == 'cuda' else 1500
+    """裝好後的大小（CUDA 版實測 torch 2.11+cu128 約 4.9GB，CUDA 函式庫佔大半）。"""
+    if variant == 'cuda':
+        return 5000
+    if P.IS_MAC:
+        return 1600
+    return 1500
 
 
 # ── 子程序共用 ──────────────────────────────────────────────────────────
@@ -167,6 +232,8 @@ def _child_env() -> Dict[str, str]:
     env['PYTHONNOUSERSITE'] = '1'
     env['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
     env['MPLBACKEND'] = 'Agg'
+    # MPS 少數運算沒有實作（例如某些 FFT）；讓它退回 CPU 算，而不是整個中斷。
+    env['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
     return env
 
 
@@ -249,7 +316,102 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _host_python_version(exe: str) -> tuple:
+    """`exe` 的版本（例如 `(3, 12)`）；太舊、建不出 venv 或根本不是 Python 就回 ()。
+
+    embeddable 版的 Python 沒有 venv 模組，所以連 import 一起試。
+    """
+    try:
+        out = subprocess.run(
+            [exe, '-c', 'import venv, sys; print("%d.%d" % sys.version_info[:2])'],
+            capture_output=True, text=True, timeout=60, env=_child_env(),
+            creationflags=_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if out.returncode != 0:
+        return ()
+    try:
+        version = tuple(int(part) for part in out.stdout.strip().split('.'))
+    except ValueError:
+        return ()
+    return version if version >= MIN_HOST_PYTHON else ()
+
+
+def _usable_host_python(exe: str) -> bool:
+    return bool(_host_python_version(exe))
+
+
+def _inside_developer_tools(exe: str) -> bool:
+    """Xcode／Command Line Tools 附的那份 Python。
+
+    venv 會連回建立它的直譯器，而這份會隨著 Xcode 更新或搬家而消失，
+    整個轉譜環境就跟著壞掉。有別的選擇時不要用它。
+    """
+    path = os.path.realpath(exe)
+    return '/Xcode.app/' in path or '/CommandLineTools/' in path
+
+
+def find_host_python() -> str:
+    """找一個可以拿來建 venv 的系統 Python（版本新的優先）。找不到回空字串。
+
+    打包成 .app 之後 `sys.executable` 是 PyInstaller 的執行檔（沒有 venv 模組
+    也不該拿來建環境），所以只有在原始碼執行時才把它算進候選。
+    """
+    candidates: List[str] = []
+    for name in HOST_PYTHON_NAMES:
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+        candidates.extend(os.path.join(folder, name) for folder in HOST_PYTHON_DIRS)
+    if not getattr(sys, 'frozen', False):
+        candidates.append(sys.executable)
+
+    best, best_rank, seen = '', None, set()
+    for exe in candidates:
+        if not os.path.isfile(exe):
+            continue
+        key = os.path.realpath(exe)
+        if key in seen:
+            continue
+        seen.add(key)
+        version = _host_python_version(exe)
+        if not version:
+            continue
+        rank = (-version[0], -version[1], 1 if _inside_developer_tools(exe) else 0)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = exe, rank
+    return best
+
+
+def _install_venv(root: str, cancel: threading.Event, log: Log, progress: Progress) -> None:
+    """mac／Linux：用系統的 Python 建一個乾淨的 venv（Windows 走 embeddable）。"""
+    exe = python_exe(root)
+    if os.path.isfile(exe):
+        log('Python 虛擬環境已存在，略過。')
+        return
+    host = find_host_python()
+    if not host:
+        raise RuntimeError(
+            '找不到可以用的 Python %d.%d 以上（轉譜環境要拿它建虛擬環境）。\n'
+            'macOS 請先裝一個，例如：brew install python@3.12' % MIN_HOST_PYTHON)
+    target = os.path.dirname(os.path.dirname(exe))
+    log('用 %s 建立虛擬環境…' % host)
+    progress('python', 0, 0)
+    if os.path.isdir(target):
+        shutil.rmtree(target)           # 上次建到一半的不要留著
+    code = _Proc(cancel).run([host, '-m', 'venv', target], log)
+    if code != 0:
+        raise RuntimeError('建立虛擬環境失敗（代碼 %d）。' % code)
+    if not os.path.isfile(exe):
+        raise RuntimeError('虛擬環境建好了卻找不到直譯器：%s' % exe)
+    # 系統附的 pip 可能太舊，認不出新的輪子標籤
+    _pip(root, ['--upgrade', 'pip'], cancel, log, progress, 'pip')
+
+
 def _install_python(root: str, cancel: threading.Event, log: Log, progress: Progress) -> None:
+    if not P.IS_WINDOWS:
+        _install_venv(root, cancel, log, progress)
+        return
     exe = python_exe(root)
     if os.path.isfile(exe):
         log('Python 已存在，略過。')
@@ -276,6 +438,26 @@ def _install_python(root: str, cancel: threading.Event, log: Log, progress: Prog
     os.remove(archive)
 
 
+def _pip_version(root: str) -> tuple:
+    """轉譜環境裡的 pip 版本（例如 `(24, 2)`）；問不出來就回 ()。"""
+    try:
+        out = subprocess.run([python_exe(root), '-m', 'pip', '--version'],
+                             capture_output=True, text=True, timeout=60,
+                             env=_child_env(), creationflags=_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    # 「pip 24.2 from /.../pip (python 3.12)」
+    parts = out.stdout.split()
+    if out.returncode != 0 or len(parts) < 2:
+        return ()
+    numbers = []
+    for piece in parts[1].split('.')[:2]:
+        if not piece.isdigit():
+            return ()
+        numbers.append(int(piece))
+    return tuple(numbers)
+
+
 def _pip(root: str, args: List[str], cancel: threading.Event, log: Log,
          progress: Progress, stage: str) -> None:
     def on_line(line: str) -> None:
@@ -289,9 +471,13 @@ def _pip(root: str, args: List[str], cancel: threading.Event, log: Log,
                 pass
         log(line)
 
+    flags = ['--no-warn-script-location']
+    # venv 內附的 pip 可能比 raw 進度條還老（Python 3.9 帶的是 21.x），給了會
+    # 直接被當成參數錯誤而失敗。升級 pip 本身就是這種情況下的第一個 pip 指令。
+    if _pip_version(root) >= PIP_RAW_PROGRESS_MIN:
+        flags += ['--progress-bar', 'raw']
     code = _Proc(cancel).run(
-        [python_exe(root), '-m', 'pip', 'install', '--no-warn-script-location',
-         '--progress-bar', 'raw'] + args, on_line)
+        [python_exe(root), '-m', 'pip', 'install'] + flags + args, on_line)
     if code != 0:
         raise RuntimeError('pip 安裝失敗（代碼 %d），詳細訊息在上面的紀錄裡。' % code)
 
@@ -364,15 +550,26 @@ def selftest(root: Optional[str] = None, device: str = 'auto',
     return result
 
 
+def _torch_args(variant: str) -> List[str]:
+    """`pip install` 要給 torch 的參數。
+
+    mac 的官方輪子只有 PyPI 有（本身就帶 MPS），PyTorch 自己的 cpu／cu128
+    索引裡沒有 macOS 的檔案，指過去會裝不起來。
+    """
+    if P.IS_MAC:
+        return ['torch']
+    return ['torch', '--index-url', TORCH_INDEX.get(variant, TORCH_INDEX['cpu'])]
+
+
 def install(cancel: threading.Event, log: Log, progress: Progress,
             variant: Optional[str] = None, root: Optional[str] = None) -> Dict:
     """安裝（或補完）轉譜環境。已完成的步驟會跳過。回傳 installed.json 的內容。"""
     root = root or env_root()
     os.makedirs(root, exist_ok=True)
     if variant is None:
-        variant = 'cuda' if has_nvidia_gpu() else 'cpu'
+        variant = default_variant()
     log('安裝位置：%s' % root)
-    log('torch 版本：%s' % ('CUDA 12.8（NVIDIA 顯卡）' if variant == 'cuda' else 'CPU'))
+    log('torch 版本：%s' % VARIANT_TEXT.get(variant, variant))
     try:
         os.remove(_marker_path(root))       # 裝到一半的環境不能被當成好的
     except OSError:
@@ -381,7 +578,7 @@ def install(cancel: threading.Event, log: Log, progress: Progress,
     _install_python(root, cancel, log, progress)
     _install_pip(root, cancel, log, progress)
     log('安裝 torch（這一步最大，請耐心等）…')
-    _pip(root, ['torch', '--index-url', TORCH_INDEX[variant]], cancel, log, progress, 'torch')
+    _pip(root, _torch_args(variant), cancel, log, progress, 'torch')
     log('安裝轉譜套件…')
     _pip(root, PACKAGES, cancel, log, progress, 'packages')
     _install_checkpoint(root, cancel, log, progress)
@@ -400,10 +597,11 @@ def install(cancel: threading.Event, log: Log, progress: Progress,
     }
     with open(_marker_path(root), 'w', encoding='utf-8') as fh:
         json.dump(info, fh, ensure_ascii=False, indent=2)
-    if variant == 'cuda' and info['device'] != 'cuda':
-        log('注意：裝的是 GPU 版，但這張顯卡跑不起來，轉譜會用 CPU（%s）' % info['device_name'])
+    if variant != 'cpu' and info['device'] == 'cpu':
+        log('注意：裝的是 %s 版，但這台機器跑不起來，轉譜會用 CPU（%s）'
+            % (VARIANT_TEXT.get(variant, variant), info['device_name']))
     log('完成：torch %s，使用 %s%s' % (
-        info['torch'], 'GPU' if info['device'] == 'cuda' else 'CPU',
+        info['torch'], device_label(info['device']),
         ('（%s）' % info['device_name']) if info['device_name'] else ''))
     return info
 

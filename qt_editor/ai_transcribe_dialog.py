@@ -16,10 +16,11 @@ from PyQt5.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMessageBox, QPlainTe
                              QProgressBar, QPushButton, QVBoxLayout)
 
 from . import ai_transcribe as AT
+from . import platform_support as PS
 from .ui_text import tr
 
 _STAGE_TEXT = {
-    'python': '下載 Python',
+    'python': '下載 Python' if PS.IS_WINDOWS else '建立 Python 虛擬環境',
     'pip': '下載 pip',
     'torch': '下載 torch',
     'packages': '下載轉譜套件',
@@ -34,6 +35,13 @@ _BYTE_STAGES = {'python', 'pip', 'torch', 'packages', 'model'}
 
 SOLO_PIANO_HINT = ('模型只用獨奏鋼琴訓練過：整首混音（有鼓、合成器、人聲）會轉出大量雜音。'
                    '有鋼琴分軌（*_piano.wav）的曲子請用分軌。')
+
+#: 每種 torch 版本大概多快（安裝前的確認對話框要講清楚要等多久）。
+_VARIANT_SPEED = {
+    'cuda': '偵測到 NVIDIA 顯卡，裝 GPU 版，一首歌幾秒鐘',
+    'mps': '會用 Apple 晶片的 GPU（MPS）轉譜，一首歌約半分鐘（M5 Pro 實測約音檔長度的 14%）',
+    'cpu': '沒有可用的 GPU，裝 CPU 版，一首歌約半分鐘到數分鐘（看 CPU）',
+}
 
 
 class _Worker(QThread):
@@ -185,20 +193,29 @@ def ensure_installed(parent) -> bool:
     """沒裝就問要不要裝、裝完回傳 True；已經裝好直接 True。"""
     if AT.is_installed():
         return True
-    gpu = AT.has_nvidia_gpu()
-    variant = 'cuda' if gpu else 'cpu'
+    variant = AT.default_variant()
+    # Windows 版自己帶 embeddable Python；其他平台要拿系統的 Python 建 venv
+    host = '' if PS.IS_WINDOWS else AT.find_host_python()
+    if not PS.IS_WINDOWS and not host:
+        QMessageBox.warning(
+            parent, tr('安裝 AI 轉譜環境'),
+            tr('AI 轉譜要另外建一個 Python 環境，但這台機器上找不到 Python %d.%d 以上。\n\n'
+               '裝好之後再試一次，例如：\n　brew install python@3.12')
+            % AT.MIN_HOST_PYTHON)
+        return False
     size_mb = AT.estimated_download_mb(variant)
     text = (
         'AI 轉譜要用到 PyTorch 和 ByteDance 的鋼琴轉譜模型，太大放不進製譜器，'
         '需要另外下載安裝一次（之後就不用了）：\n\n'
-        '　下載量：約 %.1f GB，裝好後佔用約 %.0f GB（%s）\n'
-        '　安裝位置：%s\n\n'
+        '　下載量：約 %.1f GB，裝好後佔用約 %.1f GB（%s）\n'
+        '　安裝位置：%s\n'
+        '%s\n'
         '中途取消的話，下次會從還沒完成的步驟接著裝。\n\n'
         '%s\n\n現在安裝嗎？'
     ) % (size_mb / 1000.0, AT.estimated_disk_mb(variant) / 1000.0,
-         '偵測到 NVIDIA 顯卡，裝 GPU 版，一首歌幾秒鐘' if gpu
-         else '沒有偵測到 NVIDIA 顯卡，裝 CPU 版，一首歌約半分鐘到數分鐘（看 CPU）',
-         AT.env_root(), SOLO_PIANO_HINT)
+         _VARIANT_SPEED.get(variant, variant), AT.env_root(),
+         ('　使用的 Python：%s\n' % host) if host else '',
+         SOLO_PIANO_HINT)
     reply = QMessageBox.question(parent, tr('安裝 AI 轉譜環境'), tr(text),
                                  QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
     if reply != QMessageBox.Yes:
@@ -217,7 +234,7 @@ def run_install(parent, variant: Optional[str] = None) -> bool:
     QMessageBox.information(
         parent, tr('安裝完成'),
         tr('AI 轉譜環境已經裝好。\n\ntorch %s，轉譜會使用 %s%s。') % (
-            info.get('torch', '?'), 'GPU' if info.get('device') == 'cuda' else 'CPU',
+            info.get('torch', '?'), AT.device_label(info.get('device', '')),
             ('（%s）' % info['device_name']) if info.get('device_name') else ''))
     return True
 
@@ -249,7 +266,7 @@ def manage_environment(parent) -> None:
                 '　位置：%s\n　大小：約 %d MB\n　torch：%s%s\n　轉譜裝置：%s%s') % (
             root, AT.env_size_mb(), info.get('torch', '?'),
             ('（CUDA %s）' % info['cuda']) if info.get('cuda') else '',
-            'GPU' if info.get('device') == 'cuda' else 'CPU',
+            AT.device_label(info.get('device', '')),
             ('（%s）' % info['device_name']) if info.get('device_name') else '')
     box = QMessageBox(parent)
     box.setWindowTitle(tr('AI 轉譜環境'))

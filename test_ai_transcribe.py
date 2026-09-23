@@ -1,5 +1,6 @@
 """AI 轉譜的安裝與子程序協定（不連網、不需要 torch：用假的 worker 代替）。"""
 
+import importlib.util
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import zipfile
 from unittest import mock
 
 from qt_editor import ai_transcribe as AT
+from qt_editor import platform_support as P
 
 
 FAKE_WORKER = r'''
@@ -213,30 +215,300 @@ class InstalledInfoTests(unittest.TestCase):
         self.assertFalse(AT.is_installed(self.root))
 
 
+class _PlatformPatch:
+    """換掉 platform_support 的平台常數（ai_transcribe 每次都讀屬性，不讀快照）。"""
+
+    def __init__(self, system='darwin'):
+        self.system = system
+
+    def __enter__(self):
+        self._saved = (P.IS_WINDOWS, P.IS_MAC, P.IS_LINUX)
+        P.IS_WINDOWS = self.system.startswith('win')
+        P.IS_MAC = self.system == 'darwin'
+        P.IS_LINUX = not P.IS_WINDOWS and not P.IS_MAC
+        return self
+
+    def __exit__(self, *_exc):
+        P.IS_WINDOWS, P.IS_MAC, P.IS_LINUX = self._saved
+        return False
+
+
 class InstallPythonTests(unittest.TestCase):
+    """Windows 下載 embeddable，mac／Linux 拿系統的 Python 建 venv。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='ai_transcribe_test_')
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
     def test_embeddable_pth_gets_site_enabled(self):
-        root = tempfile.mkdtemp(prefix='ai_transcribe_test_')
-        try:
-            src = os.path.join(root, 'src.zip')
-            with zipfile.ZipFile(src, 'w') as zf:
-                zf.writestr('python.exe', b'')
-                zf.writestr('python311._pth', 'python311.zip\n.\n\n# comment\n#import site\n')
+        src = os.path.join(self.root, 'src.zip')
+        with zipfile.ZipFile(src, 'w') as zf:
+            zf.writestr('python.exe', b'')
+            zf.writestr('python311._pth', 'python311.zip\n.\n\n# comment\n#import site\n')
 
-            def fake_download(url, dest, cancel, progress, stage, expected_size=0):
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.copyfile(src, dest)
+        def fake_download(url, dest, cancel, progress, stage, expected_size=0):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copyfile(src, dest)
 
-            with mock.patch.object(AT, '_download', fake_download):
-                AT._install_python(root, threading.Event(), lambda m: None,
+        with _PlatformPatch('win32'), mock.patch.object(AT, '_download', fake_download):
+            AT._install_python(self.root, threading.Event(), lambda m: None, lambda *a: None)
+            exe = AT.python_exe(self.root)
+        with open(os.path.join(self.root, 'python', 'python311._pth')) as fh:
+            lines = fh.read().splitlines()
+        self.assertIn('import site', lines)
+        self.assertNotIn('#import site', lines)
+        self.assertTrue(os.path.isfile(exe))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, 'downloads', 'python-embed.zip')))
+
+    def test_mac_builds_a_venv_with_the_host_python(self):
+        # 真的建一個 venv（不連網），確認 python_exe 指得到裡面的直譯器
+        pip_args = []
+        with _PlatformPatch('darwin'), \
+                mock.patch.object(AT, 'find_host_python', lambda: sys.executable), \
+                mock.patch.object(AT, '_pip', lambda root, args, *a: pip_args.append(args)):
+            AT._install_python(self.root, threading.Event(), lambda m: None, lambda *a: None)
+            exe = AT.python_exe(self.root)
+        self.assertTrue(os.path.isfile(exe), exe)
+        self.assertIn(['--upgrade', 'pip'], pip_args)      # 系統附的 pip 可能太舊
+
+    def test_mac_without_a_host_python_says_how_to_get_one(self):
+        with _PlatformPatch('darwin'), mock.patch.object(AT, 'find_host_python', lambda: ''):
+            with self.assertRaises(RuntimeError) as ctx:
+                AT._install_python(self.root, threading.Event(), lambda m: None,
                                    lambda *a: None)
-            with open(os.path.join(root, 'python', 'python311._pth')) as fh:
-                lines = fh.read().splitlines()
-            self.assertIn('import site', lines)
-            self.assertNotIn('#import site', lines)
-            self.assertTrue(os.path.isfile(AT.python_exe(root)))
-            self.assertFalse(os.path.exists(os.path.join(root, 'downloads', 'python-embed.zip')))
+        self.assertIn('brew install', str(ctx.exception))
+
+    def test_existing_venv_is_kept(self):
+        with _PlatformPatch('darwin'):
+            exe = AT.python_exe(self.root)
+            os.makedirs(os.path.dirname(exe))
+            open(exe, 'wb').close()
+            looked = []
+            with mock.patch.object(AT, 'find_host_python',
+                                   lambda: looked.append(1) or ''):
+                AT._install_python(self.root, threading.Event(), lambda m: None,
+                                   lambda *a: None)
+        self.assertEqual(looked, [])
+
+
+class PipFlagTests(unittest.TestCase):
+    """venv 內附的 pip 可能很老（Python 3.9 帶 21.x），不能硬給新選項。"""
+
+    def _run_pip(self, pip_version):
+        seen = []
+        with mock.patch.object(AT, '_pip_version', lambda _root: pip_version), \
+                mock.patch.object(AT, 'python_exe', lambda root=None: 'PY'), \
+                mock.patch.object(AT._Proc, 'run',
+                                  lambda self, args, on_line, cwd=None: seen.append(args) or 0):
+            AT._pip('/root', ['torch'], threading.Event(), lambda m: None, lambda *a: None,
+                    'torch')
+        return seen[0]
+
+    def test_new_pip_gets_the_raw_progress_bar(self):
+        self.assertIn('raw', self._run_pip((24, 2)))
+
+    def test_old_pip_does_not(self):
+        # pip 21.x 會回「invalid choice: 'raw'」直接失敗
+        self.assertNotIn('--progress-bar', self._run_pip((21, 2)))
+
+    def test_unknown_pip_version_plays_safe(self):
+        self.assertNotIn('--progress-bar', self._run_pip(()))
+
+    def test_version_parsing(self):
+        with mock.patch.object(AT.subprocess, 'run', lambda *a, **kw: mock.Mock(
+                returncode=0, stdout='pip 24.2 from /x/pip (python 3.12)')):
+            self.assertEqual(AT._pip_version('/root'), (24, 2))
+        with mock.patch.object(AT.subprocess, 'run', lambda *a, **kw: mock.Mock(
+                returncode=1, stdout='')):
+            self.assertEqual(AT._pip_version('/root'), ())
+
+
+class HostPythonTests(unittest.TestCase):
+    def test_the_running_interpreter_is_usable(self):
+        self.assertTrue(AT._usable_host_python(sys.executable))
+
+    def test_a_path_that_is_not_python_is_rejected(self):
+        self.assertFalse(AT._usable_host_python(os.path.join(os.sep, 'nope', 'python3')))
+
+    def test_falls_back_to_the_running_interpreter(self):
+        with mock.patch.object(AT.shutil, 'which', lambda _name: None), \
+                mock.patch.object(AT, 'HOST_PYTHON_DIRS', ()):
+            self.assertEqual(os.path.realpath(AT.find_host_python()),
+                             os.path.realpath(sys.executable))
+
+    def test_a_newer_python_wins(self):
+        versions = {'/opt/a/python3.9': (3, 9), '/opt/b/python3.12': (3, 12)}
+        with mock.patch.object(AT.shutil, 'which', lambda _name: None), \
+                mock.patch.object(AT, 'HOST_PYTHON_DIRS', ('/opt/a', '/opt/b')), \
+                mock.patch.object(AT, 'HOST_PYTHON_NAMES', ('python3.9', 'python3.12')), \
+                mock.patch.object(AT.os.path, 'isfile', lambda p: p in versions), \
+                mock.patch.object(AT, '_host_python_version', versions.get), \
+                mock.patch.object(sys, 'frozen', True, create=True):
+            self.assertEqual(AT.find_host_python(), '/opt/b/python3.12')
+
+    def test_xcodes_python_is_the_last_resort(self):
+        # venv 會連回建立它的直譯器，Xcode 更新一搬家整個環境就壞了
+        xcode = '/Applications/Xcode.app/Contents/Developer/usr/bin/python3.9'
+        versions = {xcode: (3, 9), '/usr/local/bin/python3.9': (3, 9)}
+        with mock.patch.object(AT.shutil, 'which', lambda _name: xcode), \
+                mock.patch.object(AT, 'HOST_PYTHON_DIRS', ('/usr/local/bin',)), \
+                mock.patch.object(AT, 'HOST_PYTHON_NAMES', ('python3.9',)), \
+                mock.patch.object(AT.os.path, 'isfile', lambda p: p in versions), \
+                mock.patch.object(AT, '_host_python_version', versions.get), \
+                mock.patch.object(sys, 'frozen', True, create=True):
+            self.assertEqual(AT.find_host_python(), '/usr/local/bin/python3.9')
+
+
+class TorchSourceTests(unittest.TestCase):
+    def test_mac_takes_torch_from_pypi(self):
+        # PyTorch 自己的 cpu／cu128 索引裡沒有 macOS 的輪子，指過去會裝不起來
+        with _PlatformPatch('darwin'):
+            self.assertEqual(AT._torch_args('mps'), ['torch'])
+            self.assertEqual(AT._torch_args('cpu'), ['torch'])
+
+    def test_windows_picks_the_matching_index(self):
+        with _PlatformPatch('win32'):
+            self.assertIn(AT.TORCH_INDEX['cuda'], AT._torch_args('cuda'))
+            self.assertIn(AT.TORCH_INDEX['cpu'], AT._torch_args('cpu'))
+
+
+class VariantTests(unittest.TestCase):
+    def test_device_labels(self):
+        self.assertEqual(AT.device_label('cuda'), 'GPU')
+        self.assertIn('Apple', AT.device_label('mps'))
+        self.assertEqual(AT.device_label('cpu'), 'CPU')
+        self.assertEqual(AT.device_label(''), 'CPU')
+
+    def test_apple_silicon_defaults_to_mps(self):
+        with _PlatformPatch('darwin'), \
+                mock.patch.object(AT.platform, 'machine', lambda: 'arm64'):
+            self.assertEqual(AT.default_variant(), 'mps')
+            self.assertLess(AT.estimated_download_mb('mps'),
+                            AT.estimated_download_mb('cuda'))
+
+    def test_intel_mac_defaults_to_cpu(self):
+        with _PlatformPatch('darwin'), \
+                mock.patch.object(AT.platform, 'machine', lambda: 'x86_64'):
+            self.assertEqual(AT.default_variant(), 'cpu')
+
+    def test_mac_never_looks_for_cuda(self):
+        with _PlatformPatch('darwin'):
+            self.assertFalse(AT.has_nvidia_gpu())
+
+
+class EnvRootTests(unittest.TestCase):
+    def test_mac_env_lives_in_application_support(self):
+        with _PlatformPatch('darwin'):
+            root = AT.env_root()
+            self.assertIn('Library/Application Support', root.replace(os.sep, '/'))
+            self.assertTrue(root.endswith('ai_transcribe'))
+            self.assertTrue(AT.python_exe(root).endswith(os.path.join('bin', 'python3')))
+
+    def test_windows_env_uses_python_exe(self):
+        with _PlatformPatch('win32'):
+            self.assertTrue(AT.python_exe('C:/x').endswith('python.exe'))
+
+
+def _load_worker():
+    """worker 是複製到轉譜環境去跑的獨立腳本，不是套件的一部分，直接讀檔載入。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'qt_editor', 'ai_transcribe_worker.py')
+    spec = importlib.util.spec_from_file_location('ai_transcribe_worker_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeTorch:
+    """只夠 pick_device 用的假 torch（真的 torch 不在製譜器的環境裡）。"""
+
+    class cuda:
+        available = False
+
+        @classmethod
+        def is_available(cls):
+            return cls.available
+
+
+class PickDeviceTests(unittest.TestCase):
+    """轉譜用哪個裝置：MPS 只在算得對的時候才用，其他情況一律退回 CPU。"""
+
+    def setUp(self):
+        self.worker = _load_worker()
+        _FakeTorch.cuda.available = False
+        self._saved = sys.modules.get('torch')
+        sys.modules['torch'] = _FakeTorch
+
+    def tearDown(self):
+        if self._saved is None:
+            sys.modules.pop('torch', None)
+        else:
+            sys.modules['torch'] = self._saved
+
+    def _patch_mps(self, available, mismatch='', error=None):
+        def fake_mismatch(_torch):
+            if error is not None:
+                raise error
+            return mismatch
+
+        return (mock.patch.object(self.worker, '_mps_available', lambda _t: available),
+                mock.patch.object(self.worker, '_mps_mismatch', fake_mismatch))
+
+    def _pick(self, requested, **kw):
+        patches = self._patch_mps(**kw)
+        for patch in patches:
+            patch.start()
+        try:
+            return self.worker.pick_device(requested)
         finally:
-            shutil.rmtree(root, ignore_errors=True)
+            for patch in patches:
+                patch.stop()
+
+    def test_auto_uses_mps_when_it_agrees_with_cpu(self):
+        device, note = self._pick('auto', available=True)
+        self.assertEqual(device, 'mps')
+        self.assertTrue(note)               # 晶片型號，給使用者看的
+
+    def test_the_chip_name_is_reported(self):
+        # 對應 CUDA 回報顯卡名字；問不到就退回 'MPS'
+        self.assertTrue(self.worker._apple_chip_name())
+
+    def test_wrong_mps_results_fall_back_to_cpu(self):
+        # 安靜算錯比慢更糟：整首譜的音高都會壞掉
+        device, note = self._pick('auto', available=True, mismatch='最大誤差 0.5')
+        self.assertEqual(device, 'cpu')
+        self.assertIn('不一致', note)
+
+    def test_mps_that_blows_up_falls_back_to_cpu(self):
+        device, note = self._pick('auto', available=True, error=RuntimeError('沒有這個運算'))
+        self.assertEqual(device, 'cpu')
+        self.assertIn('無法執行', note)
+
+    def test_asking_for_mps_without_mps_says_so(self):
+        device, note = self._pick('mps', available=False)
+        self.assertEqual(device, 'cpu')
+        self.assertIn('MPS', note)
+
+    def test_asking_for_cpu_skips_the_mps_check(self):
+        self.assertEqual(self._pick('cpu', available=True, error=AssertionError('不該檢查')),
+                         ('cpu', ''))
+
+    def test_auto_without_any_gpu_is_quietly_cpu(self):
+        self.assertEqual(self._pick('auto', available=False), ('cpu', ''))
+
+    def test_mps_wins_over_cuda_on_a_mac(self):
+        # 不會同時有，但順序要確定：先看 MPS 再看 CUDA
+        _FakeTorch.cuda.available = True
+        self.assertEqual(self._pick('auto', available=True)[0], 'mps')
+
+    def test_batch_size_per_device(self):
+        # MPS 的記憶體是和系統共用的，批次比 CUDA 保守
+        self.assertGreater(self.worker._default_batch('cuda'),
+                           self.worker._default_batch('mps'))
+        self.assertEqual(self.worker._default_batch('cpu'), 1)
 
 
 class ParseTests(unittest.TestCase):

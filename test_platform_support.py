@@ -35,9 +35,15 @@ class MacPatch:
 class FeatureGateTests(unittest.TestCase):
     def test_windows_only_features_are_off_on_mac(self):
         with MacPatch():
-            for name in ('hiraeth', 'ai_transcribe', 'game_launch'):
+            for name in ('hiraeth', 'game_launch'):
                 self.assertFalse(P.feature_available(name), name)
                 self.assertTrue(P.feature_reason(name), '關掉了要講原因：%s' % name)
+
+    def test_ai_transcribe_is_on_everywhere(self):
+        # 轉譜環境在 mac／Linux 上改成用系統的 Python 建 venv，不再是 Windows 專用
+        for system in ('darwin', 'win32', 'linux'):
+            with MacPatch(system):
+                self.assertTrue(P.feature_available('ai_transcribe'), system)
 
     def test_everything_is_on_for_windows(self):
         with MacPatch('win32'):

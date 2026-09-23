@@ -24,8 +24,8 @@ WINDOWS_ONLY_FEATURES = {
     # Hiraeth 那套工具是 Windows 專用的第三方環境（SONG_MANAGER.bat、
     # 內嵌的 python.exe、spice64.exe），沒有 Mac 版可言。
     'hiraeth': 'Hiraeth 工具只能在 Windows 上用',
-    # AI 轉譜下載的是 Windows 的嵌入式 Python，整個安裝流程要重做。
-    'ai_transcribe': 'AI 轉譜目前只做了 Windows 的執行環境',
+    # AI 轉譜（音檔 → MIDI）兩邊都能用：Windows 下載嵌入式 Python，mac／Linux
+    # 拿系統的 Python 建 venv（見 ai_transcribe.find_host_python）。
     # 遊戲本體是 Windows 的 Unity build；找遊戲、連曲庫都是 .exe / junction。
     'game_launch': '遊戲目前只有 Windows 版',
     'junction': '曲庫連結在這個平台上用符號連結（symlink）',
