@@ -362,6 +362,9 @@ class MainWindow(QMainWindow):
         self._playback_offset_ms: int = 0       # 播放偏移（正=提前，負=延後）
         self._playback_offset_advance: bool = True  # 上次選的方向
 
+        # 遊戲預覽（斜降的小視窗）；開著的時候跟著判定線跑
+        self._game_preview = None
+
         # ── judge line 更新計時器 ─────────────────────────────────────
         self._silent_play = None      # 只播 MIDI 時的牆上時鐘 (t0, start_ms, end_ms)
         self._judge_timer = QTimer(self)
@@ -605,6 +608,34 @@ class MainWindow(QMainWindow):
         """
         for v in self._visible_panes():
             v.set_judge_line(ms)
+        # 遊戲預覽跟著同一個時刻跑。停播（ms 為 None）時改用判定線現在停在哪，
+        # 這樣暫停後捲動譜面，預覽也會跟著看向那一段。
+        self._push_game_preview(ms if ms is not None else self.view.judge_line_view_ms())
+
+    # ── 遊戲預覽（斜降的小視窗）──────────────────────────────────────
+
+    def open_game_preview(self) -> None:
+        """開（或帶到前面）遊戲預覽視窗。"""
+        from .game_preview import GamePreviewWindow
+
+        existing = getattr(self, '_game_preview', None)
+        if existing is None:
+            existing = GamePreviewWindow(self.view.model.notes, self)
+            existing.finished.connect(lambda _r: setattr(self, '_game_preview', None))
+            self._game_preview = existing
+        existing.set_notes(self.view.model.notes)
+        existing.show()
+        existing.raise_()
+        self._push_game_preview(self.view.judge_line_view_ms())
+
+    def _push_game_preview(self, ms) -> None:
+        window = getattr(self, '_game_preview', None)
+        if window is None or not window.isVisible():
+            return
+        try:
+            window.set_time(ms)
+        except RuntimeError:                # 視窗已經被關掉／刪掉
+            self._game_preview = None
 
     # ── 分割開關 / 方向 / 作用格 ──────────────────────────────────────
 
@@ -1274,6 +1305,9 @@ class MainWindow(QMainWindow):
         view_m = mb.addMenu(t('menu_view'))
         self._add_action(view_m, t('action_zoom_in'),  lambda: self.view.zoom(0.5), '=')
         self._add_action(view_m, t('action_zoom_out'), lambda: self.view.zoom(2.0), '-')
+        view_m.addSeparator()
+        # 斜降的遊戲畫面，開著編輯也沒關係；播放時會自己跟著跑
+        self._add_action(view_m, t('action_game_preview'), self.open_game_preview)
         view_m.addSeparator()
         self._act_inv = QAction(t('action_scroll_invert'), self, checkable=True)
         self._act_inv.setChecked(bool(settings.get('scroll_invert', False)))
@@ -2289,6 +2323,10 @@ class MainWindow(QMainWindow):
         self._refresh_pattern_key_label()
         # Keep hit-time cache consistent after any model edit (including undo).
         self._rebuild_hit_times()
+        # 遊戲預覽看的是同一批音符，改了就要拿新的
+        window = getattr(self, '_game_preview', None)
+        if window is not None and window.isVisible():
+            window.set_notes(self.view.model.notes)
         # 另一格看的是同一份譜：BPM / beat_data 可能變了，重建它的 mapper
         src = self.sender()
         for v in self._visible_panes():

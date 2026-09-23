@@ -77,7 +77,8 @@ hiddenimports = collect_submodules('mido')
 hiddenimports += ['generate_pedal', 'batch_restore_expression']
 hiddenimports += ['qt_editor.ai_transcribe', 'qt_editor.ai_transcribe_dialog',
                   'qt_editor.ai_grid', 'qt_editor.ai_grid_dialog',
-                  'qt_editor.beat_detect', 'qt_editor.audio_backend_sd']
+                  'qt_editor.beat_detect', 'qt_editor.audio_backend_sd',
+                  'qt_editor.game_preview']
 
 a = Analysis(
     ['qt_editor/app.py'],

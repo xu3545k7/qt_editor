@@ -134,6 +134,7 @@ _STRINGS: dict[str, dict[str, str]] = {
 
         # 檢視選單
         'action_zoom_in':       '放大 (+)',
+        'action_game_preview':  '遊戲預覽（斜降）…',
         'action_zoom_out':      '縮小 (-)',
         'menu_pitch_numbering': '音高編號',
         'action_pitch_piano': '鋼琴 (1~88)',
@@ -504,6 +505,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'action_delete_measure':    '删除小节…',
 
         'action_zoom_in':       '放大 (+)',
+        'action_game_preview':  '游戏预览（斜降）…',
         'action_zoom_out':      '缩小 (-)',
         'menu_pitch_numbering': '音高编号',
         'action_pitch_piano': '钢琴 (1~88)',
@@ -859,6 +861,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'action_delete_measure':    'Delete Measure…',
 
         'action_zoom_in':       'Zoom In (+)',
+        'action_game_preview':  'Game Preview…',
         'action_zoom_out':      'Zoom Out (-)',
         'menu_pitch_numbering': 'Pitch numbering',
         'action_pitch_piano': 'Piano (1-88)',

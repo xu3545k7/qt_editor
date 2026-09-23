@@ -67,7 +67,8 @@ hiddenimports = collect_submodules('mido')
 # 批次工具拉進來），PyInstaller 的靜態分析看不到，不明講就會漏打包。
 hiddenimports += ['generate_pedal', 'batch_restore_expression']
 hiddenimports += ['qt_editor.ai_transcribe', 'qt_editor.ai_transcribe_dialog',
-                  'qt_editor.ai_grid', 'qt_editor.ai_grid_dialog', 'qt_editor.beat_detect']
+                  'qt_editor.ai_grid', 'qt_editor.ai_grid_dialog', 'qt_editor.beat_detect',
+                  'qt_editor.game_preview']
 
 a = Analysis(
     ['qt_editor/app.py'],
