@@ -58,6 +58,21 @@ def load_manifest(project_root):
     return json.load(io.open(path, encoding="utf-8")), os.path.dirname(path)
 
 
+#: 和遊戲的 PianoDynamics.MinSoundingVelocity 同一個值，改一邊就要改另一邊。
+MIN_SOUNDING_VELOCITY = 37
+
+
+def lift_velocity(velocity):
+    """把力度抬進 [MIN_SOUNDING_VELOCITY, 127]，和遊戲 PianoDynamics.Lift 同一條式子。
+
+    取樣庫忠於真鋼琴，最輕那層錄到 −35.9 dBFS，力度 16 的音在歌曲底下等於沒有。
+    這裡不抬的話，預覽會比實際遊玩安靜一截。
+    """
+    velocity = max(1, min(127, int(velocity)))
+    span = 127 - MIN_SOUNDING_VELOCITY
+    return max(1, min(127, int(round(MIN_SOUNDING_VELOCITY + span * (velocity - 1) / 126.0))))
+
+
 def pick_zone(manifest, pitch, velocity):
     """The band and zone the game would choose for this note.
 
@@ -141,8 +156,7 @@ def render(chart_path, manifest, sample_folder, rate):
         if pitch <= 0:
             continue
 
-        velocity = int(note.get("velocity") or 96)
-        velocity = max(1, min(127, velocity))
+        velocity = lift_velocity(int(note.get("velocity") or 96))
         zone = pick_zone(manifest, pitch, velocity)
         data = read_sample(sample_folder, zone["sample"], cache)
         if not data:
