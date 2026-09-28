@@ -3692,13 +3692,16 @@ class MainWindow(QMainWindow):
         if grid_dlg.enabled():
             grid = grid_dlg.settings()
             settings.set('ai_grid_division', grid.division)
-            load_path = G.output_path(out, grid.bpm)
+            load_path = G.output_path(out, grid.bpm, variable=grid.variable)
             stats = G.build(out, load_path, grid)
             if audio_for_editor and stats.pad_ms:
                 from .audio_lead_in import apply_lead_in
                 audio_for_editor = apply_lead_in(audio_for_editor, stats.pad_ms).path
+            tempo_text = ('%.2f BPM' % grid.bpm if stats.tempos <= 1
+                          else '%d 段速度 %.2f–%.2f BPM' % (stats.tempos, stats.bpm_min,
+                                                          stats.bpm_max))
             summary = '　'.join(filter(None, [
-                summary, '%.2f BPM，開頭補 %d ms' % (grid.bpm, stats.pad_ms),
+                summary, '%s，開頭補 %d ms' % (tempo_text, stats.pad_ms),
                 ('吸附後合併 %d 顆同格同音' % stats.merged) if stats.merged else '']))
 
         self._load_path(load_path)

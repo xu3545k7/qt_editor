@@ -100,6 +100,16 @@ class AiGridDialog(QDialog):
         self._snap_length.setChecked(True)
         form.addRow('', self._snap_length)
 
+        self._variable = QCheckBox(tr('跟著音樂的速度變化（分段偵測）'))
+        self._variable.setToolTip(tr(
+            '每 16 小節重新量一次速度，相同的併成一段，只在真的換速的地方寫速度變化。\n'
+            '定速的曲子偵測結果就是一段，和不勾一樣。勾了之後第一小節起點由偵測決定。'))
+        self._variable.toggled.connect(self._refresh_enabled)
+        form.addRow('', self._variable)
+        self._tempo_info = QLabel()
+        self._tempo_info.setWordWrap(True)
+        form.addRow('', self._tempo_info)
+
         self._info = QLabel()
         self._info.setWordWrap(True)
         form.addRow(self._info)
@@ -115,11 +125,13 @@ class AiGridDialog(QDialog):
             redetect.setEnabled(False)
             self._candidates.addItem(tr('（這個版本無法自動偵測，請手動輸入）'))
             self._candidates.setEnabled(False)
+        self._curve = None
         if bpm_hint and bpm_hint > 0:
             self._bpm.setValue(float(bpm_hint))
             self._detect_bpm(fill=False)       # 只填候選，不蓋掉給定的 BPM
         else:
             self._detect_bpm()
+        self._detect_curve()
         self._refresh_enabled()
 
     # ── 偵測 ──
@@ -151,11 +163,35 @@ class AiGridDialog(QDialog):
         self._downbeat_edited = False
         self._refresh_info()
 
+    def _detect_curve(self) -> None:
+        """偵測速度變化（0.3 秒以內，開窗時就算好，勾選才會用到）。"""
+        if not BD.available():
+            self._variable.setEnabled(False)
+            self._tempo_info.setText(tr('（這個版本無法偵測速度變化）'))
+            return
+        self._curve = BD.estimate_curve(self._onsets, bpm=self._bpm.value(),
+                                        numerator=self._numerator.value())
+        segments = self._curve.segments if self._curve else []
+        if len(segments) <= 1:
+            self._variable.setEnabled(False)
+            if self._variable.isChecked():
+                self._variable.setChecked(False)
+            self._tempo_info.setText(tr('偵測結果：整首同一個速度。'))
+            return
+        self._variable.setEnabled(True)
+        bar = 1
+        parts = []
+        for segment in segments:
+            parts.append('第 %d 小節 %.2f BPM' % (bar, segment.bpm))
+            bar += segment.bars
+        self._tempo_info.setText(tr('偵測到 %d 段速度：%s') % (len(segments), '，'.join(parts)))
+
     def _on_bpm_changed(self, *_args) -> None:
         if not self._downbeat_edited:
             self._detect_downbeat()
         else:
             self._refresh_info()
+        self._detect_curve()
 
     def _on_downbeat_edited(self, *_args) -> None:
         if not self._updating:
@@ -169,6 +205,8 @@ class AiGridDialog(QDialog):
         snapping = self._grid.currentData() not in (0, None)
         self._strength.setEnabled(on and snapping)
         self._snap_length.setEnabled(on and snapping)
+        # 變速時整條拍點表來自偵測，手動改起點沒有意義（每段拍長都不同）
+        self._downbeat.setEnabled(on and not self.variable())
         self._refresh_info()
 
     def _refresh_info(self) -> None:
@@ -178,20 +216,31 @@ class AiGridDialog(QDialog):
         settings = self.settings()
         pad = G.pad_ms_for(settings)
         bar_ms = settings.bar_s * 1000.0
-        self._info.setText(tr('一小節 %.0f ms。音檔開頭會補 %d ms 靜音（音符一起往後移），'
-                              '第一小節起點落在第 %d 小節的小節線上。') % (
-            bar_ms, pad, int(round((settings.downbeat * 1000 + pad) / bar_ms)) + 1))
+        downbeat = (settings.beats[0] if settings.variable else settings.downbeat) * 1000.0
+        text = tr('一小節 %.0f ms。音檔開頭會補 %d ms 靜音（音符一起往後移），'
+                  '第一小節起點落在第 %d 小節的小節線上。') % (
+            bar_ms, pad, int(round((downbeat + pad) / bar_ms)) + 1)
+        if settings.variable:
+            text += tr('（第一小節的長度；後面每段各自的速度見上面）')
+        self._info.setText(text)
 
     # ── 結果 ──
     def enabled(self) -> bool:
         return self._enable.isChecked()
 
+    def variable(self) -> bool:
+        return bool(self._variable.isChecked() and self._curve
+                    and len(self._curve.segments) > 1)
+
     def settings(self) -> G.GridSettings:
+        variable = self.variable()
+        curve = self._curve if variable else None
         return G.GridSettings(
-            bpm=float(self._bpm.value()),
-            downbeat=self._downbeat.value() / 1000.0,
+            bpm=curve.bpm_first if curve else float(self._bpm.value()),
+            downbeat=curve.beats[0] if curve else self._downbeat.value() / 1000.0,
             numerator=int(self._numerator.value()),
             division=int(self._grid.currentData() or 0),
             strength=self._strength.value() / 100.0,
             snap_length=self._snap_length.isChecked(),
+            beats=curve.beats if curve else None,
         )

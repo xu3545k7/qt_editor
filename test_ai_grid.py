@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import unittest
 
+import bisect
+
 import mido
 
 from qt_editor import ai_grid as G
@@ -162,6 +164,129 @@ class GridBuildTests(unittest.TestCase):
         bar_ms = 4 * 60000.0 / 161
         first = min(n.start for n in model.notes_tree)
         self.assertAlmostEqual(first, bar_ms, delta=1.0)
+
+
+def _varying(first=150.0, second=135.0, bars_each=12, downbeat=0.6, jitter=0.006, seed=7):
+    """前 bars_each 小節 first BPM、之後 second BPM 的合成曲（低音踩拍、右手 16 分）。"""
+    rng = random.Random(seed)
+    notes, t0 = [], downbeat
+    for index, bpm in ((0, first), (1, second)):
+        beat = 60.0 / bpm
+        for bar in range(bars_each):
+            start = t0 + bar * 4 * beat
+            notes.append((start + rng.uniform(-jitter, jitter), 36, 100))
+            notes.append((start + 2 * beat + rng.uniform(-jitter, jitter), 43, 80))
+            for k in range(16):
+                if rng.random() < 0.85:
+                    notes.append((start + k * beat / 4 + rng.uniform(-jitter, jitter),
+                                  72 + (k * 5) % 12, 90 if k % 4 == 0 else 60))
+        t0 += bars_each * 4 * beat
+    return sorted(notes)
+
+
+@unittest.skipUnless(BD.available(), 'numpy 不在')
+class TempoCurveTests(unittest.TestCase):
+    def test_constant_song_is_one_segment(self):
+        curve = BD.estimate_curve(_song(bpm=150, downbeat=0.7, bars=24), numerator=4)
+        self.assertEqual(len(curve.segments), 1)
+        self.assertAlmostEqual(curve.segments[0].bpm, 150.0, places=1)
+
+    def test_finds_the_two_tempos(self):
+        # 給 BPM（使用者通常知道；不給的話全曲估計可能挑到 2 倍速，那是另一件事）
+        curve = BD.estimate_curve(_varying(), bpm=150, numerator=4)
+        bpms = [round(s.bpm) for s in curve.segments]
+        self.assertIn(150, bpms)
+        self.assertIn(135, bpms)
+        # 拍點表本身要跟著變慢：後半的拍長明顯比前半長
+        first = curve.beats[4] - curve.beats[3]
+        last = curve.beats[-2] - curve.beats[-3]
+        self.assertGreater(last, first * 1.05)
+
+    def test_beats_follow_the_music(self):
+        notes = _varying()
+        curve = BD.estimate_curve(notes, bpm=150, numerator=4)
+        # 每個低音（都踩在拍上）都該離某一拍很近
+        beats = curve.beats
+        for t, pitch, _v in notes:
+            if pitch != 36:
+                continue
+            i = min(max(bisect.bisect_left(beats, t) - 1, 0), len(beats) - 2)
+            gap = min(abs(t - beats[i]), abs(t - beats[i + 1]))
+            self.assertLess(gap, 0.03, '拍點離 %.3f 秒的低音太遠' % t)
+
+
+class TempoEventTests(unittest.TestCase):
+    """速度事件：定速只寫一個、換速只寫一個，而且不會來回震盪。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='ai_grid_var_')
+        self.src = os.path.join(self.dir, 'song.ai.mid')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _tempos(self, path):
+        mid = mido.MidiFile(path)
+        out, tick = [], 0
+        for msg in mid.tracks[0]:
+            tick += msg.time
+            if msg.type == 'set_tempo':
+                out.append((tick // (480 * 4), round(mido.tempo2bpm(msg.tempo), 2)))
+        return out
+
+    def test_constant_beats_write_one_tempo(self):
+        beat = 60.0 / 150.0
+        beats = [0.5 + k * beat for k in range(4 * 40 + 1)]
+        notes = [(b, b + 0.2, 60 + (k % 5), 90) for k, b in enumerate(beats[:-1])]
+        _write_ai_midi(self.src, notes)
+        dst = os.path.join(self.dir, 'out.mid')
+        stats = G.build(self.src, dst, G.GridSettings(bpm=150, downbeat=0.5, numerator=4,
+                                                      division=4, beats=beats))
+        self.assertEqual(stats.tempos, 1)
+        self.assertEqual(self._tempos(dst), [(0, 150.0)])
+
+    def test_one_change_writes_two_tempos_without_wobble(self):
+        # 20 小節 196 BPM 之後 10 小節 176 BPM——實測舊版會在這裡每兩小節跳一次
+        beats, t = [], 0.4
+        for bpm, bars in ((196.0, 20), (176.0, 10)):
+            beat = 60.0 / bpm
+            for _ in range(bars * 4):
+                beats.append(t)
+                t += beat
+        beats.append(t)
+        notes = [(b, b + 0.15, 60 + (k % 7), 90) for k, b in enumerate(beats[:-1])]
+        _write_ai_midi(self.src, notes)
+        dst = os.path.join(self.dir, 'out.mid')
+        stats = G.build(self.src, dst, G.GridSettings(bpm=196, downbeat=0.4, numerator=4,
+                                                      division=4, beats=beats))
+        tempos = self._tempos(dst)
+        self.assertEqual(stats.tempos, 2, tempos)
+        self.assertEqual([bpm for _bar, bpm in tempos], [196.0, 176.0])
+
+    def test_bar_lines_land_on_the_tracked_beats(self):
+        beats, t = [], 0.3
+        for bpm, bars in ((170.0, 12), (150.0, 12)):
+            beat = 60.0 / bpm
+            for _ in range(bars * 4):
+                beats.append(t)
+                t += beat
+        beats.append(t)
+        notes = [(b, b + 0.12, 60 + (k % 9), 88) for k, b in enumerate(beats[:-1])]
+        _write_ai_midi(self.src, notes)
+        dst = os.path.join(self.dir, 'out.mid')
+        settings = G.GridSettings(bpm=170, downbeat=0.3, numerator=4, division=4, beats=beats)
+        stats = G.build(self.src, dst, settings)
+        model = NoteModel()
+        model.load_midi(dst, auto_arrange=False)
+        pad = stats.pad_ms / 1000.0
+        shift_bars = int(round((beats[0] + pad) / (beats[4] - beats[0])))
+        worst = 0.0
+        for k in range(0, len(beats) - 1, 4):
+            start, _end = model.get_measure_time_range(k // 4 + shift_bars)
+            if start is None:
+                continue
+            worst = max(worst, abs(start - (beats[k] + pad) * 1000.0))
+        self.assertLess(worst, 3.0, '小節線和追蹤到的拍點差 %.1fms' % worst)
 
 
 class MidiTempoTests(unittest.TestCase):
