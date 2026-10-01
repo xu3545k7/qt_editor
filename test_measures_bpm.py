@@ -276,3 +276,47 @@ class TimeSignatureDurationTests(unittest.TestCase):
             lens_after = [a[1] - a[0] for a in after]
             self.assertEqual(lens_after, lens_before,
                              '%d/%d 後面小節的長度不該變' % (num, den))
+
+
+class BpmSnapTests(unittest.TestCase):
+    """整數毫秒造成的 BPM 抖動：180 BPM 不該顯示成 179.9 / 180.1。
+
+    使用者回報「BPM 算出來在 179.9 和 180.1 反覆跳」。180 BPM 的 4/4 小節是
+    1333.33 ms，存成整數只能 1333 或 1334，回推就是 180.05 / 179.91。
+    """
+
+    def test_a_180bpm_bar_reads_exactly_180(self):
+        from qt_editor.models import snap_measured_bpm
+        # 1333 和 1334 都要讀成 180（兩條小節線各自最多差 0.5 ms）
+        self.assertEqual(snap_measured_bpm(1333, 4), 180.0)
+        self.assertEqual(snap_measured_bpm(1334, 4), 180.0)
+        # 2/4（兩拍）和單拍的量測窗也一樣
+        self.assertEqual(snap_measured_bpm(666, 2), 180.0)
+        self.assertEqual(snap_measured_bpm(667, 2), 180.0)
+        self.assertEqual(snap_measured_bpm(333, 1), 180.0)
+        self.assertEqual(snap_measured_bpm(334, 1), 180.0)
+
+    def test_a_real_non_integer_tempo_is_reported_as_measured(self):
+        """吸附不能吃掉真的速度：1400 ms 就是 171.43，不是 171.5 也不是 171。"""
+        from qt_editor.models import snap_measured_bpm
+        self.assertEqual(snap_measured_bpm(1400, 4), 171.43)
+        self.assertEqual(snap_measured_bpm(1524, 4), 157.48)
+
+    def test_no_snap_when_it_would_need_more_than_a_millisecond(self):
+        from qt_editor.models import snap_measured_bpm, BPM_SNAP_TOLERANCE_MS
+        ideal = 4 * 60000.0 / 200.0                      # 200 BPM = 1200 ms
+        off = int(ideal + BPM_SNAP_TOLERANCE_MS + 1)     # 差 2 ms
+        self.assertNotEqual(snap_measured_bpm(off, 4), 200.0)
+
+    def test_every_measure_of_a_180bpm_chart_reads_the_same(self):
+        m = NoteModel.create_new('t', 180.0, 40.0, 4)
+        m.rebuild_display_cache()
+        got = {m.get_measure_bpm(i) for i in range(m.count_measures())}
+        self.assertEqual(got, {180.0}, '同一個速度的譜不該量出多個 BPM：%s' % sorted(got))
+
+    def test_a_constant_tempo_chart_writes_one_tempo_event(self):
+        """抖動會讓 tempo_events_from_measures 每一小節都補一個速度事件。"""
+        m = NoteModel.create_new('t', 180.0, 40.0, 4)
+        m.rebuild_display_cache()
+        self.assertEqual(len(m.tempo_events_from_measures()), 1)
+

@@ -1273,15 +1273,7 @@ class ChartView(QWidget):
     # ── 長押長度修整（threshold 分級）──────────────────────────────
     def _ms_per_beat_at(self, ms: float) -> float:
         """回傳指定 ms 位置一拍（四分音符）的毫秒長度，吃小節 BPM / 變速。"""
-        bpm = 0.0
-        try:
-            midx = self.model.get_measure_at_ms(float(ms))
-            bpm = float(self.model.get_measure_bpm(midx))
-        except Exception:
-            bpm = 0.0
-        if bpm <= 0:
-            bpm = float(self.model.bpm) if self.model.bpm > 0 else 120.0
-        return 60000.0 / bpm
+        return self.model.ms_per_beat_at(ms)
 
     def _note_dur_beats(self, n: GNote) -> float:
         """音符時長換算成拍數（依該位置 BPM，與變速無關）。"""
@@ -1305,7 +1297,8 @@ class ChartView(QWidget):
         長 hold 的固定前移量不管下一顆音在哪，砍完仍可能壓到同手的下一顆；
         補這一刀之後尾端保證 <= 同手（跨 track）下一顆最早起音 − gap。
         """
-        stats = {'tapped': 0, 'trimmed': 0, 'unchanged': 0, 'total': 0, 'gapped': 0}
+        stats = {'tapped': 0, 'trimmed': 0, 'unchanged': 0, 'total': 0, 'gapped': 0,
+                 'pedal': 0, 'shortened': 0}
         if self.alloc_active:
             return stats
 
@@ -1315,6 +1308,7 @@ class ChartView(QWidget):
         advance_ms = max(0, int(params.get('long_advance_ms', 40)))
         tail_gap_ms = max(0, int(params.get('tail_gap_ms', 0)))
         tail_only_conflicts = bool(params.get('tail_only_conflicts', True))
+        tail_ring = max(0, int(params.get('tail_ring_notes', 0)))
         scope = params.get('scope', 'all')
 
         if scope == 'selected':
@@ -1327,6 +1321,17 @@ class ChartView(QWidget):
 
         was_dirty = self.model.dirty
         self.model.push_history()
+
+        # 先把「長度其實是踏板」的轉回 Tap，再分級。順序不能反：分級看的是音符
+        # 現在的長度，而那個長度正是踏板的長度（見 model.pedal_holds_to_taps）。
+        if params.get('pedal_to_tap'):
+            # 範圍是整份譜面的音符，不只長押——AI 轉譜連 Tap 的長度都是踏板長度
+            pool = ([n for n in self.model.notes_tree if n.idx in self.selected]
+                    if scope == 'selected' else list(self.model.notes_tree))
+            pedal = self.model.pedal_lengths_to_keypress(pool)
+            stats['pedal'] = pedal['retyped']
+            stats['shortened'] = pedal['trimmed']
+            targets = [n for n in targets if hold_fix_candidate(int(n.note_type))]
 
         for n in targets:
             stats['total'] += 1
@@ -1356,10 +1361,48 @@ class ChartView(QWidget):
         # 補刀：同手（跨 track）最小間隔。時間軸取自整份譜面，但只裁 targets。
         if tail_gap_ms > 0:
             stats['gapped'] = self.model.enforce_hold_tail_gap(
-                tail_gap_ms, targets, only_conflicts=tail_only_conflicts)
+                tail_gap_ms, targets, only_conflicts=tail_only_conflicts,
+                max_ring_notes=tail_ring)
 
-        changed = stats['tapped'] + stats['trimmed'] + stats['gapped']
+        changed = (stats['tapped'] + stats['trimmed'] + stats['gapped']
+                   + stats['pedal'] + stats['shortened'])
         if changed:
+            sel_notes = [n for n in self.model.notes_tree if n.idx in self.selected]
+            self.model.rebuild_display_cache()
+            self.selected = {n.idx for n in sel_notes}
+            self.update()
+            self.note_edited.emit()
+        elif self.model.undo_stack:
+            self.model.discard_last_history()
+            self.model.dirty = was_dirty
+        return stats
+
+    def apply_hand_split(self, split_tracks: bool = True) -> dict:
+        """重新判斷左右手（見 `hand_split`）。回傳 {'changed', 'total', 'tracks'}。
+
+        `split_tracks` 會把音符照新的手拆成兩條音軌。不拆的話，下次跑排譜器時
+        `smart_chart._assign_hands` 會因為「只有一條音軌」而改用全曲音高中位數
+        重新切一刀，把這裡的結果蓋掉（見記憶 hand-vs-track）。
+        """
+        from . import hand_split
+
+        stats = {'changed': 0, 'total': 0, 'tracks': 0}
+        if self.alloc_active:
+            return stats
+        notes = [n for n in self.model.notes_tree if n.pitch is not None]
+        stats['total'] = len(notes)
+        if len(notes) < 2:
+            return stats
+
+        was_dirty = self.model.dirty
+        self.model.push_history()
+        stats['changed'] = hand_split.assign(notes)
+        if split_tracks:
+            for note in notes:
+                note.track = 1 if int(note.hand) == 1 else 2
+            stats['tracks'] = 2
+
+        if stats['changed'] or split_tracks:
             sel_notes = [n for n in self.model.notes_tree if n.idx in self.selected]
             self.model.rebuild_display_cache()
             self.selected = {n.idx for n in sel_notes}

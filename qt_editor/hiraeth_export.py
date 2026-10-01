@@ -296,6 +296,37 @@ def copy_model(model: Any) -> Any:
             pass
 
 
+def _trim_beats(root: Any, duration_ms: int, log: Dict[str, int]) -> None:
+    """砍掉曲末之後的拍子線。
+
+    Hiraeth 2.1.0 開始檢查 `beat_data` 的時間（`chart_compat.inspect_chart`）：
+    每一條都必須落在 `music_finish_time_msec + 2000` 以內，超過就整份退件
+    （訊息是 `start_timing_msec outside supported range at index N`，N 是
+    **拍子線**的編號，不是音符的，很容易看錯地方）。
+
+    音符和 sub_note 本來就有夾在 limit 內，只有拍子線漏了——因為 2.0 不檢查。
+    實測一份 202 秒、BPM 100 的譜最後一條拍子線落在曲末後 2398 ms，剛好超線。
+
+    收到曲末（而不是收到 limit）是因為：曲子結束之後的拍子線本來就畫不到，
+    而夾到 limit 會讓兩條拍子線疊在同一刻。至少留一條，`beat_data` 不能空。
+    """
+    container = root.find('beat_data')
+    if container is None:
+        return
+    beats = container.findall('beat')
+    keep = [b for b in beats
+            if int(b.findtext('start_timing_msec', '0')) <= duration_ms]
+    if not keep and beats:
+        keep = beats[:1]
+    dropped = len(beats) - len(keep)
+    if not dropped:
+        return
+    for beat in beats:
+        if beat not in keep:
+            container.remove(beat)
+    log['beats_after_end_dropped'] = dropped
+
+
 def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
                       hold_gap_ms: int = DEFAULT_HOLD_GAP_MS) -> bytes:
     """PAN 相容 XML 再收緊到 Hiraeth 的規則。`model` 會被改，請傳副本。"""
@@ -310,6 +341,7 @@ def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
     header.find('max_scale').text = '88'
     header.find('music_finish_time_msec').text = str(int(duration_ms))
     limit = int(duration_ms) + 2000
+    _trim_beats(root, int(duration_ms), log)
     tracks = root.findall('track_info/track')
     for track in tracks:
         track.find('name').text = 'key_apiano1'
@@ -943,6 +975,12 @@ def validate_chart(path: str, seconds: float) -> List[str]:
     if len(ids_ok) != len(tracks) or any(int(s.findtext('track_index', '-1')) not in ids_ok
                                          for s in root.iter('sub_note')):
         problems.append(tr('track 不是 key_apiano1 或對不上'))
-    if int(root.findtext('header/first_bpm', '0')) <= 0 or not root.findall('beat_data/beat'):
+    beats = root.findall('beat_data/beat')
+    if int(root.findtext('header/first_bpm', '0')) <= 0 or not beats:
         problems.append(tr('缺 BPM 或拍子資料'))
+    # Hiraeth 2.1.0 起，拍子線的時間也要落在曲末 +2 秒內（2.0 不檢查）。
+    # 它的錯誤訊息報的是**拍子線**的編號，看起來很像音符出問題，別被騙了。
+    elif any(not 0 <= int(b.findtext('start_timing_msec', '-1')) <= duration + 2000
+             for b in beats):
+        problems.append(tr('有拍子線落在曲末 2 秒之後'))
     return problems

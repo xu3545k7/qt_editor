@@ -498,7 +498,13 @@ def _classify_articulations(
     notes: Sequence[Any],
     settings: SmartChartSettings,
 ) -> Tuple[int, int, int]:
-    """Infer articulations from each hand's local onset-spacing distribution."""
+    """Infer articulations from each hand's local onset-spacing distribution.
+
+    這裡**只決定類型，不改長度**。長度是照踏板來的，折算回按鍵長度是
+    `NoteModel.trim_pedal_sustained_holds` 的事——那條路才知道「這是剛轉進來的
+    MIDI 還是重排既有譜面」，而重排不准動長度（見 test_arrange_options 的
+    `test_lengths_really_survive_a_rearrange`）。
+    """
     beat_ms = max(80.0, float(settings.beat_ms))
     changed = 0
     by_hand: Dict[int, List[Any]] = {0: [], 1: []}

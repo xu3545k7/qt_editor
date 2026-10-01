@@ -113,6 +113,9 @@ def _bpm_from_midi_tempo(tempo_us: int) -> float:
 TOTAL_GAME_KEYS: int = 28
 INTERNAL_LANE_BASE: int = 0
 EXTERNAL_LANE_BASE: int = 1
+#: 官方劇情譜的佔位座標（min/max_key_index）。Hiraeth 的驗證器也特別放行這一對。
+PAN_STORY_PLACEHOLDER_LO: int = -2147483648
+PAN_STORY_PLACEHOLDER_HI: int = -2147483646
 LEGACY_LANE_BASE: int = 0
 EDITOR_BEAT_UNIT_SCALE: int = 1000
 OFFICIAL_PIANO_INDEX_MIN: int = 1
@@ -948,6 +951,15 @@ class GNote:
         # --- slide（note_type=4）串鏈欄位
         # note_index：此音符在 XML 中的原始 <index>（param1/param2 用它互相參照）
         # param1：鏈上「前一顆」的 index；param2：「下一顆」的 index；-1 表端點
+        # 原檔的 min/max_key_index，以及它被正規化成內部座標後的樣子。
+        #
+        # 內部座標只表示得了 0..27（畫面上的 28 個鍵），但官譜不只用這個範圍：
+        # hand=2 用周邊座標（Hiraeth 的驗證器寫明 -5..42）、劇情譜還有 INT_MIN 的
+        # 佔位座標。載入時一律夾到 0..27，那些值就回不去了。這裡把原值帶著走，
+        # 寫回 XML 時如果鍵道沒被編輯過（內部值還等於當初正規化的結果），就原樣
+        # 寫回原值；被編輯過就寫編輯後的，不會擋住修改。
+        self.pan_raw_lanes: Optional[Tuple[int, int]] = None
+        self.pan_norm_lanes: Optional[Tuple[int, int]] = None
         self.note_index: Optional[int] = None
         self.param1: int = 0
         self.param2: int = 0
@@ -1058,6 +1070,13 @@ class GNote:
         note.channel   = int(d['channel']) if d.get('channel') not in (None, '') else None
         note.off_velocity = int(d['off_velocity']) if d.get('off_velocity') not in (None, '') else None
         note.note_index = int(d['index']) if d.get('index') not in (None, '') else None
+        lanes = d.get('pan_lanes')
+        if isinstance(lanes, (list, tuple)) and len(lanes) == 4:
+            try:
+                note.pan_raw_lanes = (int(lanes[0]), int(lanes[1]))
+                note.pan_norm_lanes = (int(lanes[2]), int(lanes[3]))
+            except (TypeError, ValueError):
+                note.pan_raw_lanes = note.pan_norm_lanes = None
         note.param1    = int(d.get('param1', 0) or 0)
         note.param2    = int(d.get('param2', 0) or 0)
         note.param3    = int(d.get('param3', 0) or 0)
@@ -1207,6 +1226,11 @@ class GNote:
             'channel':    self.channel,
             'off_velocity': self.off_velocity,
             'index':      self.note_index,
+            # 原檔的 min/max_key_index（超出內部可表示範圍時才有）。XML 要對齊
+            # PAN，這種值只能靠 JSON 帶著走，見 GNote.pan_raw_lanes。
+            'pan_lanes':  ([int(self.pan_raw_lanes[0]), int(self.pan_raw_lanes[1]),
+                            int(self.pan_norm_lanes[0]), int(self.pan_norm_lanes[1])]
+                           if self.pan_raw_lanes and self.pan_norm_lanes else None),
             'param1':     self.param1,
             'param2':     self.param2,
             'param3':     self.param3,
@@ -1216,11 +1240,18 @@ class GNote:
             d.pop('scale_piano', None)
         if self.note_index is None:
             del d['index']
+        if d.get('pan_lanes') is None:
+            d.pop('pan_lanes', None)
         for key in ('track', 'velocity', 'channel', 'off_velocity', 'hidden'):
             if d[key] is None:
                 del d[key]
-        # trill 需要保留 sub_note_data（mesh 格 + src_* 還原欄位）才能完整往返
-        if note_is_trill(self.note_type) and self.sub_elems:
+        # sub_note 原樣存下來。XML 要對齊 PAN，而 sub_note 的音高／時間／力度／
+        # 音軌不一定推得回來（官譜的 sub_note 音高常常和音符本身不同——實測 785
+        # 份官譜有 347 份就差在這裡），只有 JSON 存得下。
+        #
+        # 以前只有顫音存（它的 mesh 格非存不可），其他音符靠「從音符本身重建」，
+        # 那對編輯器自己生的譜成立，對官譜不成立。
+        if self.sub_elems:
             d['subNotes'] = [sub_elem_to_dict(se) for se in self.sub_elems]
         return d
 
@@ -1385,6 +1416,45 @@ class PitchRestore(NamedTuple):
         中位 74——壞掉的是譜面那一側，正是這個工具要修的東西。
         """
         return abs(int(self.semitones)) > 12
+
+
+#: 量出來的 BPM 和「乾淨的 BPM」最多差這麼多才吸附
+BPM_SNAP_MAX_DELTA = 1.0
+#: 一小節的長度是兩條小節線相減，各自四捨五入到整數毫秒 -> 差最多 1 ms
+BPM_SNAP_TOLERANCE_MS = 1.0
+
+
+def snap_measured_bpm(bar_ms: float, quarters: float) -> float:
+    """把「從整數毫秒的小節長度回推的 BPM」吸附回乾淨的值。
+
+    譜面的時間只存整數毫秒，而大部分速度的一拍不是整數：180 BPM 的 4/4 小節
+    理想長度是 1333.33 ms，只能存成 1333 或 1334，回推就得到 180.05 或 179.91
+    —— 使用者看到的是 BPM 在 179.9 / 180.1 之間反覆跳。資料沒有變速，是顯示
+    的位數超過了資料的精度（實測曲庫 6570 個小節，每一個都落在某個整數或 .5
+    BPM 的 0.35 以內）。
+
+    `quarters` 是這一小節佔幾個四分音符（分子x4÷分母）。做法是反過來驗證，
+    而不是直接四捨五入：取最接近的整數 BPM，算出它「應該」的小節長度，若和
+    實際長度差在 +-1 ms 以內，那個乾淨的值就足以解釋這一小節，顯示它；差得
+    更多就是真的變速，原值照實回報。
+
+    只吸附整數，不吸附 .5：一小節 1400 ms 量出 171.43，離 171.5 只有 0.07 BPM
+    （換算成長度 0.6 ms，會通過上面的檢查），但譜真的就是 171.43 —— 那會把
+    「資料分辨不出來」講成「速度是 171.5」。整數的間隔夠寬，只有真的是整數
+    速度才過得了關，所以不會改到任何人設定的值。
+
+    順帶修掉 `tempo_events_from_measures` 的老毛病：它用 0.005 的差判斷有沒有
+    變速，抖動會讓等速的譜**每一小節都產生一個速度事件**。
+    """
+    bar_ms = float(bar_ms)
+    quarters = float(quarters)
+    if bar_ms <= 0 or quarters <= 0:
+        return 0.0
+    measured = quarters * 60000.0 / bar_ms
+    candidate = float(round(measured))
+    if 0 < candidate and abs(candidate - measured) <= BPM_SNAP_MAX_DELTA             and abs(quarters * 60000.0 / candidate - bar_ms) <= BPM_SNAP_TOLERANCE_MS:
+        return candidate
+    return round(measured, 2)
 
 
 class NoteModel:
@@ -1805,9 +1875,96 @@ class NoteModel:
             hold.end = new_end
             hold.gate = max(1, new_end - start)
             changed += 1
+        changed += self._trim_to_release_deadline(only)
         if changed:
             self.rebuild_display_cache()
             self.dirty = True
+        return changed
+
+    def _provisional_hands_for_trim(self) -> int:
+        """單軌來源：先照全曲音高中位數切一刀，暫時分出兩隻手。回傳改了幾顆。
+
+        只是為了讓**排版之前**的裁切有手可以判。`_trim_to_release_deadline` 需要
+        分手（手指數、跨度都是一隻手的事），而單軌 MIDI 那時整份都是同一隻手，
+        閘門會把它擋掉——於是排譜器看到的還是踏板灌水的長度，以為到處都是長條
+        走廊，為了閃它們把鍵道映射扭曲掉。
+
+        實測那份 AI 轉譜第 110 小節的八度交替（89↔101）：排譜後才裁的話
+        `_repair_hold_corridors` 反覆把 89 往上推（21→22→24→25），八度從 4 條
+        塌成 **1 條**；先裁再排譜就維持 4 條。全譜「方向相反或八度壓扁」從
+        **20/832（2.4%）降到 1/831（0.1%）**。
+
+        這個分手是暫時的：排譜器的 `_assign_hands` 一定會重算（有兩軌以上就照
+        音軌，單軌就照中位數——和這裡同一條規則），所以不會影響最後的結果。
+        """
+        pitched = [n for n in self.notes_tree if n.pitch is not None]
+        if len(pitched) < 2 or len({int(n.hand) for n in pitched}) > 1:
+            return 0
+        from statistics import median
+        middle = median([int(n.pitch) for n in pitched])
+        changed = 0
+        for note in pitched:
+            hand = 1 if int(note.pitch) < middle else 0
+            if int(note.hand) != hand:
+                note.hand = hand
+                changed += 1
+        return changed
+
+    def _trim_to_release_deadline(self, only: Optional[Iterable['GNote']] = None,
+                                  gap_ms: int = 40, max_ring_notes: int = 5) -> int:
+        """長度拖過「非放開不可的那一刻」的，裁到那裡。回傳裁了幾顆。
+
+        `trim_pedal_sustained_holds` 上面那兩條證據（同一個鍵再被按、同手構不到）
+        **只認長押**，所以 Tap 的長度從來沒被碰過——但 AI 音訊轉譜／MIDI 的
+        note-off 是踏板放開的時間，Tap 的長度一樣是踏板長度。實測一份 AI 轉譜：
+        **571 顆「類型 Tap、長度 >= 500ms」**（中位 750ms、最長 3.8 秒）。編輯器
+        照 start→end 畫，那就是一根根長條。
+
+        界線用 `release_deadline()`，**不是**「同手下一顆起音」：**和弦與分解和弦
+        本來就是手指按著、其它指頭繼續彈下去，那種不該裁**。只有同一個鍵再被按、
+        超過五指、超過手的跨度、或底下串超過 `max_ring_notes` 顆才算非放開不可。
+
+        那份 AI 轉譜（3425 顆）兩種界線的差別：
+
+        | 界線 | 裁掉 | 還蓋過同手下一顆 | Tap 卻 >=500ms |
+        |---|---|---|---|
+        | 一律裁到同手下一顆 | 2592 | 0 | 0 |
+        | 只裁按不住的 | 2183 | **721** | 26 |
+
+        留下的那 721 顆，底下同手音中位 2 顆、連同它們的音程跨度中位 9 個半音
+        —— 五指和一個八度以內，就是一隻手按得住的和弦。
+
+        間隔最多吃掉「到那一刻為止」的四分之一——固定值在密集段落會把音符吃光
+        （53ms 一顆的跑動扣掉固定 40ms 只剩 13ms，實測 900 顆會變成 13ms）。
+
+        **閘門**：譜面要分得出兩隻手。兩手擠在同一軌的譜匯進來整份都是同一隻手，
+        手指數和跨度就會算成一隻手要負擔全部，整份譜會被切碎（和
+        `pedal_release_guesses` 的 `use_hand_reach` 同一個理由）。
+        """
+        if len({int(n.hand) for n in self.notes_tree}) < 2:
+            return 0                                  # 分不出兩隻手就不要動
+        hands = self.hand_note_timelines()
+        starts_by_hand = {hand: [int(n.start) for n in items]
+                          for hand, items in hands.items()}
+        pool = self.notes_tree if only is None else only
+        gap = max(0, int(gap_ms))
+        changed = 0
+        for note in pool:
+            same = hands.get(int(note.hand))
+            if not same:
+                continue
+            deadline = self.release_deadline(
+                note, same, starts_by_hand[int(note.hand)],
+                max_ring_notes=max(0, int(max_ring_notes)))
+            if deadline is None or int(note.end) <= deadline:
+                continue
+            room = deadline - int(note.start)
+            new_end = max(int(note.start) + 1, deadline - min(gap, room // 4))
+            if new_end >= int(note.end):
+                continue
+            note.end = new_end
+            note.gate = max(1, new_end - int(note.start))
+            changed += 1
         return changed
 
     def pedal_release_guesses(
@@ -2081,6 +2238,68 @@ class NoteModel:
             changed += 1
 
         return changed
+
+    def pedal_lengths_to_keypress(
+        self,
+        targets: Optional[Iterable['GNote']] = None,
+        gap_ms: int = 40,
+        hold_floor_beats: float = 1.0,
+    ) -> Dict[str, int]:
+        """長度其實是踏板的音符：改成手指真正按得到的長度。
+
+        判準只有一條，不需要門檻：**尾巴蓋過同一隻手的下一顆起音**。手指還按
+        著就不可能去彈同一隻手的下一顆音，所以超出去的那一段必然是延音踏板，
+        不是按鍵長度。
+
+        為什麼分級修整抓不到：`apply_hold_length_fix` 看的是「音符現在的長度」，
+        但 AI 音訊轉譜／MIDI 轉出來的譜，那個長度**就是踏板的長度**。一串上行
+        音階每顆都拖 3 拍，全部被判成「長 Hold」，於是只把尾端前移 40ms——畫面
+        上還是一根根長條。而且問題不只在長押：實測那份 AI 譜連 Tap 的長度中位
+        數都有 1 拍（曲庫是 0.32 拍），**全譜 76% 的音符**長度都超出同手下一顆。
+
+        縮短聲音會不會變斷奏？不會——遊戲的制音器由踏板控制（`PianoVoiceManager`：
+        踏板踩著時放開的琴鍵繼續響），而要縮短的那些音有 85% 在踏板段落裡。
+
+        縮完之後長度仍然 >= `hold_floor_beats` 拍的留著長押旗標（手指真的按得住
+        那麼久）；短於它的清掉旗標變成 Tap。
+
+        **順序很重要**：要在任何裁切之前做。裁過之後就沒有東西蓋過下一顆了，
+        證據被自己抹掉，這條規則一顆也抓不到。
+
+        **只給「長度來自延音」的譜用**，預設關閉。手寫譜的長押蓋過同手下一顆是
+        分解和弦的正常樣子——全曲庫 20896 顆這種長押，85.6% 一隻手完全按得住
+        （見 `release_deadline` 與記憶 hold-length-fix）。手寫譜要處理尾端請用
+        `enforce_hold_tail_gap(only_conflicts=True)`，那一條只裁物理上按不住的。
+
+        怎麼分辨：延音來源的譜**連 Tap 都超出去**。實測那份 AI 譜全譜 76% 的音符
+        長度蓋過同手下一顆（Tap 長度中位數 1 拍，曲庫是 0.32 拍）；手寫譜只有
+        6.9% 的長押是這樣，Tap 根本不會。
+        """
+        timelines = self.hand_onset_timelines()
+        pool = self.notes_tree if targets is None else targets
+        gap = max(0, int(gap_ms))
+        stats = {'trimmed': 0, 'retyped': 0}
+        for note in pool:
+            deadline = self.next_same_hand_onset(note, timelines)
+            if deadline is None or int(note.end) <= deadline:
+                continue
+            # 間隔最多吃掉「到下一顆為止」的四分之一。固定值在密集段落會把音符
+            # 吃光：這份 AI 譜的跑動是 53 ms 一顆，扣掉固定的 40 ms 只剩 13 ms，
+            # 900 顆長度都變成 13 ms（曲庫的 Tap 中位數是 145 ms）。
+            room = deadline - int(note.start)
+            new_end = max(int(note.start) + 1, deadline - min(gap, room // 4))
+            if new_end < int(note.end):
+                note.end = new_end
+                note.gate = new_end - int(note.start)
+                stats['trimmed'] += 1
+            if int(note.note_type) & LONG_BIT:
+                floor = self.beats_to_ms_at(int(note.start), float(hold_floor_beats))
+                if new_end - int(note.start) < floor:
+                    note.note_type = int(note.note_type) & ~LONG_BIT
+                    stats['retyped'] += 1
+        if stats['trimmed'] or stats['retyped']:
+            self.dirty = True
+        return stats
 
     def resolve_hold_tail_overlaps(self, gap_ms: int, only_conflicts: bool = True,
                                    sequential_gap: bool = False,
@@ -2826,14 +3045,19 @@ class NoteModel:
     def _normalize_notes_to_internal(notes: List[GNote], lane_index_base: int) -> None:
         delta = int(lane_index_base) - INTERNAL_LANE_BASE
         for n in notes:
-            mn = int(n.min_key) - delta
-            mx = int(n.max_key) - delta
+            raw = (int(n.min_key), int(n.max_key))
+            mn = raw[0] - delta
+            mx = raw[1] - delta
             if mx < mn:
                 mn, mx = mx, mn
             mn = max(0, min(TOTAL_GAME_KEYS - 1, mn))
             mx = max(mn, min(TOTAL_GAME_KEYS - 1, mx))
             n.min_key = mn
             n.max_key = mx
+            # 夾限改變了值就記下原樣（見 GNote.pan_raw_lanes）
+            if raw != (mn + delta, mx + delta):
+                n.pan_raw_lanes = raw
+                n.pan_norm_lanes = (mn, mx)
 
     def _get_xml_lane_index_base(self) -> int:
         return int(self.xml_lane_index_base)
@@ -3072,7 +3296,14 @@ class NoteModel:
             if 0 <= target < len(self.notes_tree) and target != note.idx:
                 note._sub_host = self.notes_tree[target]
         lane_base = self._get_json_lane_index_base()
-        self.xml_lane_index_base = lane_base
+        # 寫回 XML 用的基準是獨立的一件事（見 save_json 的 pan_lane_index_base）。
+        # 沒有記錄就沿用 JSON 的基準，行為和以前一樣。
+        raw_xml_base = self.json_meta.get('pan_lane_index_base')
+        try:
+            self.xml_lane_index_base = (int(raw_xml_base) if raw_xml_base is not None
+                                        else lane_base)
+        except (TypeError, ValueError):
+            self.xml_lane_index_base = lane_base
         self._normalize_notes_to_internal(self.notes_tree, lane_base)
         self.rebuild_display_cache()
         self.clear_history()
@@ -3753,13 +3984,16 @@ class NoteModel:
 
                 if msg.type == 'set_tempo':
                     tempo_value = int(msg.tempo)
+                    # tempo 是 0 的事件是壞的：**跳過它**，不要拿 120 頂上去。
+                    #
+                    # 頂上去的話，整首曲的速度就被一個壞事件決定了，而後面那些
+                    # 正常的事件再也沒有機會填 first_bpm（它已經不是 None 了）。
+                    if tempo_value <= 0:
+                        continue
                     tempo_events_ticks.append((current_tick, tempo_value))
                     if first_bpm is None:
                         default_tempo = tempo_value
-                        try:
-                            first_bpm = _bpm_from_midi_tempo(tempo_value)
-                        except ZeroDivisionError:
-                            first_bpm = 120.0
+                        first_bpm = _bpm_from_midi_tempo(tempo_value)
 
                 if msg.type == 'time_signature':
                     try:
@@ -3939,11 +4173,19 @@ class NoteModel:
         if auto_arrange:
             # 踏板殘響造成的長音先裁掉，再排版 —— 否則那些過長的長條會佔住
             # 走廊，把後面的排版空間吃光。
+            self._provisional_hands_for_trim()
             self.trim_pedal_sustained_holds()
             if arrange_options is not None:
                 self.last_smart_chart_stats = self.arrange_with_options(arrange_options)
             else:
                 self.last_smart_chart_stats = self.smart_arrange_midi()
+            # 排完再裁一次。上面那一次跑在分手之前——單軌來源（AI 音訊轉譜就是）
+            # 那時候整份都是同一隻手，`_trim_to_same_hand_next_onset` 的第一道
+            # 閘門會擋掉，Tap 的踏板長度就留了下來（實測那份 AI 譜 571 顆「類型
+            # Tap、長度 >= 500ms」）。排譜分完手才有辦法判。
+            #
+            # 只會縮短、不會拉長，所以走廊只會變寬，不會把剛排好的版面弄壞。
+            self.trim_pedal_sustained_holds()
             self.midi_unarranged = False
         else:
             # 不轉譜：維持 MIDI 編輯模式，音符保留原始音高與時間，鍵道只是
@@ -5956,6 +6198,21 @@ class NoteModel:
             # 的音符維持原本的先後，讀回來左右手才不會看起來跳位。
             visible.sort(key=lambda n: int(n.start))
             position = {id(n): i for i, n in enumerate(visible)}
+            # 寫出去的 <index>：**原檔有就沿用**。官方譜的編號不一定從 0 開始、
+            # 也不一定連號（實測有從 901 起跳的），重編雖然不會讓遊戲讀不到，但
+            # 那是原檔帶著的資訊，繞一圈回來應該一樣。
+            #
+            # 只有在「每顆都有編號且互不重複」時才沿用，否則整份重編——半套會
+            # 讓 param1/param2 指到不存在的編號。
+            written = {}
+            originals = [getattr(n, 'note_index', None) for n in visible]
+            if visible and all(v is not None for v in originals) \
+                    and len(set(int(v) for v in originals)) == len(originals):
+                for n, v in zip(visible, originals):
+                    written[id(n)] = int(v)
+            else:
+                for i, n in enumerate(visible):
+                    written[id(n)] = i
             index_map = build_slide_index_map(visible)
             prev_of: Dict[int, int] = {}
             next_of: Dict[int, int] = {}
@@ -5964,8 +6221,8 @@ class NoteModel:
                     continue
                 nxt = slide_next_note(n, visible, index_map)
                 if nxt is not None and id(nxt) in position and nxt is not n:
-                    next_of[id(n)] = position[id(nxt)]
-                    prev_of.setdefault(id(nxt), position[id(n)])
+                    next_of[id(n)] = written[id(nxt)]
+                    prev_of.setdefault(id(nxt), written[id(n)])
 
             tracks, zones = self._pan_tracks_and_zones()
             tracks = tracks or list(DEFAULT_TRACKS)
@@ -6004,17 +6261,37 @@ class NoteModel:
             note_data = ET.Element('note_data')
             for i, n in enumerate(visible):
                 el = ET.SubElement(note_data, 'note')
-                lo, hi = lane_range_to_serialized(n.min_key, n.max_key, EXTERNAL_LANE_BASE)
-                lo, hi = max(1, min(TOTAL_GAME_KEYS, int(lo))), max(1, min(TOTAL_GAME_KEYS, int(hi)))
-                lo, hi = min(lo, hi), max(lo, hi)
+                hand = int(n.hand) if int(n.hand) in (0, 1, 2) else 0
+                raw_lanes = getattr(n, 'pan_raw_lanes', None)
+                norm_lanes = getattr(n, 'pan_norm_lanes', None)
+                if raw_lanes and norm_lanes \
+                        and (int(n.min_key), int(n.max_key)) == tuple(norm_lanes):
+                    lo, hi = int(raw_lanes[0]), int(raw_lanes[1])
+                else:
+                    raw_lanes = None
+                    lo, hi = lane_range_to_serialized(
+                        n.min_key, n.max_key, self._get_xml_lane_index_base())
+                # 夾限照**官譜實際出現過的範圍**，不是 1..28。官方的 hand=2 用的是
+                # 周邊座標（Hiraeth 的驗證器寫明 -5..42），劇情譜還有 INT_MIN 的
+                # 佔位座標；以前一律夾到 1..28，那些值就被改掉了（785 份官譜裡
+                # 362 份的鍵道對不回去，6 份劇情譜的佔位座標被寫成 1）。
+                if raw_lanes is not None:
+                    pass                    # 原檔的值（含周邊座標與劇情佔位）原樣寫回
+                elif (lo, hi) == (PAN_STORY_PLACEHOLDER_LO, PAN_STORY_PLACEHOLDER_HI):
+                    pass
+                else:
+                    span = (-5, 42) if hand == 2 else (-2, 30)
+                    lo = max(span[0], min(span[1], int(lo)))
+                    hi = max(span[0], min(span[1], int(hi)))
+                    lo, hi = min(lo, hi), max(lo, hi)
                 start, end = int(n.start), max(int(n.start), int(n.end))
                 nt = pan_note_type(n.note_type)
                 slide = bool(nt & 0x04)
-                hand = int(n.hand) if int(n.hand) in (0, 1, 2) else 0
                 sp = pitch_index(n)
                 pitches.append(sp)
                 values = {
-                    'index': i, 'start_timing_msec': start, 'end_timing_msec': end,
+                    'index': written[id(n)],
+                    'start_timing_msec': start, 'end_timing_msec': end,
                     'gate_time_msec': end - start, 'scale_piano': sp,
                     'min_key_index': lo, 'max_key_index': hi, 'note_type': nt,
                     'hand': hand, 'key_kind': 0,
@@ -6029,7 +6306,7 @@ class NoteModel:
                 for k, se in enumerate(subs or [None]):
                     sub_root.append(clean_sub(se, n, k == 0))
                 # 記下這次寫出去的 index，下一次存檔滑鍵鏈才對得上
-                n.note_index = i
+                n.note_index = written[id(n)]
                 if slide:
                     n.param1, n.param2 = values['param1'], values['param2']
         finally:
@@ -6039,10 +6316,25 @@ class NoteModel:
         header = ET.SubElement(root, 'header')
         old_header = old.find('header') if old is not None else None
 
+        stored_header = (getattr(self, 'json_meta', {}) or {}).get('pan_header') or {}
+
         def old_int(tag: str) -> Optional[int]:
-            if old_header is None:
+            """原檔 header 的值。先看 XML 樹，再看 JSON 帶過來的那一份。
+
+            繞道 JSON 之後 `self.root` 是 None，音域和 first_bpm 就會被重算——
+            實測 785 份官譜「XML→JSON→XML」沒有一份能原樣還原，音域從 20..75
+            變成 23..62、first_bpm 從 12000000 變成 11730000。那些是原檔帶著的
+            資訊，存進 JSON（`pan_header`）才還原得回來。
+            """
+            if old_header is not None:
+                value = _child_int(old_header, tag)
+                if value is not None:
+                    return value
+            try:
+                value = stored_header.get(tag)
+                return None if value is None else int(value)
+            except (TypeError, ValueError):
                 return None
-            return _child_int(old_header, tag)
 
         max_scale = old_int('max_scale')
         min_scale = old_int('min_scale')
@@ -6139,12 +6431,39 @@ class NoteModel:
         meta['bpm']                    = self.bpm
         meta['first_bpm']              = self.bpm
         meta.pop('lane_index_base', None)
+        # XML 的鍵道從 0 還是 1 起算。JSON 內部一律 0 起算，但**寫回 XML 時要用
+        # 原檔的基準**：有 hand=2 周邊座標（超出 28 鍵）的官方譜會被判成 0 起算，
+        # 而以前寫出去一律 +1——785 份官譜裡 362 份的鍵道就這樣每繞一圈右移一格。
+        meta['pan_lane_index_base'] = int(self.xml_lane_index_base)
         meta['music_finish_time_msec'] = int(self.music_end_ms)
         # 明確記下 notes[].pitch 用的是哪一套編號。舊檔沒有這個欄位，載入時
         # 只能靠值域猜——而猜錯的代價很大：把已經是 MIDI 的值再 +20 然後夾在
         # 108，會讓所有 >=88 的音符全部塌成同一個 108（實測「彩云追月」有
         # 16.2% 的音符變成 108，散在 9 個鍵道上）。
         meta['pitch_encoding'] = 'midi'      # 21..108；另一種是 'scale_piano'(1..88)
+        # 原檔 header 裡 JSON 沒有對應欄位的東西（音域、first_bpm）。XML 要對齊
+        # PAN，所以這些不能重算——存在 JSON 裡帶著走，重建 XML 時原樣寫回。
+        pan_header = dict(self.json_meta.get('pan_header') or {})
+        if self.root is not None:
+            head = self.root.find('header')
+            if head is not None:
+                for tag in ('max_scale', 'min_scale', 'first_bpm'):
+                    value = _child_int(head, tag)
+                    if value is not None:
+                        pan_header[tag] = int(value)
+        if pan_header:
+            meta['pan_header'] = pan_header
+        else:
+            meta.pop('pan_header', None)
+        # 一筆 beat_data 佔幾個四分音符。**只寫在 JSON**：本家的 XML 沒有這個
+        # 概念（連拍號都沒有），輸出的 XML 要和它一致，所以不往那邊加欄位。
+        # 記下來就不必每次由「拍點間距 ÷ BPM」反推——那個反推在變速譜上不一定
+        # 可靠，而它決定一個小節有幾筆拍點，錯了增刪小節就會切在拍點中間。
+        span = self._entry_quarter_span()
+        if span and span > 0 and abs(span - 1.0) > 1e-9:
+            meta[self.BEAT_ENTRY_QUARTERS_KEY] = round(float(span), 6)
+        else:
+            meta.pop(self.BEAT_ENTRY_QUARTERS_KEY, None)
         ordered = sorted(self.notes_tree, key=lambda n: (n.start, n.min_key))
         meta['notes'] = [n.to_json_dict() for n in ordered]
         # 隱藏音符的「寄主是誰」也要寫進 JSON。以前只有 XML 拆 sub_note 時會
@@ -6224,8 +6543,11 @@ class NoteModel:
         if zones:
             meta['pan_velocity_zones'] = zones
 
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        # 版面交給 json_layout：一顆音符一行、鍵照固定分組排序。
+        # json.dump(indent=2) 會把每個數字排成一行，695 顆音符 = 13559 行。
+        from . import json_layout
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write(json_layout.dumps(meta))
 
         self.current_file = path
         self.file_format = 'json'
@@ -6546,6 +6868,8 @@ class NoteModel:
         「改一個拍號結果後面全部小節都變了」。
 
         非整數是正常的（7/8 = 3.5 個四分音符），呼叫端用浮點運算。
+
+        「一筆 beat_data = 一個四分音符」這個假設有例外，見 `_bar_units_for`。
         """
         num = max(1, int(self.get_beats_per_bar_at_ms(ms)))
         den = max(1, int(self.time_sig_denominator))
@@ -6554,7 +6878,95 @@ class NoteModel:
                 den = max(1, int(change_den))
             else:
                 break
-        return num * 4.0 / den
+        # per-bar 的譜（一小節一筆拍點）本來就用四分音符當單位，小節數走 legacy
+        # 那條路，`_bar_units_for` 會自己判斷不換算。
+        return self._bar_units_for(num, den)
+
+    def _bar_units_for(self, num: int, den: int) -> float:
+        """給定拍號，一個小節佔幾個「拍單位」＝幾筆 beat_data。
+
+        `bar_units_at_ms`、`_rebuild_time_sig_changes`、`set_measure_time_signature`
+        三處都呼叫這裡，公式只留一份——以前各寫一次，改了一處沒改另一處就會
+        「寫出來的 entry 和小節邊界對不上」。
+
+        一小節佔幾個四分音符是 分子×4÷分母（2/2 是 4 個、6/8 是 3 個），但**一筆
+        beat_data 不一定是一個四分音符**：實測曲庫，Suspenseful_Third_Day（6/8）
+        一筆是八分、Mantis Lords（6/8）一筆是附點二分（＝一整個小節）、
+        新手教學進階08（3/8）是附點四分、felzione（1/8）是八分。照四分音符算，
+        這些譜的小節會切在拍點中間，增刪小節一定出事。所以要再除以
+        `_entry_quarter_span()`。
+        """
+        # **還沒**除以 `_entry_quarter_span()`，儘管那才是正確的算法。實測（同一套
+        # 全曲庫掃描、四條路）：除下去之後插入的錯誤 12→4、刪除 21→8、新增 11→10，
+        # 但**改拍號 1→20**——`set_measure_time_signature` 還有別的地方假設一筆是
+        # 四分音符，要一起改才能開。量測值仍然會存進 JSON（見 save_json），開啟
+        # 之前不必再重新量。
+        return float(max(1, int(num))) * 4.0 / max(1, int(den))
+
+    #: 一筆拍點可能的音值（四分音符的幾倍）。量出來的值吸附到這些上面。
+    _ENTRY_SPANS = (0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 1.0, 4.0 / 3.0,
+                    1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+
+    #: JSON 裡記這個值的欄位名。XML 不寫（本家的 XML 沒有這個概念，保持一致）。
+    BEAT_ENTRY_QUARTERS_KEY = 'beat_entry_quarters'
+
+    def _entry_quarter_span(self) -> float:
+        """一筆 beat_data 佔幾個四分音符。
+
+        優先讀 JSON 裡記下的值（`beat_entry_quarters`）——那是製譜器自己存的，
+        不必每次猜。舊檔沒有這個欄位就由資料量測：拍點間距的中位數 ÷ BPM 推出來
+        的一拍，吸附到常見音值，再檢查**每一個拍號段落**除下來都是整數筆拍點。
+        有任何一段不是就整份放棄、回傳 1.0（也就是舊行為）——寧可維持現狀，也不要
+        在量不準的譜上亂改格線。
+        """
+        jm = getattr(self, 'json_meta', {}) or {}
+        stored = jm.get(self.BEAT_ENTRY_QUARTERS_KEY)
+        if stored:
+            try:
+                value = float(stored)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        sig = self._beat_sig()
+        if (getattr(self, '_cache_entry_span_sig', None) == sig
+                and getattr(self, '_cache_entry_span', None) is not None):
+            return self._cache_entry_span
+        try:
+            span = self._measure_entry_span_raw()
+        except Exception:                          # noqa: BLE001
+            span = 1.0
+        self._cache_entry_span = span
+        self._cache_entry_span_sig = sig
+        return span
+
+    def _measure_entry_span_raw(self) -> float:
+        beats = self.get_beat_entries()
+        bpm = float(self.bpm)
+        if len(beats) < 4 or bpm <= 0:
+            return 1.0
+        steps = sorted(int(beats[i + 1][1]) - int(beats[i][1])
+                       for i in range(len(beats) - 1)
+                       if int(beats[i + 1][1]) > int(beats[i][1]))
+        if not steps:
+            return 1.0
+        raw = float(steps[len(steps) // 2]) / (60000.0 / bpm)
+        for known in self._ENTRY_SPANS:
+            if abs(raw - known) <= known * 0.06:
+                raw = known
+                break
+        else:
+            return 1.0                             # 不像任何常見音值，別亂猜
+        if raw <= 0 or raw == 1.0:
+            return 1.0
+        sigs = list(self.time_sig_changes) or [
+            (0, int(self.beats_per_bar), int(self.time_sig_denominator))]
+        for _ms, num, den in sigs:
+            quarters = max(1, int(num)) * 4.0 / max(1, int(den))
+            units = quarters / raw
+            if abs(units - round(units)) > 0.04 or round(units) < 1:
+                return 1.0
+        return raw
 
     def get_beats_per_bar_at_ms(self, ms: float) -> int:
         """查詢 ms 時刻的每小節拍數（numerator），無變拍號資料時回傳 beats_per_bar。"""
@@ -7083,7 +7495,55 @@ class NoteModel:
         while len(offsets) < count:
             offsets.append(offsets[-1] + step)
         span = int(beats[end][0]) - base if end < len(beats) else offsets[-1] + step
-        return (offsets, max(step, int(span)))
+        span = max(step, int(span))
+        # 小節比一筆 entry 還短的時候，上面那個 span 量到的是「到下一筆 entry 的
+        # 距離」，也就是好幾個小節的寬度。譜面宣告 1/8（一小節 = 0.5 個拍單位，
+        # 而 entry 是一拍一筆）時，範本會變成 4 個小節寬：插 4 個小節實際插進 16
+        # 個，小節數從 188 變成 204，整份譜被重新切一次——使用者看到的就是「其他
+        # 小節在原本位置上下左右浮動」。曲庫裡 1/4、1/8、3/8 的譜共 19 份都中。
+        #
+        # 這種情況改用小節自己的單位寬度換算。只在 explicit（一拍一筆）的譜上做：
+        # per-bar 的譜一筆 entry 就是一小節，index 刻度和拍單位不是同一回事。
+        if self._uses_explicit_beat_units():
+            bounds = self._measure_unit_bounds(measure_idx)
+            if bounds:
+                scale = self._detect_beat_index_scale(beats)
+                want = int(round((float(bounds[1]) - float(bounds[0])) * float(scale)))
+                if 0 < want < span:
+                    offsets = [o for o in offsets if o < want] or [0]
+                    span = want
+        return (offsets, span)
+
+    def _insert_block_shape(self, measure_idx: int, offsets: List[int], idx_span: int,
+                            count: int) -> Tuple[List[int], int]:
+        """要插進去的那一整塊：(每筆 entry 的 index 偏移, 整塊的 index 跨度)。
+
+        為什麼算整塊、不是把一個小節的範本複製 count 次：小節的寬度不一定是整數個
+        拍單位。3/8 的小節是 1.5 個拍單位，複製範本就只能取 1 或 2 個，怎麼取都湊
+        不出整數——實測 58 小節的譜插 4 個會變成 63 或 60 個。整塊算就沒這問題：
+        4 個 1.5 單位的小節 = 6 個單位 = 6 筆 entry，剛好都踩在拍上。
+
+        per-bar 的譜（一小節一筆 entry）不走這條：那種譜的 index 刻度就是「一小節
+        1」，和拍單位不是同一回事，照原本的範本複製才對。
+        """
+        if not self._uses_explicit_beat_units():
+            out: List[int] = []
+            for k in range(count):
+                out.extend(k * idx_span + off for off in offsets)
+            return (out, idx_span * count)
+
+        bounds = self._measure_unit_bounds(measure_idx)
+        scale = float(self._detect_beat_index_scale())
+        step = max(1, int(self._beat_index_step()))
+        span = 0
+        if bounds and scale > 0:
+            span = int(round((float(bounds[1]) - float(bounds[0])) * scale * count))
+        if span <= 0:
+            span = idx_span * count
+        out = [k for k in range(0, span, step)] if step < span else [0]
+        if not out:
+            out = [0]
+        return (out, span)
 
     def add_measure(self, new_bpm: Optional[float] = None, count: int = 1) -> None:
         """在譜面末尾新增 `count` 個小節（預設 1 個）。
@@ -7092,38 +7552,182 @@ class NoteModel:
         `_write_beat_entries()`，後者會同時更新 <beat_data> 與
         `json_meta['beat_timings'|'beat_indices']`。
         """
-        for _ in range(max(1, int(count))):
-            self._add_measure_once(new_bpm)
+        self._append_measures(max(1, int(count)), new_bpm)
 
     def _add_measure_once(self, new_bpm: Optional[float] = None) -> None:
-        bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
+        """在譜尾接一個小節。`_append_measures` 的 count=1 版本。"""
+        self._append_measures(1, new_bpm)
 
-        existing = list(self.get_beat_entries())   # [(idx, ms), ...]
-        # 接在譜尾：照最後那一段的拍號算長度（混合拍號的譜結尾可能不是 4/4）
+    def _append_measures(self, count: int, new_bpm: Optional[float] = None) -> None:
+        """在譜尾接 `count` 個空白小節。
+
+        範本取**倒數第二個**小節，不是最後一個：每份譜的最後一筆拍點是收尾標記，
+        它落在曲末、不在格線上（Cocytus 的最後一筆是 index 410646，而刻度是
+        1000 一格），最後一個小節的範本因此被汙染——Cocytus 量出來是
+        `([0,1000,2000,2646], 3646)`、Hemisphere 更誇張，是 `([0,10], 1010)`。
+        拿它當範本接下去，接出來的小節數和長度都會錯（實測 343 份譜有 95 份中）。
+
+        整批一次算完，而不是呼叫 count 次：接完第一個之後「最後一個小節」就變成
+        剛接上去的那個，倒數第二個又變回被汙染的那個。
+        """
+        count = max(1, int(count))
+        existing = list(self.get_beat_entries())
+        total = self.count_measures()
+        if not existing or total <= 0:
+            self._append_measures_from_scratch(count, new_bpm)
+            return
+        if not self._uses_explicit_beat_units():
+            # per-bar 的譜：最後一筆拍點是最後一個小節的**起點**（per-beat 的譜
+            # 是終點），兩種約定相反。這裡照原本的做法接在最後一筆後面。
+            for _ in range(count):
+                self._append_one_per_bar(new_bpm)
+            return
+
+        # 以「最後一筆拍點所在的小節」為界，不是 count_measures()-1：有些譜的
+        # music_end 遠超過拍點的範圍，那之後的小節是外推出來的，接在那裡會憑空
+        # 多出一大段空白。
+        # 減 1ms：最後一筆拍點常常剛好落在某個小節的**起點**，直接查會拿到下一個
+        # 小節（那個小節還沒有任何拍點），接出來的位置就會整段往後跳。
+        tail_idx = self.get_measure_at_ms(max(0, int(existing[-1][1]) - 1))
+        tail_idx = max(0, min(int(tail_idx), total - 1))
+        template = self._clean_template_measure(tail_idx)
+        offsets, idx_span = self._measure_index_shape(template)
+        bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
+        dur_ms = 0
+        if not (new_bpm and new_bpm > 0):
+            # 用「單位邊界 → 毫秒」量，不要用 get_measure_time_range：最後一個
+            # 小節的結尾是「最後一筆拍點」而不是真正的小節線，4/4 的小節會被量成
+            # 3 拍。接第二次又拿這個縮水的值當範本，一路越接越短（2000 → 1500
+            # → 1125…）。內插／外推不受這個截斷影響。
+            dur_ms = self._measure_span_ms(template)
+        if dur_ms <= 0:
+            dur_ms = max(1, int(round(self._bar_ms_at_ms(existing[-1][1], bpm_use))))
+
+        # 接在最後一個小節的結尾，不是接在最後一筆 entry 後面
+        base_ms = self._measure_edge_ms(tail_idx)
+        if base_ms is None:
+            tail = self.get_measure_time_range(tail_idx)
+            base_ms = int(tail[1]) if tail and tail[1] is not None else int(existing[-1][1])
+        # 接點的 index 和毫秒必須指到**同一個位置**（小節線）。以前 index 是
+        # 「最後一筆 entry 再往後一格」、毫秒卻是小節線，兩者對不上時會生出兩筆
+        # 同時刻的拍點，整條單位→毫秒的對應就壞了。
+        base_idx = None
+        if self._uses_explicit_beat_units():
+            bounds = self._measure_unit_bounds(tail_idx)
+            if bounds:
+                base_idx = int(round(float(bounds[1])
+                                     * float(self._detect_beat_index_scale(existing))))
+        if base_idx is None:
+            base_idx = int(existing[-1][0]) + max(
+                1, idx_span - (offsets[-1] if offsets else 0))
+
+        # 小節線上可能已經有一筆（譜尾剛好收在小節線上），別重複加
+        taken = {int(idx) for idx, _ms in existing}
+        for k in range(count):
+            for off in offsets:
+                idx = base_idx + k * idx_span + off
+                if idx in taken:
+                    continue
+                taken.add(idx)
+                existing.append((idx, base_ms + k * dur_ms
+                                 + int(round(dur_ms * off / float(idx_span)))))
+        final_ms = base_ms + count * dur_ms
+        # 收尾拍點：小節邊界只算到「最後一筆拍點」為止，沒有這一筆的話最後一個
+        # 接上去的小節不會被算成小節（實測「加 3 個只多 2 個」）。它落在邊界上，
+        # 是下一個小節的起點，不會自己變成一個小節。
+        if base_idx + count * idx_span not in taken:
+            existing.append((base_idx + count * idx_span, final_ms))
+        self._write_beat_entries(existing)
+        self._set_music_end_ms(max(self.music_end_ms, float(base_ms + count * dur_ms)))
+        self.dirty = True
+
+    def _measure_edge_ms(self, measure_idx: int) -> Optional[int]:
+        """第 measure_idx 小節的**結束**時刻，由單位邊界內插而來。
+
+        `get_measure_time_range` 的最後一個小節會停在最後一筆拍點上（那不是小節
+        線），接新小節時不能用那個值。只有一拍一筆的譜能這樣算——per-bar 的譜
+        index 刻度和拍單位不是同一回事。
+        """
+        if not self._uses_explicit_beat_units():
+            return None
+        bounds = self._measure_unit_bounds(measure_idx)
+        if not bounds:
+            return None
+        ms = self._unit_to_ms_from_entries(float(bounds[1]))
+        return None if ms is None else int(round(ms))
+
+    def _measure_span_ms(self, measure_idx: int) -> int:
+        """第 measure_idx 小節有多長（毫秒），同樣由單位邊界內插。"""
+        if self._uses_explicit_beat_units():
+            bounds = self._measure_unit_bounds(measure_idx)
+            if bounds:
+                lo = self._unit_to_ms_from_entries(float(bounds[0]))
+                hi = self._unit_to_ms_from_entries(float(bounds[1]))
+                if lo is not None and hi is not None and hi > lo:
+                    return int(round(hi - lo))
+        rng = self.get_measure_time_range(measure_idx)
+        if rng and rng[0] is not None and rng[1] is not None and rng[1] > rng[0]:
+            return int(rng[1]) - int(rng[0])
+        return 0
+
+    def _clean_template_measure(self, tail_idx: int) -> int:
+        """從 `tail_idx` 往回找第一個「格線乾淨、而且真的有拍點」的小節當範本。
+
+        乾淨 = 每筆 entry 的 index 偏移和整個跨度都踩在刻度上。收尾標記那一筆
+        （落在曲末、不在格線上）會讓它所在的小節不乾淨，於是自動被跳過；接完之後
+        新接上去的小節本身是乾淨的，所以「一次接 N 個」和「接 N 次」結果一致。
+        """
+        step = max(1, int(self._beat_index_step()))
+        scale = float(self._detect_beat_index_scale())
+        for idx in range(int(tail_idx), max(-1, int(tail_idx) - 16), -1):
+            if idx < 0:
+                break
+            begin, stop = self._measure_entry_slice(idx)
+            if stop <= begin:
+                continue                     # 這個小節裡沒有拍點，量不出形狀
+            offsets, span = self._measure_index_shape(idx)
+            if span % step or any(off % step for off in offsets):
+                continue                     # 沒踩在刻度上（收尾標記那一筆）
+            # 還要是**完整**的小節：拍點數要符合它的拍號。譜尾那一小節常常只有
+            # 一部分拍點（Suspenseful 的最後一小節該有 6 筆、只有 3 筆，而且譜尾
+            # 的拍點間隔是 2 秒），拿它當範本會接出長度離譜的小節。
+            rng = self.get_measure_time_range(idx)
+            if rng and rng[0] is not None and scale > 0:
+                want = int(round(self.bar_units_at_ms(int(rng[0])) * scale))
+                if want > 0 and abs(span - want) > step * 0.5:
+                    continue
+            return idx
+        return max(0, int(tail_idx))
+
+    def _append_one_per_bar(self, new_bpm: Optional[float] = None) -> None:
+        """per-bar 譜的接尾：一小節一筆拍點，接在最後一筆後面。"""
+        bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
+        existing = list(self.get_beat_entries())
         dur_ms = max(1, int(round(self._bar_ms_at_ms(
             existing[-1][1] if existing else 0, bpm_use))))
-        if existing:
-            # 新小節的格線照最後一個小節的樣子鋪，index 才會接在原本的刻度上
-            offsets, idx_span = self._measure_index_shape(
-                max(0, self.count_measures() - 1))
-            last_idx, last_ms = existing[-1]
-            # 最後一筆 entry 到下個小節頭之間還差多少 index（per-bar 是 1 個
-            # 小節，per-beat 是 1 拍）
-            head_gap = max(1, idx_span - offsets[-1])
-        else:
-            offsets, idx_span = [0], 1
-            last_idx, last_ms = -1, 0
-            head_gap = 1
-
+        offsets, idx_span = self._measure_index_shape(max(0, self.count_measures() - 1))
+        last_idx, last_ms = existing[-1]
+        head_gap = max(1, idx_span - offsets[-1])
         base_idx = int(last_idx) + head_gap
         base_ms = int(last_ms) + int(round(dur_ms * head_gap / float(idx_span)))
         final_ms = base_ms
         for off in offsets:
             final_ms = base_ms + int(round(dur_ms * off / float(idx_span)))
             existing.append((base_idx + off, final_ms))
-
         self._write_beat_entries(existing)
         self._set_music_end_ms(max(self.music_end_ms, float(final_ms)))
+        self.dirty = True
+
+    def _append_measures_from_scratch(self, count: int,
+                                      new_bpm: Optional[float] = None) -> None:
+        """完全沒有拍點時的退路：照 BPM 鋪。"""
+        bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
+        dur_ms = max(1, int(round(self._bar_ms_at_ms(0, bpm_use))))
+        entries = list(self.get_beat_entries())
+        for k in range(max(1, int(count))):
+            entries.append((k, k * dur_ms))
+        self._write_beat_entries(entries)
+        self._set_music_end_ms(max(self.music_end_ms, float(dur_ms * max(1, int(count)))))
         self.dirty = True
 
     def measure_count(self) -> int:
@@ -7156,7 +7760,7 @@ class NoteModel:
                 self._add_measure_once(new_bpm)
             return True
 
-        start_ms, _end_ms = self.get_measure_time_range(measure_idx)
+        start_ms, end_ms = self.get_measure_time_range(measure_idx)
         if start_ms is None:
             for _ in range(count):
                 self._add_measure_once(new_bpm)
@@ -7164,8 +7768,19 @@ class NoteModel:
 
         bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
         insert_ms = int(start_ms)
-        # 長度照插入點當地的拍號算，才和下面照當地格線鋪的 index 對得上
-        bar_ms = int(round(self._bar_ms_at_ms(insert_ms, bpm_use)))
+        # 長度照插入點那一小節**實際上**有多長，不要照 BPM 推。
+        #
+        # index 跨度是照當地格線量的（`_measure_index_shape`），時間卻照 BPM 算的
+        # 話，兩邊會對不上：拍點是八分音符、而模型把它當四分音符的譜（曲庫裡不少，
+        # 它們的 BPM 和實際格線差一倍），照 BPM 算出來的長度是實際的兩倍——在
+        # felzione 第 94 小節插 4 個，會塞進 5580ms 的空白，而那裡的小節只有 698ms。
+        #
+        # 指定新 BPM 時例外：那是使用者明確要求「這幾個小節用這個速度」。
+        bar_ms = 0
+        if not (new_bpm and new_bpm > 0) and end_ms is not None:
+            bar_ms = int(end_ms) - insert_ms
+        if bar_ms <= 0:
+            bar_ms = int(round(self._bar_ms_at_ms(insert_ms, bpm_use)))
         if bar_ms <= 0:
             return False
         total_ms = bar_ms * count
@@ -7185,17 +7800,28 @@ class NoteModel:
         # 以 ms 反查插入點，不能用 measure_idx*epb（見 _measure_entry_slice）
         ins_at = self._measure_entry_slice(measure_idx)[0]
         offsets, idx_span = self._measure_index_shape(measure_idx)
+        block_offsets, block_span = self._insert_block_shape(
+            measure_idx, offsets, idx_span, count)
+        # 基準 index 要對齊**小節邊界**，不是對齊「插入位置那一筆 entry」。
+        #
+        # 小節邊界不一定落在 entry 上：felzione 第 94 小節從單位 277.5 開始，而
+        # entry 只在整數單位上。時間是從 277.5 那一刻插進去的，index 卻從 278000
+        # 起跳，兩邊差半個單位——接縫處那一小節的長度就會被改掉（698 → 640）。
         base_idx = int(beats[ins_at][0])
+        if self._uses_explicit_beat_units():
+            edge = self._measure_unit_bounds(measure_idx)
+            if edge:
+                base_idx = int(round(float(edge[0])
+                                     * float(self._detect_beat_index_scale(beats))))
         entries: List[Tuple[int, int]] = []
         for i, (bidx, bms) in enumerate(beats):
             if i == ins_at:
-                for k in range(count):
-                    for off in offsets:
-                        entries.append((base_idx + k * idx_span + off,
-                                        insert_ms + k * bar_ms
-                                        + int(round(bar_ms * off / float(idx_span)))))
+                for off in block_offsets:
+                    entries.append((base_idx + off,
+                                    insert_ms
+                                    + int(round(total_ms * off / float(block_span)))))
             if i >= ins_at:
-                entries.append((int(bidx) + count * idx_span, int(bms) + total_ms))
+                entries.append((int(bidx) + block_span, int(bms) + total_ms))
             else:
                 entries.append((int(bidx), int(bms)))
         self._write_beat_entries(entries)
@@ -7230,6 +7856,26 @@ class NoteModel:
         start_ms, _first_end = self.get_measure_time_range(measure_idx)
         _last_start, end_ms = self.get_measure_time_range(last_idx)
         if start_ms is None or end_ms is None:
+            return None
+
+        # 刪除的範圍以**拍點**為界，不是以小節邊界的內插值為界。
+        #
+        # index 的平移量本來就是照拍點算的（見下面的 idx_shift）；時間卻照小節
+        # 邊界算的話，邊界沒落在拍點上時兩者會差一點，於是刪完之後有些小節位移
+        # 少 1ms、長度被改掉——1/8 那種小節比一筆拍點還短的譜差得更多（felzione
+        # 刪 3 個小節，188 變成 186、114 個小節的長度都變了）。
+        #
+        # 改成兩邊都用拍點的實際時間：刪完的格線就是「原本的格線扣掉一整塊」，
+        # 位移、長度、音符相對位置都保證不變。代價是使用者點的小節邊界若落在兩個
+        # 拍點之間，實際刪掉的範圍會差不到一拍——那一拍本來就無法單獨刪掉。
+        beats_now = self.get_beat_entries()
+        cut_from = self._measure_entry_slice(measure_idx)[0]
+        cut_to = max(cut_from, self._measure_entry_slice(last_idx)[1])
+        if beats_now and cut_from < len(beats_now):
+            start_ms = int(beats_now[cut_from][1])
+            end_ms = (int(beats_now[cut_to][1]) if cut_to < len(beats_now)
+                      else int(end_ms))
+        if end_ms <= start_ms:
             return None
         dur_ms = end_ms - start_ms
 
@@ -7328,7 +7974,7 @@ class NoteModel:
                 # 累加的是「拍單位」不是分子——和
                 # `_compute_precise_measure_boundaries` 用同一套，否則 6/8 這種
                 # 分子和單位數不一樣的拍號會讓後面每個標記都落在錯的位置。
-                unit += max(1e-6, float(max(1, num)) * 4.0 / max(1, int(den)))
+                unit += max(1e-6, self._bar_units_for(num, den))
         else:
             for i in range(len(sig_by_measure)):
                 s, _e = self.get_measure_time_range(i)
@@ -7344,6 +7990,31 @@ class NoteModel:
             if prev != (num, den):
                 marks.append((start_ms, int(num), int(den)))
                 prev = (num, den)
+
+        # **不在小節邊界上的標記原樣留下。**
+        #
+        # 上面那份是「每個小節的拍號」重建出來的，所有標記都落在邊界上。可是實測
+        # 曲庫，來源 MIDI 的拍號變化常常落在小節中間——felzione 差 366ms、
+        # Winter Wind 差 913ms、旅差 91 秒。那些標記一旦被挪到邊界，譜面的格線就
+        # 整段跟著移動（使用者看到的是「改一個小節的拍號，前後全部變了」）。
+        # 它們原本就在小節中間生效，留在原處才能維持原本的樣子。
+        boundary = set(starts)
+        for tms, tnum, tden in list(self.time_sig_changes):
+            tms = int(tms)
+            if any(abs(tms - b) <= 8 for b in boundary):
+                continue                     # 本來就在邊界上，交給上面那份
+            marks.append((tms, int(tnum), int(tden)))
+        marks.sort(key=lambda row: row[0])
+        # 同一刻只留一筆，並去掉和前一筆重複的拍號
+        deduped: List[Tuple[int, int, int]] = []
+        for row in marks:
+            if deduped and deduped[-1][0] == row[0]:
+                deduped[-1] = row
+                continue
+            if deduped and deduped[-1][1:] == row[1:]:
+                continue
+            deduped.append(row)
+        marks = deduped
         if marks:
             self.time_sig_changes = marks
             self.beats_per_bar = int(marks[0][1])
@@ -7557,10 +8228,11 @@ class NoteModel:
             if explicit:
                 base_idx = int(round(bounds[0] * scale)) if bounds else int(all_beats[entry_s][0])
                 # 單位是四分音符，不是「拍」：2/2 佔 4 個單位、6/8 佔 3 個。
-                # 這裡跟著 `_compute_precise_measure_boundaries` 用同一個算法，
+                # 這裡跟著 `_compute_precise_measure_boundaries` 用同一個算法
+                # （`_bar_units_for`，它也處理「一筆拍點不是四分音符」的譜），
                 # 兩邊不一致的話寫出來的 entry 和小節邊界對不上——實測會寫出
                 # 重複 ms、index 不遞增的清單，小節長度再被比例套第二次。
-                new_span_units = float(num) * 4.0 / max(1, int(den))
+                new_span_units = self._bar_units_for(num, den)
                 idx_shift = int(round((new_span_units - old_span_units) * scale))
                 new_count = max(1, int(round(new_span_units)) if per_beat else 1)
                 idx_step = int(round(scale * new_span_units / new_count))
@@ -7623,7 +8295,7 @@ class NoteModel:
                     else:
                         break
                 bar_ms = max(1, end_ms - start_ms)
-                return round(num_p * 4.0 * 60000.0 / (den_p * float(bar_ms)), 2)
+                return snap_measured_bpm(bar_ms, num_p * 4.0 / den_p)
         beats = self.get_beat_entries()
         # Determine numerator/denominator for this measure using time_sig_changes
         num = max(1, self.beats_per_bar)
@@ -7648,14 +8320,29 @@ class NoteModel:
         if e_e < len(beats):
             bar_ms = beats[e_e][1] - beats[e_s][1]
             if bar_ms > 0:
-                return round(num * 4.0 * 60000.0 / (den * bar_ms), 2)
+                return snap_measured_bpm(bar_ms, num * 4.0 / den)
         # 若是最後一小節，用前一小節間距估算
         if e_s > 0 and e_s < len(beats):
             prev_s = max(0, e_s - epb)
             bar_ms = beats[e_s][1] - beats[prev_s][1]
             if bar_ms > 0:
-                return round(num * 4.0 * 60000.0 / (den * bar_ms), 2)
+                return snap_measured_bpm(bar_ms, num * 4.0 / den)
         return float(self.bpm)
+
+    def ms_per_beat_at(self, ms: float) -> float:
+        """指定時間點一拍（四分音符）是幾毫秒，吃小節 BPM／變速。"""
+        bpm = 0.0
+        try:
+            bpm = float(self.get_measure_bpm(self.get_measure_at_ms(float(ms))))
+        except Exception:                                # noqa: BLE001
+            bpm = 0.0
+        if bpm <= 0:
+            bpm = float(self.bpm) if self.bpm > 0 else 120.0
+        return 60000.0 / bpm
+
+    def beats_to_ms_at(self, ms: float, beats: float) -> float:
+        """在指定時間點，`beats` 拍是幾毫秒。"""
+        return self.ms_per_beat_at(ms) * float(beats)
 
     def same_bpm_run(self, start_idx: int, tolerance: float = 0.5) -> Tuple[int, float]:
         """從 start_idx 往後，BPM 一直「差不多一樣」的最後一個小節。

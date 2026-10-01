@@ -44,6 +44,11 @@ def _base_dir() -> str:
     return os.path.dirname(os.path.abspath(sys.executable))
 
 
+def config_dir() -> str:
+    """設定與紀錄檔共用的資料夾。理由見 `_base_dir`（打包後要在 exe 旁邊）。"""
+    return _base_dir()
+
+
 def _pick_settings_file() -> str:
     """exe 旁邊那一份。舊版寫在工作目錄，找得到就沿用那一份的內容（見 load）。"""
     return os.path.join(_base_dir(), 'settings.json')

@@ -34,10 +34,11 @@ from __future__ import annotations
 from typing import List, Optional, Sequence, Tuple
 
 from PyQt5.QtCore import QPointF, QRectF, Qt
-from PyQt5.QtGui import (QBrush, QColor, QLinearGradient, QPainter, QPen,
-                         QPixmap, QPolygonF)
-from PyQt5.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel, QSpinBox,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtGui import (QBrush, QColor, QKeySequence, QLinearGradient,
+                         QPainter, QPen, QPixmap, QPolygonF)
+from PyQt5.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel,
+                             QPushButton, QShortcut, QSpinBox, QVBoxLayout,
+                             QWidget)
 
 from .models import (GNote, TOTAL_GAME_KEYS, build_slide_index_map,
                      note_is_long, note_is_slide, note_is_trill,
@@ -484,6 +485,10 @@ class GamePreviewWindow(QDialog):
 
         bar = QHBoxLayout()
         bar.setContentsMargins(8, 4, 8, 4)
+        self._play = self._transport_button(bar, '▶ 播放', self._on_play)
+        self._pause = self._transport_button(bar, '⏸ 暫停', self._on_pause)
+        self._stop = self._transport_button(bar, '⏹ 停止', self._on_stop)
+        bar.addSpacing(10)
         bar.addWidget(QLabel('視野'))
         self._lead = QSpinBox()
         self._lead.setRange(MIN_LEAD_MS, MAX_LEAD_MS)
@@ -498,8 +503,84 @@ class GamePreviewWindow(QDialog):
         self._flash.toggled.connect(self._on_flash)
         bar.addWidget(self._flash)
         bar.addStretch(1)
-        bar.addWidget(QLabel('播放製譜器就會跟著動'))
+        self._hint = QLabel('')
+        bar.addWidget(self._hint)
         layout.addLayout(bar)
+
+        # 空白鍵＝播放／暫停，和製譜器本體一致。按鈕設成不吃焦點，否則空白鍵
+        # 會被「剛剛按過的那顆按鈕」接走，變成重複觸發同一個動作。
+        QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._on_space)
+        self._refresh_transport()
+
+    # ── 播放控制 ────────────────────────────────────────────────────
+    #
+    # 這個視窗自己不放音：它是製譜器的第二個視窗，時間也是製譜器推進來的
+    # （見 set_time）。所以這幾顆按鈕就是去按製譜器本體的同一組入口，不要
+    # 另外開一條播放路徑——那會變成兩個時間來源。
+    def _transport_button(self, bar, text: str, slot) -> QPushButton:
+        button = QPushButton(text)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.clicked.connect(slot)
+        bar.addWidget(button)
+        return button
+
+    def _editor(self):
+        """製譜器主視窗；單獨開這個視窗（測試）時是 None。"""
+        window = self.parent()
+        needed = ('play_window', 'stop_audio', '_toggle_pause_resume')
+        return window if all(hasattr(window, n) for n in needed) else None
+
+    def _playing(self) -> bool:
+        """真的正在出聲。暫停時 `_is_playing` 仍然是 True，所以要再問一次。"""
+        editor = self._editor()
+        if editor is None or not getattr(editor, '_is_playing', False):
+            return False
+        try:
+            return not editor.audio.is_paused()
+        except Exception:
+            return True
+
+    def _on_play(self) -> None:
+        editor = self._editor()
+        if editor is None:
+            return
+        if self._playing():
+            return
+        # 暫停中就接著播，沒在播就從頭播這個視窗範圍——和主視窗那兩顆一樣。
+        if editor.audio.is_paused():
+            editor.resume_audio()
+        else:
+            editor.play_window()
+        self._refresh_transport()
+
+    def _on_pause(self) -> None:
+        editor = self._editor()
+        if editor is None:
+            return
+        editor._toggle_pause_resume()
+        self._refresh_transport()
+
+    def _on_stop(self) -> None:
+        editor = self._editor()
+        if editor is None:
+            return
+        editor.stop_audio()
+        self._refresh_transport()
+
+    def _on_space(self) -> None:
+        if self._playing():
+            self._on_pause()
+        else:
+            self._on_play()
+
+    def _refresh_transport(self) -> None:
+        editor = self._editor()
+        for button in (self._play, self._pause, self._stop):
+            button.setEnabled(editor is not None)
+        playing = self._playing()
+        self._play.setEnabled(editor is not None and not playing)
+        self._pause.setText('⏸ 暫停' if playing else '▶ 繼續')
+        self._hint.setText('' if editor is not None else '（獨立開啟：沒有接到製譜器）')
 
     def _on_flash(self, on: bool) -> None:
         self.canvas.show_flash = bool(on)
@@ -511,3 +592,5 @@ class GamePreviewWindow(QDialog):
 
     def set_time(self, ms: Optional[float]) -> None:
         self.canvas.set_time(ms)
+        # 製譜器每個判定 tick 都會推時間進來，順便讓按鈕反映現在在不在播。
+        self._refresh_transport()

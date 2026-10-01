@@ -8,7 +8,7 @@
 import unittest
 
 from PyQt5.QtGui import QImage, QPainter
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget
 
 from qt_editor import game_preview as GP
 from qt_editor.models import GNote, TOTAL_GAME_KEYS
@@ -207,6 +207,93 @@ class WindowWiringTests(_CanvasCase):
             self.assertFalse(win.canvas.show_flash)
         finally:
             win.close()
+
+
+class _FakeAudio:
+    def __init__(self):
+        self.paused = False
+
+    def is_paused(self):
+        return self.paused
+
+
+class _FakeEditor(QWidget):
+    """只有預覽視窗會去按的那幾個入口。"""
+
+    def __init__(self):
+        super().__init__()
+        self.audio = _FakeAudio()
+        self._is_playing = False
+        self.calls = []
+
+    def play_window(self):
+        self.calls.append('play_window')
+        self._is_playing = True
+
+    def stop_audio(self):
+        self.calls.append('stop_audio')
+        self._is_playing = False
+        self.audio.paused = False
+
+    def resume_audio(self):
+        self.calls.append('resume_audio')
+        self.audio.paused = False
+
+    def _toggle_pause_resume(self):
+        self.calls.append('toggle')
+        self.audio.paused = not self.audio.paused
+
+
+class TransportTests(_CanvasCase):
+    """三顆按鈕就是去按製譜器本體的入口，不另開一條播放路徑。"""
+
+    def window(self):
+        editor = _FakeEditor()
+        win = GP.GamePreviewWindow([note(100)], editor)
+        self.addCleanup(win.close)
+        self.addCleanup(editor.deleteLater)
+        return win, editor
+
+    def test_play_starts_the_editor_not_the_preview(self):
+        win, editor = self.window()
+        win._play.click()
+        self.assertEqual(editor.calls, ['play_window'])
+
+    def test_play_resumes_when_paused_instead_of_restarting(self):
+        win, editor = self.window()
+        editor._is_playing = True
+        editor.audio.paused = True
+        win._play.click()
+        self.assertEqual(editor.calls, ['resume_audio'])
+
+    def test_stop_goes_through_the_editor(self):
+        win, editor = self.window()
+        win._stop.click()
+        self.assertEqual(editor.calls, ['stop_audio'])
+
+    def test_the_play_button_is_off_while_it_is_really_playing(self):
+        win, editor = self.window()
+        editor._is_playing = True
+        win.set_time(500)                       # 主視窗每個判定 tick 都會推
+        self.assertFalse(win._play.isEnabled())
+        editor.audio.paused = True              # 暫停時仍然 _is_playing
+        win.set_time(500)
+        self.assertTrue(win._play.isEnabled())
+        self.assertEqual(win._pause.text(), '▶ 繼續')
+
+    def test_space_plays_and_then_pauses(self):
+        win, editor = self.window()
+        win._on_space()
+        self.assertEqual(editor.calls, ['play_window'])
+        win._on_space()
+        self.assertEqual(editor.calls, ['play_window', 'toggle'])
+
+    def test_it_still_opens_without_an_editor(self):
+        win = GP.GamePreviewWindow([note(100)])
+        self.addCleanup(win.close)
+        self.assertFalse(win._play.isEnabled())
+        win._play.click()                       # 不能炸
+        win._on_space()
 
 
 class MainWindowTests(unittest.TestCase):

@@ -414,5 +414,275 @@ class MainWindowWiringTests(unittest.TestCase):
         self.assertEqual(m.get_beat_entries(), entries)
 
 
+
+def tiny_bar_model(numerator=1, denominator=8, beats=64):
+    """宣告 1/8 這種拍號的譜：一個小節只有 0.5 個拍單位，比一筆 entry 還短。
+
+    曲庫裡真有這種譜（MIDI 帶進來的拍號），1/4、1/8、3/8 共 19 份。
+    """
+    m = NoteModel.create_new('t', 120.0, beats * BEAT_MS / 1000.0, numerator)
+    m._write_beat_entries([(i * SCALE, i * BEAT_MS) for i in range(beats + 1)],
+                          mark_precise=True)
+    m._epb_mode = None
+    m.beats_per_bar = numerator
+    m.time_sig_denominator = denominator
+    m.notes_tree = [make_note(i * BEAT_MS, i) for i in range(6)]
+    m.rebuild_display_cache()
+    return m
+
+
+class TinyBarTests(unittest.TestCase):
+    """使用者回報：加了幾個小節，其他小節在原本位置上下左右浮動。
+
+    原因是 `_measure_index_shape` 的 index 跨度量的是「到下一筆 entry 的距離」。
+    小節比一筆 entry 還短時（1/8 = 0.5 個拍單位，而 entry 是一拍一筆），那個距離
+    是小節的四倍，於是「插 4 個小節」實際插進 16 個，整份譜的小節被重新切一次。
+    實測 felzione（1/8）188 小節變成 204、位移出現 90 種、120 個小節長度被改掉。
+    """
+
+    def positions(self, model):
+        return [model.get_measure_time_range(i) for i in range(model.count_measures())]
+
+    def test_the_template_is_not_wider_than_the_measure(self):
+        m = tiny_bar_model()
+        offsets, span = m._measure_index_shape(0)
+        bounds = m._measure_unit_bounds(0)
+        self.assertIsNotNone(bounds)
+        want = int(round((bounds[1] - bounds[0]) * SCALE))
+        self.assertEqual(span, want, '跨度要照小節自己的寬度，不是到下一筆 entry')
+        self.assertTrue(all(o < span for o in offsets))
+
+    def test_inserting_adds_exactly_that_many_measures(self):
+        for numerator, denominator in ((1, 8), (1, 4), (2, 4)):
+            with self.subTest(sig='%d/%d' % (numerator, denominator)):
+                m = tiny_bar_model(numerator, denominator)
+                before = self.positions(m)
+                m.insert_measure(0, None, 4)
+                m.rebuild_display_cache()
+                after = self.positions(m)
+                self.assertEqual(len(after), len(before) + 4)
+
+    def test_the_rest_of_the_chart_only_slides(self):
+        m = tiny_bar_model()
+        before = self.positions(m)
+        m.insert_measure(0, None, 4)
+        m.rebuild_display_cache()
+        after = self.positions(m)
+        shifts, lengths = set(), []
+        for k, (start, end) in enumerate(before):
+            j = k + 4
+            if j >= len(after) or start is None or after[j][0] is None:
+                continue
+            shifts.add(after[j][0] - start)
+            lengths.append((after[j][1] - after[j][0]) - (end - start))
+        self.assertEqual(len(shifts), 1, '每個小節要往後平移同一個量：%s' % sorted(shifts))
+        self.assertEqual(set(lengths), {0}, '原有小節的長度不能被改掉')
+
+
+
+class InsertedLengthTests(unittest.TestCase):
+    """插進去的空白小節要和隔壁一樣長。
+
+    長度本來是照 BPM 推的，但 index 跨度是照當地格線量的。拍點是八分音符、而
+    BPM 說的是四分音符的譜（曲庫裡不少）兩者差一倍：在 felzione 第 94 小節插
+    4 個，會塞進 5580ms 的空白，而那裡的小節只有 698ms——插進去的空白小節是
+    隔壁的兩倍長。
+    """
+
+    def half_speed_model(self, bars=16, bpb=4):
+        """拍點間距只有 BPM 所說的一半（entry 是八分音符，BPM 是四分音符）。"""
+        m = NoteModel.create_new('t', 120.0, 120.0, bpb)
+        half = BEAT_MS // 2
+        m._write_beat_entries([(i * SCALE, i * half) for i in range(bars * bpb + 1)],
+                              mark_precise=True)
+        m._epb_mode = None
+        m.notes_tree = [make_note(i * bpb * half, i) for i in range(6)]
+        m.rebuild_display_cache()
+        return m
+
+    def test_blank_measures_match_the_neighbour(self):
+        m = self.half_speed_model()
+        at = 4
+        start, end = m.get_measure_time_range(at)
+        local = end - start
+        m.insert_measure(at, None, 3)
+        m.rebuild_display_cache()
+        for k in range(3):
+            a, b = m.get_measure_time_range(at + k)
+            self.assertEqual(b - a, local,
+                             '第 %d 個插入的小節長度 %d，隔壁是 %d' % (k, b - a, local))
+
+    def test_a_given_bpm_still_wins(self):
+        """指定新 BPM 時要照那個 BPM 算——那是使用者明講的。"""
+        m = self.half_speed_model()
+        at = 4
+        local = (lambda r: r[1] - r[0])(m.get_measure_time_range(at))
+        m.insert_measure(at, 60.0, 1)
+        m.rebuild_display_cache()
+        a, b = m.get_measure_time_range(at)
+        self.assertNotEqual(b - a, local)
+        self.assertGreater(b - a, local, '60 BPM 的小節要比原本長')
+
+
+class FractionalBarTests(unittest.TestCase):
+    """小節是 1.5 個拍單位（3/8）時，插入數量要對。
+
+    以前是把「一個小節」的範本複製 count 次，而 1.5 個單位怎麼取都湊不出整數：
+    58 小節的譜插 4 個會變成 63 或 60 個。現在改成整塊算：4 個 1.5 單位的小節
+    = 6 個單位 = 6 筆 entry，剛好都踩在拍上。
+    """
+
+    def model(self, numerator=3, denominator=8, beats=96):
+        m = NoteModel.create_new('t', 120.0, beats * BEAT_MS / 1000.0, numerator)
+        m._write_beat_entries([(i * SCALE, i * BEAT_MS) for i in range(beats + 1)],
+                              mark_precise=True)
+        m._epb_mode = None
+        m.beats_per_bar = numerator
+        m.time_sig_denominator = denominator
+        m.notes_tree = [make_note(i * BEAT_MS, i) for i in range(6)]
+        m.rebuild_display_cache()
+        return m
+
+    def test_inserting_adds_exactly_that_many(self):
+        for count in (1, 2, 4, 5):
+            with self.subTest(count=count):
+                m = self.model()
+                before = m.count_measures()
+                m.insert_measure(2, None, count)
+                m.rebuild_display_cache()
+                self.assertEqual(m.count_measures(), before + count)
+
+    def test_the_grid_stays_on_the_beat(self):
+        m = self.model()
+        m.insert_measure(2, None, 4)
+        m.rebuild_display_cache()
+        step = m._beat_index_step()
+        offgrid = [idx for idx, _ms in m.get_beat_entries() if idx % step]
+        self.assertEqual(offgrid, [], 'entry 的 index 要踩在拍上')
+
+
+
+class EndMarkerTests(unittest.TestCase):
+    """真實譜面的最後一筆拍點是收尾標記：落在曲末、不在格線上。
+
+    拿最後一個小節當範本就會被它汙染——Cocytus 量出來是
+    `([0,1000,2000,2646], 3646)`、Hemisphere 是 `([0,10], 1010)`。實測 343 份譜
+    有 95 份「加 3 個小節」的結果是錯的（只加到 2 個、或一次加了 6 個），而且最後
+    一個原有小節的長度會被改掉。
+    """
+
+    def model(self, bars=12, bpb=4, marker_offset=646):
+        """一拍一筆，最後補一筆落在格線外的收尾標記。"""
+        m = NoteModel.create_new('t', 120.0, bars * bpb * BEAT_MS / 1000.0, bpb)
+        entries = [(i * SCALE, i * BEAT_MS) for i in range(bars * bpb + 1)]
+        last_idx, last_ms = entries[-1]
+        entries.append((last_idx + marker_offset,
+                        last_ms + marker_offset * BEAT_MS // SCALE))
+        m._write_beat_entries(entries, mark_precise=True)
+        m._epb_mode = None
+        m.notes_tree = [make_note(i * bpb * BEAT_MS, i) for i in range(6)]
+        m.rebuild_display_cache()
+        return m
+
+    def test_the_marker_does_not_become_the_template(self):
+        m = self.model()
+        total = m.count_measures()
+        tail = m.get_measure_at_ms(max(0, int(m.get_beat_entries()[-1][1]) - 1))
+        template = m._clean_template_measure(tail)
+        step = m._beat_index_step()
+        offsets, span = m._measure_index_shape(template)
+        self.assertEqual(span % step, 0, '範本的跨度要踩在刻度上')
+        self.assertTrue(all(off % step == 0 for off in offsets))
+
+    def test_appending_adds_exactly_that_many(self):
+        for count in (1, 3, 5):
+            with self.subTest(count=count):
+                m = self.model()
+                before = m.count_measures()
+                m.add_measure(None, count)
+                m.rebuild_display_cache()
+                self.assertEqual(m.count_measures(), before + count)
+
+    def test_the_last_existing_measure_keeps_its_length(self):
+        m = self.model()
+        total = m.count_measures()
+        was = m.get_measure_time_range(total - 2)
+        m.add_measure(None, 3)
+        m.rebuild_display_cache()
+        self.assertEqual(m.get_measure_time_range(total - 2), was)
+
+    def test_appended_measures_are_full_length(self):
+        m = self.model()
+        total = m.count_measures()
+        typical = (lambda r: r[1] - r[0])(m.get_measure_time_range(total - 2))
+        m.add_measure(None, 3)
+        m.rebuild_display_cache()
+        for k in range(3):
+            a, b = m.get_measure_time_range(total + k - 1)
+            if b is None or a is None:
+                continue
+            self.assertAlmostEqual(b - a, typical, delta=2,
+                                   msg='第 %d 個接上去的小節長度 %s，隔壁是 %s'
+                                       % (k, b - a, typical))
+
+
+
+class DeleteOnBeatsTests(unittest.TestCase):
+    """刪除的範圍要以**拍點**為界。
+
+    index 的平移量本來就照拍點算，時間卻照小節邊界的內插值算——邊界沒落在拍點上
+    時兩者差一點，刪完就有小節位移少 1ms、長度被改掉。1/8 那種小節比一筆拍點還短
+    的譜差更多（felzione 刪 3 個小節，188 變 186、119 個小節的長度都變了）。
+    """
+
+    def uneven_model(self, bars=16, bpb=4):
+        """拍點間距不均勻（947/948 交錯，真實譜面就是這樣）。"""
+        m = NoteModel.create_new('t', 190.0, bars * bpb * 0.25, bpb)
+        entries, ms = [], 0
+        for i in range(bars * bpb + 1):
+            entries.append((i * SCALE, ms))
+            ms += 237 if i % 2 else 236        # 不均勻
+        m._write_beat_entries(entries, mark_precise=True)
+        m._epb_mode = None
+        m.notes_tree = [make_note(entries[i * bpb][1], i) for i in range(6)]
+        m.rebuild_display_cache()
+        return m
+
+    def test_the_grid_is_exactly_the_old_one_minus_a_chunk(self):
+        m = self.uneven_model()
+        before = list(m.get_beat_entries())
+        at, count = 4, 3
+        cut_from = m._measure_entry_slice(at)[0]
+        cut_to = m._measure_entry_slice(at + count - 1)[1]
+        m.delete_measure(at, count)
+        m.rebuild_display_cache()
+        after = list(m.get_beat_entries())
+        self.assertEqual(len(after), len(before) - (cut_to - cut_from))
+        # 剩下的拍點：前半原樣，後半整段平移（index 與 ms 都是）
+        for i in range(cut_from):
+            self.assertEqual(after[i], before[i])
+        idx_shift = before[cut_to][0] - before[cut_from][0]
+        ms_shift = before[cut_to][1] - before[cut_from][1]
+        for i in range(cut_from, len(after)):
+            src = before[i + (cut_to - cut_from)]
+            self.assertEqual(after[i], (src[0] - idx_shift, src[1] - ms_shift))
+
+    def test_measures_after_the_cut_keep_their_length(self):
+        m = self.uneven_model()
+        at, count = 4, 3
+        before = [m.get_measure_time_range(i) for i in range(m.count_measures())]
+        m.delete_measure(at, count)
+        m.rebuild_display_cache()
+        after = [m.get_measure_time_range(i) for i in range(m.count_measures())]
+        shifts = set()
+        for k in range(at + count, len(before)):
+            j = k - count
+            if j >= len(after) or before[k][0] is None or after[j][0] is None:
+                continue
+            shifts.add(before[k][0] - after[j][0])
+            self.assertEqual(after[j][1] - after[j][0], before[k][1] - before[k][0])
+        self.assertEqual(len(shifts), 1, '刪除點之後要整段平移同一個量：%s' % sorted(shifts))
+
+
 if __name__ == '__main__':
     unittest.main()

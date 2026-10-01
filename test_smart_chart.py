@@ -555,6 +555,9 @@ class SmartChartTests(unittest.TestCase):
             SmartChartSettings(classify_articulations=True),
         )
         self.assertNotEqual(notes[0].note_type, 2)
+        # 排譜只決定類型，長度留給匯入那條路裁（見 NoteModel.trim_pedal_sustained_holds
+        # 與 test_pedal_holds）——排譜不知道這是新 MIDI 還是重排既有譜面，而重排
+        # 不准動長度。所以這裡那顆 8.4 秒的還在響，鍵道要錯開來閃它。
         self.assertGreater(notes[1].min_key, notes[0].max_key)
 
     def test_long_non_hold_note_orders_every_start_during_its_duration(self):

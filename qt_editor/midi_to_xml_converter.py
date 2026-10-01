@@ -66,6 +66,22 @@ class Note:
     def end(self) -> int:
         return self.end_timing_msec
 
+    @end.setter
+    def end(self, value: int) -> None:
+        # 排譜會裁掉踏板灌水的長度（見 smart_chart 的 trim_pedal_lengths），
+        # 所以這個別名要寫得進去，而且 gate 要跟著走。
+        self.end_timing_msec = int(value)
+        self.gate_time_msec = max(0, self.end_timing_msec - self.start_timing_msec)
+
+    @property
+    def gate(self) -> int:
+        return self.gate_time_msec
+
+    @gate.setter
+    def gate(self, value: int) -> None:
+        self.gate_time_msec = max(0, int(value))
+        self.end_timing_msec = self.start_timing_msec + self.gate_time_msec
+
     @property
     def pitch(self) -> int:
         return self.scale_piano

@@ -168,6 +168,65 @@ class SongLibraryTests(unittest.TestCase):
         self.assertEqual(song.problems, [])
         self.assertEqual({d.name: d.level for d in song.difficulties}, {'Hard': 7, 'Real': 12})
 
+    def _package_zip(self):
+        """做一份真的歌曲包 ZIP 出來。"""
+        from qt_editor import hiraeth_export as H
+        plans, _ = H.plan_song_folder(os.path.join(self.root, 'Alpha'))
+        result = H.build_package(plans[0], os.path.join(self.tmp, 'zips'),
+                                 renderer=lambda _m: (b'\0' * 4 * 44100, 44100))
+        self.assertEqual(result.error, '')
+        return result.zip_path
+
+    def _rezip(self, name, entries):
+        """把 (壓縮檔內路徑, 位元組) 重新壓成一個 ZIP。"""
+        import zipfile
+        path = os.path.join(self.tmp, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with zipfile.ZipFile(path, 'w') as out:
+            for inner, data in entries:
+                out.writestr(inner, data)
+        return path
+
+    def test_import_zip_wrapped_in_a_folder(self):
+        """在檔案總管「壓縮資料夾」會多一層，那也要認得。"""
+        import zipfile
+        source = self._package_zip()
+        with zipfile.ZipFile(source) as z:
+            entries = [('我的歌/' + n, z.read(n)) for n in z.namelist()]
+        folders = self.lib.import_hiraeth_zip_all(self._rezip('wrapped.zip', entries), 'Other')
+        self.assertEqual(len(folders), 1)
+        self.assertEqual(self.lib.song(folders[0]).problems, [])
+
+    def test_import_a_zip_that_holds_several_package_zips(self):
+        """一個 ZIP 裝好幾個歌曲包 ZIP —— 使用者要一次給別人好幾首時會這樣包。"""
+        source = self._package_zip()
+        with open(source, 'rb') as fh:
+            blob = fh.read()
+        bundle = self._rezip('bundle.zip', [
+            ('歌曲包/一.zip', blob),
+            ('歌曲包/二.zip', blob),
+        ])
+        folders = self.lib.import_hiraeth_zip_all(bundle, 'Other')
+        self.assertEqual(len(folders), 2)
+        self.assertNotEqual(folders[0], folders[1], '同名要各自編號，不能互相覆蓋')
+        for folder in folders:
+            self.assertEqual(self.lib.song(folder).problems, [])
+
+    def test_a_zip_with_nothing_usable_still_says_so(self):
+        bad = self._rezip('bad.zip', [('readme.txt', b'hi')])
+        with self.assertRaises(LibraryError):
+            self.lib.import_hiraeth_zip_all(bad, 'Other')
+
+    def test_a_bundle_whose_members_are_all_broken_says_so(self):
+        import zipfile
+        inner = self._rezip('inner_bad.zip', [('readme.txt', b'hi')])
+        with open(inner, 'rb') as fh:
+            blob = fh.read()
+        bundle = self._rezip('bundle_bad.zip', [('包/壞掉.zip', blob)])
+        with self.assertRaises(LibraryError) as caught:
+            self.lib.import_hiraeth_zip_all(bundle, 'Other')
+        self.assertIn('壞掉.zip', str(caught.exception), '要講是哪一個檔壞了')
+
     def test_add_category(self):
         self.lib.add_category('新分類')
         self.assertIn('新分類', self.lib.categories())

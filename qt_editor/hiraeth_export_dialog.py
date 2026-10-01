@@ -177,6 +177,58 @@ class HiraethExportDialog(QDialog):
             self.rb_chart.setText(tr('只輸出目前開著的譜面（要在製譜器裡用）'))
         (self.rb_song if song_dir or model is None else self.rb_chart).setChecked(True)
         self._sync()
+        # 上次填的歌曲資訊。要在 _sync() 之後：它會照難度格重設等級的範圍與值。
+        self._apply_remembered()
+
+    # ── 記住填過的歌曲資訊 ───────────────────────────────────────────
+
+    def _chart_key(self) -> str:
+        return str(getattr(self._model, 'current_file', '') or '')
+
+    def _apply_remembered(self) -> None:
+        """把上次填的帶進「只輸出目前開著的譜面」那一組欄位（見 song_info）。
+
+        只填空白的；曲名已經從譜面帶出檔名了，所以那一格永遠有值、不會被蓋掉。
+        """
+        from . import song_info
+        info = song_info.recall(self._chart_key(), self._audio_path)
+        if not info:
+            return
+        if info.get('author') and not self.artist_edit.text().strip():
+            self.artist_edit.setText(str(info['author']))
+        cover = str(info.get('cover') or '')
+        if cover and not self.cover_edit.text().strip() and os.path.isfile(cover):
+            self.cover_edit.setText(cover)
+        slot = str(info.get('slot') or '')
+        if slot in H.SLOTS:
+            # 換難度格會觸發 _sync()，它會把等級換成那一格記著的值，所以等級後填
+            self.slot_combo.setCurrentIndex(H.SLOTS.index(slot))
+        try:
+            level = float(info.get('slot_level') or 0)
+        except (TypeError, ValueError):
+            level = 0.0
+        if level > 0:
+            low, high = self.level_spin.minimum(), self.level_spin.maximum()
+            if low <= level <= high:
+                self._level_memory[getattr(self, '_level_is_real', False)] = level
+                self.level_spin.setValue(level)
+        slogan = str(info.get('slogan') or '')
+        # 樂曲資料夾模式的評論存在 register.json（比這裡權威），別去搶
+        if slogan and self.rb_chart.isChecked() and not self.slogan_edit.text().strip():
+            self.slogan_edit.setText(slogan)
+            self._update_slogan_count()
+
+    def _remember(self) -> None:
+        """記下這次填的。只有譜面模式才記——另兩個模式這些欄位是鎖住的預設值。"""
+        from . import song_info
+        song_info.remember(self._chart_key(), self._audio_path, {
+            'title': self.title_edit.text().strip(),
+            'author': self.artist_edit.text().strip(),
+            'cover': self.cover_edit.text().strip(),
+            'slot': self.slot_combo.currentText(),
+            'slot_level': float(self.level_spin.value()),
+            'slogan': self.slogan_edit.text().strip(),
+        })
 
     # ── 介面 ─────────────────────────────────────────────────────────
 
@@ -330,6 +382,8 @@ class HiraethExportDialog(QDialog):
         if self.mode() == MODE_SONG:
             # 評論存回 register.json，下次輸出同一首自動帶出來
             H.write_slogan(self.song_edit.text().strip(), self.slogan_edit.text())
+        if self.mode() == MODE_CHART:
+            self._remember()
         self.accept()
 
 

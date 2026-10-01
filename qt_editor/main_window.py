@@ -36,7 +36,7 @@ from PyQt5.QtWidgets import (
     QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox, QRadioButton,
 )
 
-from .models import NoteModel, open_midi
+from .models import LONG_BIT, NoteModel, open_midi
 from .chart_view import ChartView, PANE_COLORS
 from .audio_player import AudioPlayer
 from .midi_preview import (
@@ -298,6 +298,12 @@ def _still_playing(obj) -> bool:
         return bool(obj.is_playing())
     except Exception:                           # noqa: BLE001
         return False
+
+
+#: AI 轉譜修整：一條長押底下最多讓幾顆同手音過去。使用者的話是「一串至少每五個
+#: 要裁一次」——響過一長串之後和聲早就換過了，那就不是分解和弦。官方有重疊的長押
+#: 裡 92% 只讓 3 顆以內進來，所以 5 已經比官方寬鬆。
+AI_MAX_RING_NOTES = 5
 
 
 class MainWindow(QMainWindow):
@@ -1485,6 +1491,7 @@ class MainWindow(QMainWindow):
                 (t('action_resolve_horizontal_overlaps'), self.resolve_horizontal_overlaps),
                 (self._tool_label('action_hold_length_fix', '長押長度修整…'),
                  self.hold_length_fix_dialog),
+                ('重新判斷左右手…', self.hand_split_dialog),
                 ('移除重複音符（同 start/pitch）…', self.remove_duplicate_start_pitch_dialog),
                 ('取消整份譜面的隱藏音符…', self.unhide_all_dialog),
                 ('裁掉選取長音的踏板殘響', self.trim_selected_pedal_holds),
@@ -3707,6 +3714,9 @@ class MainWindow(QMainWindow):
         self._load_path(load_path)
         if os.path.normcase(self.view.model.current_file or '') != os.path.normcase(load_path):
             return                              # 使用者在排譜詢問那裡取消了
+        fixed = self._fix_ai_transcription()
+        if fixed:
+            summary = '　'.join(filter(None, [summary, fixed]))
         if audio_for_editor and self.audio.load_wav(audio_for_editor):
             self._refresh_vol_rows()
             self._lbl_audio.setText(t('status_audio_loaded', os.path.basename(audio_for_editor)))
@@ -3715,6 +3725,63 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(summary, 15000)
             else:
                 QMessageBox.information(self, 'AI 轉譜', summary)
+
+    def _fix_ai_transcription(self) -> str:
+        """AI 轉譜剛載進來就先補兩件事。回傳給狀態列的摘要（沒做就空字串）。
+
+        這兩件事只對「AI 音訊轉譜」成立，所以在這條路上自動做掉，不動手寫譜的
+        任何預設值：
+
+        1. **分手**——AI 轉出來的 MIDI 只有一條音軌，`smart_chart._assign_hands`
+           那時走的是「全曲音高中位數切一刀」，旋律跨過那條線就換手（實測一份
+           AI 譜 58 條連續跑動有 14 條中途換手）。順便拆成兩軌，下次排譜才不會
+           又被切一刀蓋掉。見 `hand_split`。
+        2. **長度**——匯入時已經裁過一次（`trim_pedal_sustained_holds`），但那是
+           照舊的分手裁的；分手改了，「同手下一顆起音」這條界線就跟著改，所以要
+           再跑一次。
+
+        都會進 undo：使用者覺得不對就 Ctrl+Z。
+        """
+        model = self.view.model
+        notes = [n for n in model.notes_tree if n.pitch is not None]
+        if len(notes) < 2:
+            return ''
+        from . import hand_split
+
+        # 順序是「長度 → 分手 → 長度」，因為兩件事互相依賴：
+        #
+        # * 分手要先看到合理的長度。`hand_split` 把還按著的長押算成佔著手指，而
+        #   AI 的長押長度是踏板長度——一串 900ms 的長押每 200ms 一顆，一隻手瞬間
+        #   五指全滿，整條跑動就被逼得換手。
+        # * 長度要先看到合理的分手。「同手下一顆起音」正是這條規則的界線。
+        #
+        # 所以先用現有的分手（音高切一刀，實測本來就有 97.3% 正確）把長度修出來，
+        # 分手完再跑一次，補上因為換手而改變的界線。
+        #
+        # 這裡自己 push 一次 history、不走 view.apply_hand_split（它會在中間再
+        # push 一次），這樣一次 Ctrl+Z 就回到剛載進來的樣子。
+        model.push_history()
+        first = {'trimmed': model.trim_pedal_sustained_holds(), 'retyped': 0}
+        changed = hand_split.assign(notes)
+        for note in notes:
+            note.track = 1 if int(note.hand) == 1 else 2
+        second = {'trimmed': model.trim_pedal_sustained_holds(), 'retyped': 0}
+        # 保證：一條長押底下最多讓 5 顆同手音過去。上面那兩步照理已經把每顆長押
+        # 都裁到同手下一顆之前（底下 0 顆），這一刀是安全網——使用者要的是
+        # 「一串至少每五個要裁一次」這個性質成立，不是某一步剛好做到。
+        ringed = model.enforce_hold_tail_gap(
+            40, [n for n in notes if int(n.note_type) & LONG_BIT],
+            only_conflicts=True, max_ring_notes=AI_MAX_RING_NOTES)
+        trimmed = first['trimmed'] + second['trimmed'] + ringed
+        retyped = first['retyped'] + second['retyped']
+        if not (changed or trimmed):
+            if model.undo_stack:
+                model.discard_last_history()
+            return ''
+        model.rebuild_display_cache()
+        self.view.update()
+        self.view.note_edited.emit()
+        return ('AI 轉譜修整：分手改 %d 顆、長度再縮短 %d 顆' % (changed, trimmed))
 
     def _manage_ai_transcribe(self) -> None:
         from .ai_transcribe_dialog import manage_environment
@@ -6259,13 +6326,17 @@ class MainWindow(QMainWindow):
         cb_ring.setChecked(False)
         sp_ring = QSpinBox()
         sp_ring.setRange(1, 16)
-        sp_ring.setValue(3)
+        sp_ring.setValue(5)
         sp_ring.setSuffix(' 顆')
         sp_ring.setEnabled(False)
         cb_ring.toggled.connect(sp_ring.setEnabled)
         cb_ring.setToolTip(
             '一組分解和弦就那麼幾顆，響過一長串之後和聲早就換過了。\n'
-            '官方有重疊的長押裡 92% 只讓 3 顆以內的音進來。')
+            '官方有重疊的長押裡 92% 只讓 3 顆以內的音進來。\n'
+            '\n'
+            '預設 5：曲庫 11734 顆長押只有 45 顆（0.4%）底下串超過 5 顆，其中 27 顆\n'
+            '現行規則本來就會裁，這一刀多抓剩下的 18 顆——例如 Evans 有一顆 2.2 秒\n'
+            '的長押底下串了 9 顆同手音，一隻手不可能按著又敲 9 下。')
         row.addWidget(cb_ring)
         row.addWidget(sp_ring)
         row.addStretch()
@@ -6378,16 +6449,68 @@ class MainWindow(QMainWindow):
             return
         params = dlg.params()
         stats = self.view.apply_hold_length_fix(params)
-        if not (stats['tapped'] or stats['trimmed'] or stats.get('gapped')):
+        if not (stats['tapped'] or stats['trimmed'] or stats.get('gapped')
+                or stats.get('pedal') or stats.get('shortened')):
             QMessageBox.information(
                 self, '長押長度修整',
                 '沒有符合條件的長押可修整（範圍內找到 %d 顆長押）。' % stats['total'])
             return
         self.statusBar().showMessage(
-            '長押長度修整：轉 Tap %d、砍長度 %d、補間隔 %d、不變 %d（共 %d 顆長押）'
-            % (stats['tapped'], stats['trimmed'], stats.get('gapped', 0),
-               stats['unchanged'], stats['total']),
-            6000,
+            '長押長度修整：踏板長度縮短 %d 顆（其中 %d 顆轉 Tap）、'
+            '分級轉 Tap %d、砍長度 %d、補間隔 %d、不變 %d'
+            % (stats.get('shortened', 0), stats.get('pedal', 0), stats['tapped'],
+               stats['trimmed'], stats.get('gapped', 0), stats['unchanged']),
+            8000,
+        )
+
+    def hand_split_dialog(self) -> None:
+        """重新判斷左右手。只對「分手是猜出來的」譜有意義，所以先擋一道。
+
+        來源 MIDI 有兩條音軌時，那兩軌**就是**左右手，沒有推測空間——那種譜
+        重算只會把正確答案改掉。實測直接套在既有譜上：24 份變差、只有 6 份變
+        好。反過來，把可信譜的分手抹掉改用音高切一刀（＝ AI 單軌轉譜那條路）
+        再還原，30 份的正確率中位數是 97.3% → 97.8%，贏 16 份輸 2 份。
+        """
+        if self.view.alloc_active:
+            return
+        model = self.view.model
+        notes = [n for n in model.notes_tree if n.pitch is not None]
+        if len(notes) < 2:
+            QMessageBox.information(self, '重新判斷左右手', '這份譜沒有帶音高的音符。')
+            return
+
+        tracks = {int(n.track) for n in notes if n.track is not None}
+        if len(tracks) >= 2:
+            reply = QMessageBox.question(
+                self, '重新判斷左右手',
+                '這份譜有 %d 條音軌，分手很可能是來源 MIDI 寫的——那就是正確答案，'
+                '重算只會改壞。\n\n'
+                '這個工具是給「單軌來源」用的（AI 音訊轉譜、或轉檔時音軌資訊掉了）：'
+                '那種譜的分手是照全曲音高中位數切一刀猜的，旋律只要跨過那條線就換手。'
+                '\n\n還是要重算嗎？' % len(tracks),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+        split = QMessageBox.question(
+            self, '重新判斷左右手',
+            '要順便把音符拆成兩條音軌嗎？\n\n'
+            '建議「是」：排譜器看到剛好兩軌就直接照軌道定手，不拆的話下次跑排譜'
+            '會照音高中位數重新切一刀，把這次的結果蓋掉。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
+
+        stats = self.view.apply_hand_split(split_tracks=split)
+        if not stats['changed']:
+            self.statusBar().showMessage(
+                '重新判斷左右手：%d 顆都和原本一樣%s'
+                % (stats['total'], '（已拆成兩軌）' if split else ''), 6000)
+            return
+        self.statusBar().showMessage(
+            '重新判斷左右手：改了 %d / %d 顆（%.1f%%）%s'
+            % (stats['changed'], stats['total'],
+               100.0 * stats['changed'] / max(1, stats['total']),
+               '，已拆成兩軌' if split else ''),
+            8000,
         )
 
     def repair_beat_entries(self) -> None:

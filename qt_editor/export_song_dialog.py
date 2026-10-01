@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .i18n import t
+from . import song_info
 
 _base_dir = None
 if getattr(sys, 'frozen', False):
@@ -293,11 +294,102 @@ class ExportSongDialog(QDialog):
 
         main_layout.addLayout(form)
 
+        # 上次填過的歌曲資訊（見 song_info）。要在所有欄位都建好之後才做。
+        self._apply_remembered()
+        self._apply_song_register_defaults()
+
         # ── 按鈕 ──────────────────────────────────────────────────
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bbox.accepted.connect(self._validate_and_accept)
         bbox.rejected.connect(self.reject)
         main_layout.addWidget(bbox)
+
+    # ── 記住填過的歌曲資訊 ────────────────────────────────────────
+    def _apply_remembered(self) -> None:
+        """把上次填的值帶進空白欄位（見 song_info 的三層退路）。
+
+        只填空白的：追加難度模式從 register.json 帶出來的曲名／作者是真的、
+        使用者手打的更是，兩者都不該被舊紀錄蓋掉。數字與下拉在這個時間點還是
+        剛建好的預設值，所以有紀錄就直接套。
+        """
+        info = song_info.recall(self._chart_json_path, self._wav_path)
+        if not info:
+            return
+        for field, edit in (('title', self._le_display),
+                            ('author', self._le_author),
+                            ('diff_name', self._le_diff_name),
+                            ('cover', self._le_cover),
+                            ('video', self._le_video)):
+            value = str(info.get(field) or '')
+            if value and not edit.text().strip():
+                # 曲繪／影片記的是來源檔；檔案被搬走或刪掉就別帶一個死路徑進來
+                if field in ('cover', 'video') and not os.path.isfile(value):
+                    continue
+                edit.setText(value)
+        try:
+            if info.get('diff_level'):
+                self._spin_level.setValue(int(info['diff_level']))
+            if info.get('video_start') is not None:
+                self._spin_video_start.setValue(float(info['video_start']))
+        except (TypeError, ValueError):
+            pass
+        category = str(info.get('category') or '')
+        if category:
+            self._cb_category.setCurrentText(category)
+
+    def _apply_song_register_defaults(self) -> None:
+        """譜面就住在曲庫的樂曲資料夾裡：剩下的空格照那首歌的 register.json 填。
+
+        匯入的歌第一次匯出時還沒有任何紀錄，但那首歌的資訊已經在磁碟上了——
+        曲名、作者、曲繪、分類全都有。這條路讓「第一次」也不用打字。
+
+        只填還空著的欄位，所以 `_apply_remembered` 帶進來的（使用者上次的決定）
+        比它優先。
+        """
+        if not self._chart_json_path:
+            return
+        try:
+            from .song_folder import find_song_folder
+            folder = find_song_folder(self._chart_json_path)
+        except Exception:                                # noqa: BLE001
+            return
+        if not folder:
+            return
+        try:
+            with open(os.path.join(folder, 'register.json'), 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+        except Exception:                                # noqa: BLE001
+            return
+        if not self._le_display.text().strip():
+            self._le_display.setText(str(data.get('displayName') or os.path.basename(folder)))
+        if not self._le_author.text().strip():
+            self._le_author.setText(str(data.get('author') or ''))
+        if not self._le_cover.text().strip():
+            cover = _resolve_cover_from_register(data, folder)
+            if not cover:
+                # 匯入的歌（Hiraeth 包）曲繪就叫 cover.png，不在 register 的路徑上
+                for name in ('cover.png', 'cover.jpg', 'cover.jpeg'):
+                    cand = os.path.join(folder, name)
+                    if os.path.isfile(cand):
+                        cover = cand
+                        break
+            if cover:
+                self._le_cover.setText(cover)
+        if self._cb_category.currentText().strip() in ('', DEFAULT_CATEGORY):
+            self._cb_category.setCurrentText(self._category_of_folder(os.path.basename(folder)))
+
+    def _remember(self) -> None:
+        """這次填的值記起來，下次開同一份譜就都在了。"""
+        song_info.remember(self._chart_json_path, self._wav_path, {
+            'title': self.display_name(),
+            'author': self.author(),
+            'diff_name': self.diff_name(),
+            'diff_level': self.diff_level(),
+            'cover': self.cover_path(),
+            'video': self.video_path(),
+            'video_start': self.video_start_sec(),
+            'category': self.category(),
+        })
 
     # ── 事件處理 ──────────────────────────────────────────────────
     def _on_append_toggled(self, checked: bool):
@@ -314,6 +406,8 @@ class ExportSongDialog(QDialog):
             self._le_author.clear()
             self._le_cover.clear()
             self._btn_cover.setEnabled(True)
+            # 清完換回上次填的，不然取消勾選就變成一片空白（見 _apply_remembered）
+            self._apply_remembered()
 
     def _browse_export_root(self):
         """選擇匯出根目錄（songs 資料夾）。"""
@@ -521,6 +615,7 @@ class ExportSongDialog(QDialog):
         if not self._le_diff_name.text().strip():
             QMessageBox.warning(self, t('dlg_warn'), t('dlg_export_err_no_diff'))
             return
+        self._remember()
         self.accept()
 
     # ── 結果 getter ───────────────────────────────────────────────

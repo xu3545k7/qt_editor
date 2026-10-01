@@ -125,7 +125,16 @@ def _fit_bpm(times, weights, lo: float, hi: float) -> Tuple[float, float, List[T
         if all(abs(bpm - b) > 0.5 for b, _s in refined):
             refined.append((round(bpm, 2), score))
     refined.sort(key=lambda item: -item[1])
-    best_bpm, best_score = refined[0] if refined else (120.0, 0.0)
+    if refined:
+        best_bpm, best_score = refined[0]
+    else:
+        # 沒有內部局部最大值（分數曲線單調，或全是 NaN）。拿全域最大
+        # 值，而不是盲填 120 —— 120 是一個看起來很合理的數字，所以它一路被寫
+        # 進檔案而沒有人發現偵測其實失敗了。分數一起回傳，調用端才能判斷。
+        j = int(np.nanargmax(scores)) if len(scores) else 0
+        best_bpm = float(coarse[j]) if len(coarse) else 120.0
+        best_score = float(scores[j]) if len(scores) else 0.0
+        refined = [(round(best_bpm, 2), best_score)]
     return best_bpm, best_score, refined
 
 

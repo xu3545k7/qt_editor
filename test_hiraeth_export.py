@@ -803,6 +803,64 @@ class HoldTailOptionTests(unittest.TestCase):
         dlg.deleteLater()
 
 
+
+class BeatsAfterTheEndTests(unittest.TestCase):
+    """曲末之後的拍子線要收掉。
+
+    Hiraeth 2.1.0 開始檢查 `beat_data` 的時間，超過「曲末 +2 秒」整份退件，
+    而且錯誤訊息報的是拍子線的編號、看起來像音符出問題。實測一份 202 秒的
+    譜最後一條拍子線在曲末後 2398 ms，就是這樣被擋下的。
+    """
+
+    def chart(self, duration_ms, beat_ms):
+        root = ET.Element('music_score')
+        header = ET.SubElement(root, 'header')
+        for tag, value in (('max_scale', '88'), ('min_scale', '1'), ('file_version', '1'),
+                           ('first_bpm', '10000000'),
+                           ('music_finish_time_msec', str(duration_ms))):
+            ET.SubElement(header, tag).text = value
+        beats = ET.SubElement(root, 'beat_data')
+        index = 0
+        time = 0
+        while time <= duration_ms + 4000:
+            beat = ET.SubElement(beats, 'beat')
+            ET.SubElement(beat, 'index').text = str(index)
+            ET.SubElement(beat, 'start_timing_msec').text = str(time)
+            index += 1
+            time += beat_ms
+        return root
+
+    def test_beats_past_the_end_are_dropped(self):
+        root = self.chart(10000, 600)
+        before = [int(b.findtext('start_timing_msec')) for b in root.findall('beat_data/beat')]
+        self.assertGreater(max(before), 10000 + 2000, '前提：這份資料本來就超線')
+        expected = sum(1 for t in before if t > 10000)
+        log = {}
+        H._trim_beats(root, 10000, log)
+        kept = [int(b.findtext('start_timing_msec')) for b in root.findall('beat_data/beat')]
+        self.assertTrue(kept, 'beat_data 不能變空')
+        self.assertLessEqual(max(kept), 10000)
+        self.assertEqual(log['beats_after_end_dropped'], expected)
+
+    def test_nothing_to_do_when_they_already_fit(self):
+        root = self.chart(10000, 600)
+        for beat in list(root.findall('beat_data/beat')):
+            if int(beat.findtext('start_timing_msec')) > 10000:
+                root.find('beat_data').remove(beat)
+        before = len(root.findall('beat_data/beat'))
+        log = {}
+        H._trim_beats(root, 10000, log)
+        self.assertEqual(len(root.findall('beat_data/beat')), before)
+        self.assertNotIn('beats_after_end_dropped', log)
+
+    def test_at_least_one_beat_survives(self):
+        root = self.chart(0, 600)
+        root.find('header/music_finish_time_msec').text = '0'
+        log = {}
+        H._trim_beats(root, -5000, log)
+        self.assertEqual(len(root.findall('beat_data/beat')), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
 

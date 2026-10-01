@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 from PyQt5.QtWidgets import (
-    QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QRadioButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -88,6 +88,32 @@ class HoldLengthDialog(QDialog):
         intro.setStyleSheet('color: gray; font-size: 11px;')
         root.addWidget(intro)
 
+        # ── 先判斷長度是不是踏板造成的 ──────────────────────────
+        #
+        # 分級門檻看的是「音符現在的長度」，但 AI 音訊轉譜／MIDI 來的譜，那個
+        # 長度**就是踏板的長度**——一串上行音階每顆都拖 3 拍，全部被判成長 Hold，
+        # 於是分級只把尾端前移 40ms，畫面上還是一根根長條。
+        #
+        # 手指做不到「還按著就去彈同一隻手的下一顆」，所以尾巴蓋過同手下一顆起
+        # 音＝那個長度來自踏板。實測那份 AI 譜：484 顆長條有 355 顆（73%）是這
+        # 種，轉成 Tap 之後走廊衝突 85 → 0，剩下的 129 顆還保住真實長度（中位
+        # 322 ms），不必被裁成 175 ms。
+        pedal_box = QGroupBox('踏板造成的長度（AI 轉譜／MIDI 延音；手寫譜不要開）')
+        pedal_form = QVBoxLayout(pedal_box)
+        self._chk_pedal_tap = QCheckBox(
+            '長度蓋過「同手下一顆起音」的音符 → 縮到那裡（太短的轉 Tap）')
+        self._chk_pedal_tap.setChecked(False)
+        self._chk_pedal_tap.setToolTip(
+            '給 AI 音訊轉譜／MIDI 延音長度用的。手指還按著就不可能去彈同一隻手的\n'
+            '下一顆音，所以超出去的那一段是踏板延音，不是按鍵長度。\n'
+            '這一步在分級之前做——分級看的是現在的長度，而現在的長度正是踏板的長度。\n'
+            '\n'
+            '**手寫譜不要開**：這條規則會把分解和弦一起砍掉（全曲庫 20896 顆和同手\n'
+            '下一顆重疊的長押，85.6% 一隻手完全按得住）。手寫譜要處理尾端請用下面的\n'
+            '「同手最小間隔」，那一條只裁物理上按不住的。')
+        pedal_form.addWidget(self._chk_pedal_tap)
+        root.addWidget(pedal_box)
+
         # ── 門檻 ────────────────────────────────────────────────
         th_box = QGroupBox('分級門檻（音符值，吃變速）')
         th_form = QFormLayout(th_box)
@@ -129,6 +155,19 @@ class HoldLengthDialog(QDialog):
             '這一刀把長押尾端再往前壓。設 0 = 不套用。'
         )
         gap_form.addRow('長押尾端至少留（0=關閉）', self._sp_tail_gap)
+
+        # 「手按得住」不等於「還是分解和弦」：響過一長串之後和聲早就換過了。
+        # 曲庫 11734 顆長押只有 45 顆（0.4%）底下串超過 5 顆，其中 27 顆現行規則
+        # 本來就會裁；這一刀多抓剩下的 18 顆（例如 Evans 有一顆 2.2 秒的長押底下
+        # 串了 9 顆同手音）。官方有重疊的長押裡 92% 只讓 3 顆以內進來。
+        self._sp_ring = QSpinBox()
+        self._sp_ring.setRange(0, 16)
+        self._sp_ring.setValue(0)              # 預設不限；手寫譜的行為不變
+        self._sp_ring.setSuffix(' 顆')
+        self._sp_ring.setToolTip(
+            '長押期間同手進來超過這麼多顆就放開——一串超過這個數就不是分解和弦了。\n'
+            '設 0 = 不限制（只看手按不按得住）。')
+        gap_form.addRow('期間最多讓幾顆同手音進來（0=不限）', self._sp_ring)
 
         # 壓到哪裡：只壓真的搶到鍵的，還是一律壓到同手下一顆。
         self._rb_gap_conflict = QRadioButton('只裁真的搶到鍵的（分解和弦保留）')
@@ -215,11 +254,13 @@ class HoldLengthDialog(QDialog):
     # ── 結果 ─────────────────────────────────────────────────────
     def params(self) -> Dict[str, object]:
         return {
+            'pedal_to_tap':    bool(self._chk_pedal_tap.isChecked()),
             'tap_th_beats':    float(self._cb_tap_th.currentData()),
             'hold_th_beats':   float(self._cb_hold_th.currentData()),
             'short_ratio':     float(self._sp_ratio.value()) / 100.0,
             'long_advance_ms': int(self._sp_advance.value()),
             'tail_gap_ms':     int(self._sp_tail_gap.value()),
+            'tail_ring_notes': int(self._sp_ring.value()),
             'tail_only_conflicts': bool(self._rb_gap_conflict.isChecked()),
             'scope':           'selected' if self._rb_sel.isChecked() else 'all',
         }

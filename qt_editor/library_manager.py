@@ -647,7 +647,7 @@ class LibraryManagerWindow(QDialog):
         done, failed = [], []
         for path in paths:
             try:
-                done.append(self.lib.import_hiraeth_zip(path, category))
+                done.extend(self.lib.import_hiraeth_zip_all(path, category))
             except Exception as exc:                    # noqa: BLE001
                 failed.append('%s：%s' % (os.path.basename(path), exc))
         self.reload()

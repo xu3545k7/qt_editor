@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -581,7 +582,7 @@ class SongLibrary:
                 break
             try:
                 if kind == 'zip':
-                    done.append(self.import_hiraeth_zip(path, category))
+                    done.extend(self.import_hiraeth_zip_all(path, category))
                 else:
                     done.append(self.import_folder(path, category))
             except Exception as exc:                    # noqa: BLE001
@@ -667,78 +668,144 @@ class SongLibrary:
         self.notify_game(folder)
         return folder
 
-    def import_hiraeth_zip(self, zip_path: str, category: str = DEFAULT_CATEGORY) -> str:
-        """Hiraeth 歌曲包 ZIP → nos-clone 樂曲資料夾（XML 譜面轉成 JSON）。"""
-        import contextlib
-        import io
-        import tempfile
-        from .models import NoteModel
+    #: 一個 ZIP 裡再包 ZIP 最多往下挖幾層。使用者把好幾首打包在一起時通常只有
+    #: 一層；設上限是為了不讓惡意的巢狀 ZIP 把這裡拖住。
+    _MAX_BUNDLE_DEPTH = 3
 
-        slots = (('normal', 'Normal'), ('hard', 'Hard'), ('expert', 'Expert'), ('real', 'Real'))
+    @staticmethod
+    def _package_prefixes(names) -> List[str]:
+        """ZIP 裡每一份歌曲包的前綴（`''` 或 `'某資料夾/'`）。"""
+        found = set()
+        for name in names:
+            if name == 'song.json':
+                found.add('')
+            elif name.endswith('/song.json'):
+                found.add(name[:-len('song.json')])
+        return sorted(found)
+
+    def import_hiraeth_zip(self, zip_path: str, category: str = DEFAULT_CATEGORY) -> str:
+        """單一歌曲包 → 資料夾名。裡面有好幾首時回傳第一首（舊呼叫端用的）。"""
+        folders = self.import_hiraeth_zip_all(zip_path, category)
+        return folders[0]
+
+    def import_hiraeth_zip_all(self, zip_path: str, category: str = DEFAULT_CATEGORY,
+                               _depth: int = 0) -> List[str]:
+        """Hiraeth 歌曲包 ZIP → nos-clone 樂曲資料夾（XML 譜面轉成 JSON）。
+
+        三種包法都吃得下，因為使用者三種都會做出來：
+
+        1. `song.json` 就在最外層 —— 匯出功能自己產的那種。
+        2. 包在一層（或多層）資料夾裡 —— 在檔案總管「壓縮資料夾」會變這樣。
+        3. 一個 ZIP 裡裝著好幾個歌曲包 ZIP —— 要一次給別人好幾首時會這樣包。
+
+        回傳匯進來的資料夾名（可能不只一個）。
+        """
         try:
             archive = zipfile.ZipFile(zip_path)
         except (OSError, zipfile.BadZipFile) as exc:
             raise LibraryError(tr('ZIP 打不開：%s') % exc)
         with archive:
-            names = set(archive.namelist())
-            if 'song.json' not in names:
+            names = archive.namelist()
+            prefixes = self._package_prefixes(names)
+            if prefixes:
+                return [self._import_hiraeth_package(archive, prefix, zip_path, category)
+                        for prefix in prefixes]
+            inner = [n for n in names if n.lower().endswith('.zip')]
+            if not inner:
                 raise LibraryError(tr('ZIP 裡沒有 song.json，不是 Hiraeth 歌曲包'))
-            spec = json.loads(archive.read('song.json').decode('utf-8-sig'))
-            charts = spec.get('charts') or {}
-            if not isinstance(charts, dict) or not any(s in charts for s, _n in slots):
-                raise LibraryError(tr('song.json 的 charts 沒有可用的難度'))
-            audio = next((n for n in ('music.wav', 'music.ogg') if n in names), None)
-            if not audio:
-                raise LibraryError(tr('ZIP 裡沒有 music.wav'))
-            title = str(spec.get('title') or os.path.splitext(os.path.basename(zip_path))[0])
-            folder = self._unique_folder(title)
-            stem = folder
-            snapshot = self._snapshot(tr('匯入「%s」') % title, [])
-            song_dir = os.path.join(self.root, folder)
-            os.makedirs(song_dir)
-            try:
-                with open(os.path.join(song_dir, stem + os.path.splitext(audio)[1]), 'wb') as fh:
-                    fh.write(archive.read(audio))
-                if 'cover.png' in names:
-                    with open(os.path.join(song_dir, stem + '.png'), 'wb') as fh:
-                        fh.write(archive.read('cover.png'))
-                diffs = []
-                for slot, name in slots:
-                    if slot not in charts or slot + '.xml' not in names:
-                        continue
-                    os.makedirs(os.path.join(song_dir, name), exist_ok=True)
-                    temp_dir = tempfile.mkdtemp()
-                    temp = os.path.join(temp_dir, slot + '.xml')
-                    with open(temp, 'wb') as fh:
-                        fh.write(archive.read(slot + '.xml'))
-                    model = NoteModel()
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        model.load_xml(temp)
-                        model.save_json(os.path.join(song_dir, name, stem + '.json'))
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                    level = charts[slot]
-                    if slot == 'real':
-                        # REAL 顯示等級（1～3.5）→ 遊戲難度等級（輸出 ZIP 時換算的反向）
-                        level = int(round(10 + (float(level) - 1) * 2))
-                    diff = {'difficultyName': name, 'difficultyLevel': level,
-                            'chartFileName': 'songs/%s/%s/%s' % (folder, name, stem),
-                            'audioResourcePath': 'songs/%s/%s' % (folder, stem)}
-                    if 'cover.png' in names:
-                        diff['coverResourcePath'] = 'songs/%s/%s' % (folder, stem)
-                    diffs.append(diff)
-                register = {'displayName': title, 'author': str(spec.get('artist') or ''),
-                            'difficulties': diffs}
-                if spec.get('slogan'):
-                    register['slogan'] = str(spec['slogan'])
-                self._write_register(folder, register)
-            except Exception:
-                shutil.rmtree(song_dir, ignore_errors=True)
-                raise
+            if _depth >= self._MAX_BUNDLE_DEPTH:
+                raise LibraryError(tr('ZIP 包得太多層了'))
+            done: List[str] = []
+            failed: List[str] = []
+            for name in inner:
+                import tempfile
+                handle, temp = tempfile.mkstemp(suffix='.zip')
+                try:
+                    with os.fdopen(handle, 'wb') as fh:
+                        fh.write(archive.read(name))
+                    done.extend(self.import_hiraeth_zip_all(temp, category, _depth + 1))
+                except LibraryError as exc:
+                    failed.append('%s：%s' % (os.path.basename(name), exc))
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.remove(temp)
+            if not done:
+                raise LibraryError(tr('ZIP 裡的歌曲包都匯不進來：\n%s')
+                                   % '\n'.join(failed or [tr('裡面沒有歌曲包')]))
+            return done
+
+    def _import_hiraeth_package(self, archive, prefix: str, zip_path: str,
+                                category: str) -> str:
+        """把 ZIP 裡 `prefix` 底下的那一份歌曲包匯進來。"""
+        import io as _io
+        import tempfile
+        from .models import NoteModel
+
+        slots = (('normal', 'Normal'), ('hard', 'Hard'), ('expert', 'Expert'), ('real', 'Real'))
+        names = set(archive.namelist())
+
+        def has(name: str) -> bool:
+            return prefix + name in names
+
+        def read(name: str) -> bytes:
+            return archive.read(prefix + name)
+
+        spec = json.loads(read('song.json').decode('utf-8-sig'))
+        charts = spec.get('charts') or {}
+        if not isinstance(charts, dict) or not any(s in charts for s, _n in slots):
+            raise LibraryError(tr('song.json 的 charts 沒有可用的難度'))
+        audio = next((n for n in ('music.wav', 'music.ogg') if has(n)), None)
+        if not audio:
+            raise LibraryError(tr('ZIP 裡沒有 music.wav'))
+        fallback = prefix.rstrip('/') or os.path.splitext(os.path.basename(zip_path))[0]
+        title = str(spec.get('title') or fallback)
+        folder = self._unique_folder(title)
+        stem = folder
+        snapshot = self._snapshot(tr('匯入「%s」') % title, [])
+        song_dir = os.path.join(self.root, folder)
+        os.makedirs(song_dir)
+        try:
+            with open(os.path.join(song_dir, stem + os.path.splitext(audio)[1]), 'wb') as fh:
+                fh.write(read(audio))
+            if has('cover.png'):
+                with open(os.path.join(song_dir, stem + '.png'), 'wb') as fh:
+                    fh.write(read('cover.png'))
+            diffs = []
+            for slot, name in slots:
+                if slot not in charts or not has(slot + '.xml'):
+                    continue
+                os.makedirs(os.path.join(song_dir, name), exist_ok=True)
+                temp_dir = tempfile.mkdtemp()
+                temp = os.path.join(temp_dir, slot + '.xml')
+                with open(temp, 'wb') as fh:
+                    fh.write(read(slot + '.xml'))
+                model = NoteModel()
+                with contextlib.redirect_stdout(_io.StringIO()):
+                    model.load_xml(temp)
+                    model.save_json(os.path.join(song_dir, name, stem + '.json'))
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                level = charts[slot]
+                if slot == 'real':
+                    # REAL 顯示等級（1～3.5）→ 遊戲難度等級（輸出 ZIP 時換算的反向）
+                    level = int(round(10 + (float(level) - 1) * 2))
+                diff = {'difficultyName': name, 'difficultyLevel': level,
+                        'chartFileName': 'songs/%s/%s/%s' % (folder, name, stem),
+                        'audioResourcePath': 'songs/%s/%s' % (folder, stem)}
+                if has('cover.png'):
+                    diff['coverResourcePath'] = 'songs/%s/%s' % (folder, stem)
+                diffs.append(diff)
+            register = {'displayName': title, 'author': str(spec.get('artist') or ''),
+                        'difficulties': diffs}
+            if spec.get('slogan'):
+                register['slogan'] = str(spec['slogan'])
+            self._write_register(folder, register)
+        except Exception:
+            shutil.rmtree(song_dir, ignore_errors=True)
+            raise
         self._update_meta(snapshot, remove_folder=folder)
         self._set_index_entry(folder, [category])
         self.notify_game(folder)
         return folder
-
 
 # ── 曲庫位置 ──────────────────────────────────────────────────────────
 #

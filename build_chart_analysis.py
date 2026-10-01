@@ -24,7 +24,7 @@ import math
 import os
 import sys
 
-CACHE_VERSION = 10
+CACHE_VERSION = 14
 BUCKET_COUNT = 48
 SECTION_SECONDS = 12.0
 # 和整首的耐力用同一條線：每秒 12 顆音以上算「忙」。
@@ -252,21 +252,192 @@ def count_repeated_notes(seq):
     return total
 
 
+CHORD_WINDOW_MS = 8
+
+# ---- 耐力 ------------------------------------------------------------------
+# 一秒一格，不隨曲長變。顯示用的 48 個密度桶寬度是 lengthSeconds/48，最短的曲子
+# 0.8 秒一桶、最長的 20 秒一桶 —— 拿那個去量「連續撐了多久」，長曲的尖峰會被 20
+# 秒的平均抹平，而且「連續」這個概念本身就沒有意義了。
+STAMINA_GRID_SECONDS = 1.0
+# 可以無限撐下去的水位（每秒音符數，和弦成員算進去）。低於這個不累積疲勞。
+# 量自曲庫：密度中位是 7～8 顆/秒，6 這條線讓 94% 的譜有值，而且和難度等級的秩
+# 相關最高（0.909，原本的硬門檻是 0.839）。
+STAMINA_REST = 6.0
+# 連續時間的指數。1 = 線性（一段 120 秒等於四段 30 秒），>1 = 連續的更貴。
+STAMINA_GAMMA = 1.3
+# **強度**的指數。1 = 線性，那樣「5 秒的高密度」永遠贏不了「60 秒的中密度」——
+# 可是密度夠高的話五秒就受不了了。1.6 是這個曲庫裡相關最高的值（0.914），也剛好
+# 是那個比較翻轉的地方：5 秒 30 顆/秒得 383，60 秒 8 顆/秒得 182；α=1.3 時兩者
+# 打平，α=1.0 時耐久贏。
+STAMINA_ALPHA = 1.6
+# 喘幾秒不算中斷。
+STAMINA_GAP_SECONDS = 2
+# 把 T^gamma 換算成看得懂的單位：以一分鐘為基準的「額外音符數」。
+STAMINA_REFERENCE_SECONDS = 60.0
+
+# ---- 速度裡的移動成本 -------------------------------------------------------
+# 從容的移動速度（半音/秒）。60 = 八度跳躍給你 200 毫秒，和 count_fast_leaps 的
+# 「八度在 120ms 內」是同一把尺。超過就是被時間逼著跑。
+COMFORTABLE_TRAVEL = 60.0
+# 一個發聲點最多算幾個。沒有上限的話，一次極端的移動就能獨占整整一秒。
+TRAVEL_WEIGHT_CAP = 3.0
+
+
+def merge_onsets(times):
+    """Sorted strike times, with a chord collapsed to the one strike it is.
+
+    **A tolerance, not equality.** These used to be de-duplicated with a set,
+    which only merges notes written on the very same millisecond. 19% of the
+    library's charts spread a chord over one to seven milliseconds, and in 8% of
+    them that was enough to change the peak rate -- by nine strikes a second at
+    the median and twenty-four at the worst. A chart was reading as fast because
+    it was thick, which is precisely what counting strikes is supposed to avoid.
+    """
+    out = []
+    for time in sorted(times):
+        if out and time - out[-1] < CHORD_WINDOW_MS:
+            continue
+        out.append(time)
+    return out
+
+
+def _peak_per_second(times):
+    peak = 0
+    start = 0
+    for i, time in enumerate(times):
+        while time - times[start] > 1000:
+            start += 1
+        peak = max(peak, i - start + 1)
+    return peak
+
+
+def measure_peak_onset_rate(notes):
+    """Busiest second of the chart counted in rhythm points, both hands together.
+
+    This is what "speed" means to a player: how fast the music's attacks come,
+    independent of how many keys each one uses and of which hand takes it. A
+    stream shared between the hands is as fast to read as the same stream in
+    one hand, and a thick chord is one rhythm point, not five.
+    """
+    return _peak_per_second(merge_onsets(note.get("startTime") or 0 for note in notes))
+
+
+def measure_speed_load(notes):
+    """最忙一秒的**加權**節奏點數：跳得急的那一點算不只一個。
+
+    **為什麼節奏點密度不夠。** 密度低不代表不快 —— 空隙如果被大跳吃掉，給你跳的
+    時間就很少，手還是得動得很快。Grievous Lady 就是這樣：純節奏點 25/秒（全庫第
+    七成），可是它的空間有很大一部分在大跳上，加權後 57.5（第 96 百分位）。
+
+    同一隻手相鄰兩個發聲點，距離 D 半音、間隔 Δt 秒，手必須以 D/Δt 移動；超過
+    ``COMFORTABLE_TRAVEL`` 就按比例加重，上限 ``TRAVEL_WEIGHT_CAP``。
+
+    **和跨度軸不是同一件事。** 跨度問「跳得多不多」，這裡問「跳得急不急」——
+    和 fast_leap_ratio 的秩相關只有 0.43。和難度等級的相關 0.655 → 0.714。
+    """
+    urgency = {}
+    for seq in build_onsets(notes)[0]:
+        for i in range(1, len(seq)):
+            gap = (seq[i][0] - seq[i - 1][0]) / 1000.0
+            if gap <= 0 or gap > 1.0:      # 超過一秒就不是被逼的
+                continue
+            travel = abs(centre(seq[i]) - centre(seq[i - 1])) / gap
+            if travel > urgency.get(seq[i][0], 0.0):
+                urgency[seq[i][0]] = travel
+
+    points = []
+    for time in merge_onsets((note.get("startTime") or 0) for note in notes):
+        weight = max(1.0, min(TRAVEL_WEIGHT_CAP,
+                              urgency.get(time, 0.0) / COMFORTABLE_TRAVEL))
+        points.append((time, weight))
+
+    peak = 0.0
+    running = 0.0
+    start = 0
+    for i, (time, weight) in enumerate(points):
+        running += weight
+        while time - points[start][0] > 1000:
+            running -= points[start][1]
+            start += 1
+        peak = max(peak, running)
+    return round(peak, 2)
+
+
 def measure_peak_hand_rate(notes):
-    """Busiest second of a single hand, counted in strikes rather than notes."""
-    hands = (set(), set())
+    """Busiest second of a single hand, counted in strikes rather than notes.
+
+    Kept separate from :func:`measure_peak_onset_rate` because the chord axis is
+    the difference between this and the same hand's note count -- how much
+    thicker the busiest second is than the strikes that make it up.
+    """
+    hands = ([], [])
     for note in notes:
-        hands[0 if (note.get("hand") or 0) == 0 else 1].add(note.get("startTime") or 0)
+        hands[0 if (note.get("hand") or 0) == 0 else 1].append(note.get("startTime") or 0)
 
     peak = 0
     for hand in hands:
-        onsets = sorted(hand)
-        start = 0
-        for i, time in enumerate(onsets):
-            while time - onsets[start] > 1000:
-                start += 1
-            peak = max(peak, i - start + 1)
+        peak = max(peak, _peak_per_second(merge_onsets(hand)))
     return peak
+
+
+def measure_stamina_load(notes, length_seconds=None):
+    """撐下來要多付出多少：超出休息水位的音符量，連續越久權重越高。
+
+    **為什麼不是「density >= 12 的秒數」**（上一版的做法）：
+
+    1. 硬門檻。11.9 顆/秒撐四分鐘得到 0，12.1 顆/秒撐十秒得到 10。曲庫的密度中位
+       只有 7～8 顆/秒，所以那條線架得太高，**半數的譜拿到 0**，那一軸對它們等於
+       不存在。改成從休息水位起算的超出量，沒有開關。
+    2. 線性加總。一段連續 120 秒和分散的四段 30 秒得到一樣的分數，可是前者累得多。
+       改成每一段連續吃力的時間各自取 ``T ** STAMINA_GAMMA``。
+    3. 桶寬隨曲長變，長曲的「連續」根本量不準。改成固定一秒一格。
+
+    強度算的是**音符**不是節奏點：高速單點吃運指、連續砸和弦吃手臂，兩種都累 ——
+    這一點和速度軸相反，速度軸必須把和弦併成一個拍點（見 measure_peak_onset_rate）。
+    """
+    times = sorted((note.get("startTime") or 0) for note in notes)
+    if not times:
+        return 0.0
+
+    grid_ms = STAMINA_GRID_SECONDS * 1000.0
+    slots = int(times[-1] // grid_ms) + 1
+    curve = [0] * slots
+    for time in times:
+        curve[int(time // grid_ms)] += 1
+
+    rest = STAMINA_REST * STAMINA_GRID_SECONDS
+    total = 0.0
+    i = 0
+    while i < slots:
+        if curve[i] - rest <= 0:
+            i += 1
+            continue
+        j = i
+        last_busy = i
+        excess = 0.0
+        while j < slots:
+            if curve[j] - rest > 0:
+                excess += (curve[j] - rest) ** STAMINA_ALPHA
+                last_busy = j
+            elif j - last_busy >= STAMINA_GAP_SECONDS:
+                break
+            j += 1
+        seconds = (last_busy - i + 1) * STAMINA_GRID_SECONDS
+        # excess 已經是整段的總量，所以只要再乘上「這段有多長」的加權。
+        total += excess * (seconds / STAMINA_REFERENCE_SECONDS) ** (STAMINA_GAMMA - 1.0)
+        i = last_busy + 1
+    return round(total, 2)
+
+
+def project_stamina_load(notes, span_seconds, projection_seconds):
+    """一小段的耐力，換算成「整首都這樣的話」。"""
+    if not notes or span_seconds <= 0 or projection_seconds <= 0:
+        return 0.0
+    excess_rate = len(notes) / span_seconds - STAMINA_REST
+    if excess_rate <= 0:
+        return 0.0
+    return round(excess_rate ** STAMINA_ALPHA * projection_seconds
+                 * (projection_seconds / STAMINA_REFERENCE_SECONDS) ** (STAMINA_GAMMA - 1.0), 2)
 
 
 def measure_peak_chord_rate(notes):
@@ -499,9 +670,12 @@ def section_metrics(notes, projection_seconds):
         "note_count": len(notes),
         "hold_count": holds,
         "peak_hand_rate": measure_peak_hand_rate(notes),
+        "peak_onset_rate": measure_peak_onset_rate(notes),
+        "speed_load": measure_speed_load(notes),
         "peak_chord_rate": measure_peak_chord_rate(notes),
         "sustained_seconds": round(
             section_busy_fraction(times, span) * projection_seconds, 3),
+        "stamina_load": project_stamina_load(notes, span, projection_seconds),
         "fast_leap_ratio": 0.0,
         "octave_run_ratio": 0.0,
         "hand_cross_ratio": 0.0,
@@ -653,7 +827,10 @@ def analyse(chart):
         "peak_section": None,
         "quiet_section": None,
         "sustained_seconds": round(sustained, 3),
+        "stamina_load": measure_stamina_load(notes),
         "peak_hand_rate": measure_peak_hand_rate(notes),
+        "peak_onset_rate": measure_peak_onset_rate(notes),
+        "speed_load": measure_speed_load(notes),
         "peak_chord_rate": measure_peak_chord_rate(notes),
         "octave_run_ratio": 0.0,
         "fast_leap_ratio": 0.0,
