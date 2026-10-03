@@ -551,7 +551,8 @@ class MainWindow(QMainWindow):
     # ── 格式模式：JSON（完整）／XML（PAN 相容）──────────────────────────
 
     #: XML 模式要關掉的工具（PAN 沒有踏板）。用函式名比對，選單和工具列兩邊都抓得到。
-    _PAN_DISABLED_SLOTS = frozenset({'generate_pedal_dialog', 'clear_pedal'})
+    _PAN_DISABLED_SLOTS = frozenset({'generate_pedal_dialog', 'clear_pedal',
+                                     'restore_pedal_from_midi_dialog'})
 
     def _register_pan_gated(self, action, slot=None) -> None:
         name = slot if isinstance(slot, str) else getattr(slot, '__name__', '')
@@ -1539,6 +1540,7 @@ class MainWindow(QMainWindow):
             ('以 MIDI 修復', [
                 ('從 MIDI 還原音高與表情（力度／踏板）…',
                  self.restore_from_midi_dialog),
+                ('只從 MIDI 還原踏板…', self.restore_pedal_from_midi_dialog),
                 (t('action_conform_beats_midi'), self.conform_beats_to_midi_dialog),
                 (t('action_align_reference_midi'), self.align_reference_midi_dialog),
             ]),
@@ -4126,6 +4128,78 @@ class MainWindow(QMainWindow):
             % (os.path.basename(path), result.changed, result.unmatched,
                stats.get('velocity_applied', 0), stats.get('matched_notes', 0),
                stats.get('total_notes', 0), pedal_line))
+
+    def restore_pedal_from_midi_dialog(self) -> None:
+        """只拿 MIDI 的 CC64 覆蓋踏板；音高、力度、鍵道一律不動。
+
+        完整還原會連音高一起覆蓋，而音高對不上時整件事就被擋下。可是踏板是
+        時間軸事件、不綁音符——例如拿同一段音檔 AI 轉出來的 MIDI，音符和
+        手排過的譜面差很多，踏板卻是對的。所以這裡對位只用來換算時間軸；
+        對不上時問使用者要不要照 MIDI 的原始時間直接套。
+        """
+        title = '只從 MIDI 還原踏板'
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, '', 'MIDI (*.mid *.midi)')
+        if not path:
+            return
+        model = self.view.model
+        try:
+            source_model = NoteModel()
+            # 不排譜：踏板用不到鍵道，排譜卻是 MIDI 匯入最慢的那一段。
+            source_model.load_midi(path, auto_arrange=False)
+            # 先試算對位，什麼都不寫：兩個開關都關掉時只回報 alignment。
+            probe = model.apply_midi_expression_from_source(
+                source_model.notes_tree, source_model.pedal_spans,
+                restore_velocity=False, restore_pedal=False)
+        except Exception as e:                      # noqa: BLE001
+            logging.exception('restore pedal from midi failed')
+            QMessageBox.critical(self, t('dlg_load_fail_title'),
+                                 t('dlg_load_fail_msg', e))
+            return
+
+        if not source_model.pedal_spans:
+            QMessageBox.information(
+                self, title,
+                '%s 沒有 CC64 延音踏板訊息，現有踏板未變動。'
+                % os.path.basename(path))
+            return
+
+        notes = ['MIDI 裡有 %d 段踏板。' % len(source_model.pedal_spans)]
+        if probe['alignment'] == 'none':
+            notes.append(
+                '⚠ 這份 MIDI 的音符和譜面對不起來，無法換算時間軸，\n'
+                '    踏板會照 MIDI 的原始時間直接套上。\n'
+                '    MIDI 和譜面的背景音樂同一條時間軸（例如同一段音檔轉出來的）'
+                '才會對。')
+        if model.pedal_spans:
+            notes.append('譜面現有的 %d 段踏板會整份被取代。'
+                         % len(model.pedal_spans))
+        answer = QMessageBox.question(
+            self, title, '\n'.join(notes) + '\n\n要套用嗎？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No if probe['alignment'] == 'none' else QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            return
+
+        model.push_history()
+        stats = model.apply_midi_expression_from_source(
+            source_model.notes_tree, source_model.pedal_spans,
+            restore_velocity=False, restore_pedal=True)
+        # 這份是真人（或模型從音訊聽出來）的 CC64，不再是猜的。
+        model.json_meta.pop('pedal_origin', None)
+        model.dirty = True
+        self.view.update()
+        self.view.note_edited.emit()
+        self._refresh_title()
+
+        lines = ['從 %s 套用了 %d 段踏板（原本 %d 段）。'
+                 % (os.path.basename(path), stats['pedal_after'],
+                    stats['pedal_before']),
+                 '音高、力度、鍵道與左右手皆未變動。']
+        if stats['pedal_shift_ms']:
+            lines.append('踏板時間已換算到譜面時間軸（最多位移 %d ms）。'
+                         % stats['pedal_shift_ms'])
+        QMessageBox.information(self, title, '\n'.join(lines))
 
     def generate_difficulties_dialog(self) -> None:
         """從目前這份譜面生出 normal / hard / extreme 三份檔案。
