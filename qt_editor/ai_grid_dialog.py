@@ -104,7 +104,8 @@ class AiGridDialog(QDialog):
         self._variable.setToolTip(tr(
             '每 16 小節重新量一次速度，相同的併成一段，只在真的換速的地方寫速度變化。\n'
             '定速的曲子偵測結果就是一段，和不勾一樣。勾了之後第一小節起點由偵測決定。'))
-        self._variable.toggled.connect(self._refresh_enabled)
+        self._variable.toggled.connect(self._on_variable_toggled)
+        self._variable_user_set = False
         form.addRow('', self._variable)
         self._tempo_info = QLabel()
         self._tempo_info.setWordWrap(True)
@@ -175,10 +176,19 @@ class AiGridDialog(QDialog):
         if len(segments) <= 1:
             self._variable.setEnabled(False)
             if self._variable.isChecked():
+                self._updating = True
                 self._variable.setChecked(False)
+                self._updating = False
             self._tempo_info.setText(tr('偵測結果：整首同一個速度。'))
             return
         self._variable.setEnabled(True)
+        # 偵測到真的換速就預設勾起來：定速吸附在另一段速度上等於亂放格子
+        # （Mirai 的前奏是 116 BPM、主段 216，前奏的音符誤差和隨機擺沒兩樣）。
+        # 使用者自己取消過就不再勾回去。
+        if not self._variable_user_set and not self._variable.isChecked():
+            self._updating = True
+            self._variable.setChecked(True)
+            self._updating = False
         bar = 1
         parts = []
         for segment in segments:
@@ -197,6 +207,11 @@ class AiGridDialog(QDialog):
         if not self._updating:
             self._downbeat_edited = True
         self._refresh_info()
+
+    def _on_variable_toggled(self, *_args) -> None:
+        if not self._updating:
+            self._variable_user_set = True
+        self._refresh_enabled()
 
     # ── 顯示 ──
     def _refresh_enabled(self, *_args) -> None:

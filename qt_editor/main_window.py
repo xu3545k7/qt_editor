@@ -1541,6 +1541,7 @@ class MainWindow(QMainWindow):
                 ('從 MIDI 還原音高與表情（力度／踏板）…',
                  self.restore_from_midi_dialog),
                 ('只從 MIDI 還原踏板…', self.restore_pedal_from_midi_dialog),
+                ('重新吸附 AI 轉譜（BPM／小節線／變速）…', self.resnap_ai_midi_dialog),
                 (t('action_conform_beats_midi'), self.conform_beats_to_midi_dialog),
                 (t('action_align_reference_midi'), self.align_reference_midi_dialog),
             ]),
@@ -3724,16 +3725,60 @@ class MainWindow(QMainWindow):
                 result['notes'], result.get('pedals', 0),
                 AT.device_label(result.get('device', '')), result.get('elapsed', 0))
 
+        self._snap_and_load_ai_midi(out, AT.wav_path_for(path), os.path.basename(path), summary)
+
+    def resnap_ai_midi_dialog(self) -> None:
+        """拿 AI 轉出來的原始 MIDI 重新設 BPM／吸附小節線，不用重新轉譜。
+
+        已經吸附過的譜沒辦法再「修正」——吸附會把每顆音搬到最近的格子，原本的
+        時間就丟了；換一個速度再吸一次，只是把錯的位置再搬一次。所以一律回到
+        `歌名.ai.mid`（時間＝音檔秒數）重做，例如前奏和主段速度不同、當初卻用
+        定速吸附的時候。
+        """
+        import re
+        start_dir = os.path.dirname(self.view.model.current_file or '') or ''
+        path, _ = QFileDialog.getOpenFileName(
+            self, '選 AI 轉譜的原始 MIDI（歌名.ai.mid）', start_dir, 'MIDI (*.mid *.midi)')
+        if not path:
+            return
+        snapped = re.match(r'(.*\.ai)\.[0-9.]+bpm(-var)?\.mid$', path, re.IGNORECASE)
+        if snapped:
+            raw = snapped.group(1) + '.mid'
+            if not os.path.isfile(raw):
+                QMessageBox.warning(
+                    self, '重新吸附 AI 轉譜',
+                    '這份是已經吸附過的 MIDI，要用轉譜當下的原始檔：\n\n　%s\n\n'
+                    '但找不到它。' % os.path.basename(raw))
+                return
+            path = raw
+        base = path[:-len('.ai.mid')] if path.lower().endswith('.ai.mid') \
+            else os.path.splitext(path)[0]
+        wav = base + '.wav'
+        if self.view.model.dirty:
+            reply = QMessageBox.question(
+                self, t('dlg_unsaved_title'),
+                '目前譜面有未儲存的變更。\n重新吸附會載入新的譜面，要捨棄變更嗎？',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        self._snap_and_load_ai_midi(path, wav, os.path.basename(base))
+
+    def _snap_and_load_ai_midi(self, out: str, wav: str, audio_name: str,
+                               summary: str = '') -> None:
+        """AI 原始 MIDI（`歌名.ai.mid`）→ 設 BPM／吸附小節線 → 載入並掛上背景音樂。
+
+        轉譜完接著走這裡；「重新吸附 AI 轉譜」也走這裡，不用重轉就能換 BPM、
+        吸附格或改成跟著速度變化。`wav` 不存在就不掛背景音樂。
+        """
         # BPM 與小節線：改寫成指定 BPM 的 MIDI，音檔開頭補靜音讓第一小節對上小節線
         from . import ai_grid as G
         from .ai_grid_dialog import AiGridDialog
 
-        grid_dlg = AiGridDialog(self, G.onsets_for_detection(out), os.path.basename(path),
+        grid_dlg = AiGridDialog(self, G.onsets_for_detection(out), audio_name,
                                 division=int(settings.get('ai_grid_division', 4) or 0))
         if grid_dlg.exec_() != QDialog.Accepted:
             return
-        wav = AT.wav_path_for(path)
-        audio_for_editor = wav if os.path.isfile(wav) else ''
+        audio_for_editor = wav if wav and os.path.isfile(wav) else ''
         load_path = out
         if grid_dlg.enabled():
             grid = grid_dlg.settings()

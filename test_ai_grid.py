@@ -299,3 +299,33 @@ class MidiTempoTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipUnless(BD.available(), 'numpy 不在')
+class VariableTempoDefaultTests(unittest.TestCase):
+    """偵測到換速時「跟著音樂的速度變化」預設勾起來；定速曲維持不勾。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt5.QtWidgets import QApplication
+        cls._app = QApplication.instance() or QApplication([])
+
+    def _dialog(self, onsets, bpm):
+        from qt_editor.ai_grid_dialog import AiGridDialog
+        return AiGridDialog(None, onsets, 'song.wav', bpm_hint=bpm)
+
+    def test_tempo_change_is_checked_by_default(self):
+        dlg = self._dialog(_varying(), 150)
+        self.assertTrue(dlg.variable())
+        self.assertTrue(dlg.settings().variable)
+
+    def test_constant_song_stays_unchecked(self):
+        dlg = self._dialog(_song(bpm=150, downbeat=0.7, bars=24), 150)
+        self.assertFalse(dlg.variable())
+
+    def test_user_choice_survives_redetection(self):
+        dlg = self._dialog(_varying(), 150)
+        dlg._variable.setChecked(False)
+        dlg._bpm.setValue(151.0)            # 改 BPM 會重跑偵測
+        dlg._bpm.setValue(150.0)
+        self.assertFalse(dlg.variable())
