@@ -241,6 +241,7 @@ class ToolbarSet:
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
         self.view_mode_act: Optional[QAction] = None
+        self.game_preview_act: Optional[QAction] = None
         # 音量列：key -> {'label','slider','action','text'}
         self.vol: Dict[str, Dict[str, Any]] = {}
         # QToolButton 不持有 menu 的所有權，得自己留著參考
@@ -627,12 +628,39 @@ class MainWindow(QMainWindow):
         existing = getattr(self, '_game_preview', None)
         if existing is None:
             existing = GamePreviewWindow(self.view.model.notes, self)
-            existing.finished.connect(lambda _r: setattr(self, '_game_preview', None))
+            existing.finished.connect(lambda _r: self._on_game_preview_closed())
             self._game_preview = existing
         existing.set_notes(self.view.model.notes)
         existing.show()
         existing.raise_()
         self._push_game_preview(self.view.judge_line_view_ms())
+        self._sync_game_preview_buttons(True)
+
+    def toggle_game_preview(self, show: bool) -> None:
+        """檢視分頁的斜降按鈕：開關同一個視窗。"""
+        if show:
+            self.open_game_preview()
+            return
+        window = getattr(self, '_game_preview', None)
+        if window is not None:
+            window.close()
+        self._game_preview = None
+        self._sync_game_preview_buttons(False)
+
+    def _on_game_preview_closed(self) -> None:
+        """視窗自己被關掉（右上角的叉）時，按鈕也要彈回來。"""
+        self._game_preview = None
+        self._sync_game_preview_buttons(False)
+
+    def _sync_game_preview_buttons(self, on: bool) -> None:
+        """兩條工具列各有一顆，狀態要一起走（分割時是兩個獨立的 ToolbarSet）。"""
+        for tbs in getattr(self, '_toolbars', ()):
+            act = getattr(tbs, 'game_preview_act', None)
+            if act is None or act.isChecked() == on:
+                continue
+            act.blockSignals(True)         # 只是同步顯示，不要再觸發一次開關
+            act.setChecked(on)
+            act.blockSignals(False)
 
     def _push_game_preview(self, ms) -> None:
         window = getattr(self, '_game_preview', None)
@@ -1491,6 +1519,7 @@ class MainWindow(QMainWindow):
                 (t('action_resolve_horizontal_overlaps'), self.resolve_horizontal_overlaps),
                 (self._tool_label('action_hold_length_fix', '長押長度修整…'),
                  self.hold_length_fix_dialog),
+                ('PianoTrans 轉譜整理…', self.pianotrans_cleanup_dialog),
                 ('重新判斷左右手…', self.hand_split_dialog),
                 ('移除重複音符（同 start/pitch）…', self.remove_duplicate_start_pitch_dialog),
                 ('取消整份譜面的隱藏音符…', self.unhide_all_dialog),
@@ -2049,6 +2078,13 @@ class MainWindow(QMainWindow):
             tip=t('tb_time_uniform_tip'))
         self._refresh_view_mode_action()
 
+        # 斜降：和選單的「遊戲預覽（斜降）」是同一個視窗，這裡是開關。
+        tbs.game_preview_act = self._tab_action(
+            tbs, t('tb_game_preview'),
+            lambda checked: self.toggle_game_preview(checked),
+            tip=t('tb_game_preview_tip'), checkable=True, keys='open_game_preview')
+        tbs.game_preview_act.setChecked(getattr(self, '_game_preview', None) is not None)
+
         return self._tab_page([
             split_block,
             None,
@@ -2057,6 +2093,7 @@ class MainWindow(QMainWindow):
             None,
             self._tab_button(tbs.preview_act),
             self._tab_button(tbs.view_mode_act),
+            self._tab_button(tbs.game_preview_act),
         ])
 
     def _build_split_block(self, tbs: ToolbarSet) -> QWidget:
@@ -6462,6 +6499,46 @@ class MainWindow(QMainWindow):
                stats['trimmed'], stats.get('gapped', 0), stats['unchanged']),
             8000,
         )
+
+    def pianotrans_cleanup_dialog(self) -> None:
+        """把 AI 轉譜（PianoTrans）載入時自動做的那一輪整理，變成手動按得到的。
+
+        轉完就載進來的譜已經自動跑過（見 `transcribe_audio_ai`），這顆按鈕是給
+        「別的地方拿到的 PianoTrans 輸出」「之前用舊版轉的譜」用的。做的事和自動
+        那條完全一樣，所以結果一致。
+        """
+        if self.view.alloc_active:
+            return
+        model = self.view.model
+        notes = [n for n in model.notes_tree if n.pitch is not None]
+        if len(notes) < 2:
+            QMessageBox.information(self, 'PianoTrans 轉譜整理', '這份譜沒有帶音高的音符。')
+            return
+
+        tracks = {int(n.track) for n in notes if n.track is not None}
+        extra = ''
+        if len(tracks) >= 2:
+            extra = ('\n\n⚠ 這份譜有 %d 條音軌，分手很可能是來源 MIDI 寫的——那是正確'
+                     '答案，重算會蓋掉它。' % len(tracks))
+        if QMessageBox.question(
+                self, 'PianoTrans 轉譜整理',
+                '這是給 AI 音訊轉譜（PianoTrans）用的整理，會做三件事：\n\n'
+                '1. 長度：note-off 是踏板放開的時間不是手指離鍵的時間，'
+                '把拖過「非放開不可那一刻」的裁回來（和弦與分解和弦不動）\n'
+                '2. 分手：單軌來源的分手是照音高切一刀猜的，改成照手的移動判，'
+                '並拆成兩條音軌\n'
+                '3. 再裁一次長度，補上換手之後改變的界線\n\n'
+                '一次 Ctrl+Z 可以全部還原。要跑嗎？' + extra,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+
+        summary = self._fix_ai_transcription()
+        if not summary:
+            QMessageBox.information(self, 'PianoTrans 轉譜整理',
+                                    '沒有東西需要整理——分手和長度都已經是對的。')
+            return
+        self.statusBar().showMessage(summary, 10000)
+        QMessageBox.information(self, 'PianoTrans 轉譜整理', summary)
 
     def hand_split_dialog(self) -> None:
         """重新判斷左右手。只對「分手是猜出來的」譜有意義，所以先擋一道。

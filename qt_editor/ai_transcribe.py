@@ -122,11 +122,38 @@ def _marker_path(root: Optional[str] = None) -> str:
     return os.path.join(root or env_root(), 'installed.json')
 
 
-def bundled_worker_source() -> str:
-    """製譜器帶著的 worker 原始檔（打包後在 _MEIPASS/qt_editor 底下）。"""
+def _bundled_dir() -> str:
+    """製譜器帶著的 qt_editor 原始檔在哪（打包後在 _MEIPASS/qt_editor 底下）。"""
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, 'qt_editor', 'ai_transcribe_worker.py')  # type: ignore[attr-defined]
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ai_transcribe_worker.py')
+        return os.path.join(sys._MEIPASS, 'qt_editor')  # type: ignore[attr-defined]
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def bundled_worker_source() -> str:
+    return os.path.join(_bundled_dir(), 'ai_transcribe_worker.py')
+
+
+def deploy_worker(root: Optional[str] = None) -> None:
+    """把 worker 和它要的分離模組複製進轉譜環境。
+
+    worker 在那邊是獨立跑的（環境裡沒有 qt_editor 這個套件），所以
+    `piano_separate.py` 和 `vendor/` 要原樣放在它旁邊，`import piano_separate`
+    才找得到。每次轉譜前都重新複製，改過的程式才會生效。
+    """
+    root = root or env_root()
+    # 以 `bundled_worker_source()` 為準、不要自己組路徑：測試會換掉它來塞一個
+    # 假的 worker，繞過去的話會複製到真的那一份（需要 torch）。
+    source = bundled_worker_source()
+    shutil.copyfile(source, worker_path(root))
+    src = os.path.dirname(source)
+    sep = os.path.join(src, 'piano_separate.py')
+    if os.path.isfile(sep):
+        shutil.copyfile(sep, os.path.join(root, 'piano_separate.py'))
+    vendor_src = os.path.join(src, 'vendor')
+    if os.path.isdir(vendor_src):
+        vendor_dst = os.path.join(root, 'vendor')
+        shutil.rmtree(vendor_dst, ignore_errors=True)
+        shutil.copytree(vendor_src, vendor_dst)
 
 
 def default_output_path(audio_path: str) -> str:
@@ -568,8 +595,14 @@ def _torch_args(variant: str) -> List[str]:
 
 
 def install(cancel: threading.Event, log: Log, progress: Progress,
-            variant: Optional[str] = None, root: Optional[str] = None) -> Dict:
-    """安裝（或補完）轉譜環境。已完成的步驟會跳過。回傳 installed.json 的內容。"""
+            variant: Optional[str] = None, root: Optional[str] = None,
+            separator: bool = False) -> Dict:
+    """安裝（或補完）轉譜環境。已完成的步驟會跳過。回傳 installed.json 的內容。
+
+    `separator=True` 另外裝鋼琴分離模型（+699MB）。混音直接餵給轉譜模型 F1 只有
+    29%，先分離過是 60%（見 `piano_separate`），所以值得，但它不是必要的——
+    手上已經是鋼琴錄音的話用不到。
+    """
     root = root or env_root()
     os.makedirs(root, exist_ok=True)
     if variant is None:
@@ -588,7 +621,9 @@ def install(cancel: threading.Event, log: Log, progress: Progress,
     log('安裝轉譜套件…')
     _pip(root, PACKAGES, cancel, log, progress, 'packages')
     _install_checkpoint(root, cancel, log, progress)
-    shutil.copyfile(bundled_worker_source(), worker_path(root))
+    if separator:
+        _install_separator(root, cancel, log, progress)
+    deploy_worker(root)
 
     log('自我檢查…')
     progress('selftest', 0, 0)
@@ -610,6 +645,74 @@ def install(cancel: threading.Event, log: Log, progress: Progress,
         info['torch'], device_label(info['device']),
         ('（%s）' % info['device_name']) if info['device_name'] else ''))
     return info
+
+
+def _install_separator(root: str, cancel: threading.Event, log: Log,
+                       progress: Progress) -> None:
+    """鋼琴分離模型：套件 + 權重。已經裝好就跳過。"""
+    from . import piano_separate as PS
+
+    if PS.is_installed(root):
+        log('鋼琴分離模型已存在，略過。')
+        return
+    log('安裝分離模型要的套件…')
+    # 一律 --no-deps：讓 pip 自己解依賴會把 torch 降版，RTX 50 系列需要 cu128
+    _pip(root, ['--no-deps'] + list(PS.PACKAGES), cancel, log, progress, 'separator-pkgs')
+    folder = PS.model_dir(root)
+    os.makedirs(folder, exist_ok=True)
+    for name, size in ((PS.CONFIG_NAME, 0), (PS.CKPT_NAME, PS.CKPT_SIZE)):
+        dest = os.path.join(folder, name)
+        if os.path.isfile(dest) and (not size or os.path.getsize(dest) == size):
+            continue
+        log('下載鋼琴分離模型 %s%s…'
+            % (name, ('（約 %dMB）' % PS.download_size_mb()) if size else ''))
+        _download(PS.BASE_URL + name, dest, cancel, progress, 'separator', size)
+    with open(os.path.join(folder, 'installed.json'), 'w', encoding='utf-8') as fh:
+        json.dump({'model': 'BS-Rofo-SW', 'source': PS.BASE_URL}, fh,
+                  ensure_ascii=False, indent=2)
+    log('鋼琴分離模型安裝完成。')
+
+
+def install_separator(cancel: threading.Event, log: Log, progress: Progress,
+                      root: Optional[str] = None) -> None:
+    """只補裝分離模型（轉譜環境已經有的情況）。"""
+    _install_separator(root or env_root(), cancel, log, progress)
+
+
+def separator_installed(root: Optional[str] = None) -> bool:
+    """有沒有**任何一個**分離器可用。"""
+    return any(separator_models(root).values())
+
+
+def separator_models(root: Optional[str] = None) -> Dict[str, bool]:
+    """每個分離器現在能不能用：{'bsrofo': bool, 'demucs': bool}。
+
+    demucs 裝在轉譜環境裡（不是製譜器這邊），所以要問那邊的直譯器。
+    """
+    from . import piano_separate as PS
+
+    root = root or env_root()
+    out = {'bsrofo': PS.is_installed(root), 'demucs': False}
+    exe = python_exe(root)
+    if os.path.isfile(exe):
+        try:
+            probe = subprocess.run([exe, '-c', 'import demucs.api'],
+                                   capture_output=True, timeout=60,
+                                   env=_child_env(), creationflags=_NO_WINDOW)
+            out['demucs'] = probe.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return out
+
+
+def install_demucs(cancel: threading.Event, log: Log, progress: Progress,
+                   root: Optional[str] = None) -> None:
+    """裝 demucs（第二個分離器）。模型權重由它自己在第一次使用時下載。"""
+    from . import piano_separate as PS
+
+    root = root or env_root()
+    log('安裝 demucs…')
+    _pip(root, [PS.DEMUCS_PACKAGE], cancel, log, progress, 'demucs')
 
 
 def uninstall(root: Optional[str] = None) -> None:
@@ -648,8 +751,13 @@ def wav_path_for(audio_path: str) -> str:
 
 def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
                log: Log, progress: Progress, device: str = 'auto',
-               root: Optional[str] = None, want_wav: bool = True) -> Dict:
+               root: Optional[str] = None, want_wav: bool = True,
+               separate: bool = False, separate_model: str = '') -> Dict:
     """音檔 → MIDI。回傳 worker 的 done 訊息（notes / pedals / device / elapsed…）。
+
+    `separate=True` 且分離模型裝好了的話，先把鋼琴分離出來再轉——混音直接轉
+    F1 只有 29%，分離過是 60%（見 `piano_separate`）。分離出來的軌寫成
+    `<音檔>._piano.wav` 留在旁邊。
 
     非 WAV 的輸入順便輸出一份同名 WAV（已經有了就不覆蓋），結果的 `wav` 欄位是它。
     `want_wav=False` 就不解那份 WAV——只想要 MIDI 檔的時候，沒必要在人家的音樂
@@ -664,10 +772,9 @@ def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
     if os.path.getsize(audio_path) == 0:
         raise RuntimeError('這個音檔是空的（0 位元組），多半是下載沒有成功，請重新下載：\n%s'
                            % audio_path)
-    # 製譜器更新後 worker 可能也改了；每次都用製譜器帶的那份。
-    source = bundled_worker_source()
-    if os.path.isfile(source):
-        shutil.copyfile(source, worker_path(root))
+    # 製譜器更新後 worker 可能也改了；每次都用製譜器帶的那份（分離模組也一起）。
+    if os.path.isfile(bundled_worker_source()):
+        deploy_worker(root)
 
     result: Dict = {}
     errors: List[str] = []
@@ -692,6 +799,13 @@ def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
     args = [python_exe(root), worker_path(root), '--input', audio_path,
             '--output', tmp_output, '--checkpoint', checkpoint_path(root),
             '--device', device]
+    if separate and separator_installed(root):
+        # 分離出來的鋼琴軌留在音檔旁邊：使用者可以自己聽、也可以當成以後的素材。
+        # `--env` 只在這條路上給——舊的 worker 不認識它，多給會讓 argparse 退出。
+        args += ['--separate', '--env', root, '--separate-out',
+                 os.path.splitext(audio_path)[0] + '._piano.wav']
+        if separate_model:
+            args += ['--separate-model', separate_model]
     wav = wav_path_for(audio_path)
     tmp_wav = ''
     if want_wav and wav != audio_path and not os.path.isfile(wav):

@@ -190,3 +190,50 @@ class PanRoundTripTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HiraethNeedsContiguousIndexTests(unittest.TestCase):
+    """Hiraeth 歌曲包要編號從 0 連號，PAN 要原樣保留——兩條路的需求相反。
+
+    使用者回報輸出 ZIP 時報錯「音符 index 沒有從 0 連號」。成因是 PAN 相容那輪
+    改成「編號齊全且唯一就沿用原檔」，而官譜的編號本來就會跳號（實測 Pure White
+    是 2067 顆音符編號 0~2608），於是走同一條 build_pan_xml 的 Hiraeth 匯出就被
+    自己的驗證擋下來。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.xml = os.path.join(self.tmp, 'src.xml')
+        with open(self.xml, 'w', encoding='utf-8') as fh:
+            fh.write(CHART)
+        self.model = NoteModel()
+        self.model.load_xml(self.xml)
+        self.model.rebuild_display_cache()
+
+    def ids(self, root):
+        return sorted(int(n.findtext('index')) for n in root.findall('note_data/note'))
+
+    def test_pan_keeps_the_original_numbers(self):
+        self.assertEqual(self.ids(self.model.build_pan_xml()), [901, 903, 905, 907])
+
+    def test_hiraeth_renumbers_from_zero(self):
+        root = self.model.build_pan_xml(preserve_indices=False)
+        self.assertEqual(self.ids(root), [0, 1, 2, 3])
+
+    def test_renumbering_keeps_the_slide_chain_pointing_somewhere_real(self):
+        root = self.model.build_pan_xml(preserve_indices=False)
+        have = set(self.ids(root))
+        for note in root.findall('note_data/note'):
+            for key in ('param1', 'param2'):
+                value = int(note.findtext(key))
+                if value >= 0:
+                    self.assertIn(value, have, '%s 指到不存在的編號' % key)
+
+    def test_the_export_path_asks_for_renumbering(self):
+        """模組對了但匯出沒傳參數的話，這裡會抓到。"""
+        import inspect
+
+        from qt_editor import hiraeth_export
+
+        source = inspect.getsource(hiraeth_export)
+        self.assertIn('build_pan_xml(preserve_indices=False)', source)

@@ -158,6 +158,38 @@ def selftest(args):
          device=device, device_name=note)
 
 
+def run_separation(args, device):
+    """轉譜前先分離鋼琴。回傳要拿去轉譜的檔案路徑。
+
+    混音直接餵給轉譜模型 F1 只有 29%，先分離過是 60%（實測 8 首，見
+    `piano_separate` 的說明）。分離失敗不擋轉譜——退回原始音檔，只是結果會差。
+    """
+    import tempfile
+
+    env = args.env or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = args.separate_out
+    if not out:
+        out = os.path.join(tempfile.gettempdir(),
+                           os.path.splitext(os.path.basename(args.input))[0] + '._piano.wav')
+    emit('progress', stage='separate', done=0, total=1)
+    emit('log', message='先把鋼琴分離出來…')
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from qt_editor import piano_separate as PS
+    except ImportError:
+        import piano_separate as PS                      # worker 被複製出去時
+    try:
+        PS.separate(args.input, out, env, device=device,
+                    model=getattr(args, 'separate_model', None) or PS.DEFAULT_MODEL,
+                    progress=lambda f: emit('progress', stage='separate',
+                                            done=int(f * 100), total=100))
+    except Exception as exc:                             # noqa: BLE001
+        emit('log', message='分離失敗，改用原始音檔：%s' % exc)
+        return args.input
+    emit('log', message='分離完成：%s' % os.path.basename(out))
+    return out
+
+
 def transcribe(args):
     import torch
     from piano_transcription_inference import PianoTranscription, inference, sample_rate
@@ -167,8 +199,12 @@ def transcribe(args):
     if note:
         emit('log', message=('使用 %s：%s' % (device.upper(), note))
              if device != 'cpu' else note)
+    source = args.input
+    if args.separate:
+        source = run_separation(args, device)
+
     emit('progress', stage='load_audio', done=0, total=1)
-    audio, native_rate, seconds, original = load_audio(args.input, sample_rate)
+    audio, native_rate, seconds, original = load_audio(source, sample_rate)
     emit('log', message='音檔 %.1f 秒（%d Hz）' % (seconds, native_rate))
     if args.wav_out:
         # 製譜器只播得了 WAV：mp3 / ogg / flac 順便解碼一份原音質的 WAV 放旁邊
@@ -215,6 +251,12 @@ def main():
     parser.add_argument('--device', default='auto', choices=('auto', 'cuda', 'mps', 'cpu'))
     parser.add_argument('--batch', type=int, default=0)
     parser.add_argument('--wav-out', dest='wav_out')
+    parser.add_argument('--separate', action='store_true',
+                        help='轉譜前先把鋼琴分離出來（見 piano_separate）')
+    parser.add_argument('--separate-model', dest='separate_model', default='bsrofo')
+    parser.add_argument('--separate-out', dest='separate_out',
+                        help='分離出來的鋼琴軌寫到哪；不給就放暫存')
+    parser.add_argument('--env')
     args = parser.parse_args()
     try:
         if args.selftest:

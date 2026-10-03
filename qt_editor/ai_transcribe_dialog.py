@@ -12,10 +12,13 @@ from typing import Any, Callable, Dict, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QFont
-from PyQt5.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QVBoxLayout)
+from PyQt5.QtWidgets import (
+    QCheckBox, QDialog, QDialogButtonBox, QGroupBox, QHBoxLayout, QLabel,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+    QVBoxLayout)
 
 from . import ai_transcribe as AT
+from . import piano_separate as SEP
 from . import platform_support as PS
 from .ui_text import tr
 
@@ -35,6 +38,11 @@ _BYTE_STAGES = {'python', 'pip', 'torch', 'packages', 'model'}
 
 SOLO_PIANO_HINT = ('模型只用獨奏鋼琴訓練過：整首混音（有鼓、合成器、人聲）會轉出大量雜音。'
                    '有鋼琴分軌（*_piano.wav）的曲子請用分軌。')
+
+#: 裝了分離模型之後，混音也有救（實測見 piano_separate 的說明）
+SEPARATE_HINT = ('先把鋼琴從混音裡分離出來再轉。實測 6 首：直接轉混音 F1 29%，'
+                 '先分離是 60%（原本就乾淨的鋼琴軌是 93%）。'
+                 '分離出來的軌會存成 <音檔>._piano.wav 放在旁邊。')
 
 #: 每種 torch 版本大概多快（安裝前的確認對話框要講清楚要等多久）。
 _VARIANT_SPEED = {
@@ -239,17 +247,103 @@ def run_install(parent, variant: Optional[str] = None) -> bool:
     return True
 
 
+class SeparateDialog(QDialog):
+    """要不要先分離鋼琴、用哪個分離器。
+
+    兩個分離器都列出來，連實測數字一起——選哪個是有代價的決定（速度 vs 品質），
+    不該只給一個不說理由的勾選框。沒裝的那個標「要下載」，選了會先裝。
+    """
+
+    def __init__(self, parent, available: Dict[str, bool]):
+        super().__init__(parent)
+        self.setWindowTitle(tr('AI 轉譜：先分離鋼琴'))
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(tr(SEPARATE_HINT))
+        intro.setWordWrap(True)
+        intro.setStyleSheet('color: #555;')
+        layout.addWidget(intro)
+
+        box = QGroupBox(tr('用哪個分離器'))
+        inner = QVBoxLayout(box)
+        self._buttons = {}
+        for key, info in SEP.MODELS.items():
+            ready = available.get(key, False)
+            text = '%s　—　%s' % (info['label'], tr(info['note']))
+            if not ready:
+                text += tr('（要先下載）')
+            btn = QRadioButton(text)
+            btn.setChecked(key == SEP.DEFAULT_MODEL)
+            self._buttons[key] = btn
+            inner.addWidget(btn)
+        layout.addWidget(box)
+
+        self._skip = QCheckBox(tr('不要分離，直接轉原始音檔'))
+        self._skip.setToolTip(tr('手上已經是鋼琴錄音的話就不用分離。'))
+        layout.addWidget(self._skip)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def choice(self) -> str:
+        """選了哪個；不分離就回空字串。"""
+        if self._skip.isChecked():
+            return ''
+        for key, btn in self._buttons.items():
+            if btn.isChecked():
+                return key
+        return ''
+
+
+def ask_separate(parent, audio_path: str) -> str:
+    """要不要先分離鋼琴、用哪個。回傳分離器的名字；不分離回空字串。
+
+    檔名看起來已經是鋼琴分軌就不問——那本來就乾淨，再分一次只會多掉東西。
+    """
+    if os.path.basename(audio_path).lower().endswith('_piano.wav'):
+        return ''
+    available = AT.separator_models()
+    dlg = SeparateDialog(parent, available)
+    if dlg.exec_() != QDialog.Accepted:
+        return ''
+    choice = dlg.choice()
+    if not choice or available.get(choice):
+        return choice
+
+    # 選到還沒裝的那個，先裝
+    if choice == 'demucs':
+        title, job = tr('安裝 demucs'), AT.install_demucs
+    else:
+        title, job = tr('安裝鋼琴分離模型'), AT.install_separator
+    task = TaskDialog(parent, title, tr('下載中…'),
+                      lambda cancel, log, progress: job(cancel, log, progress))
+    task.exec_()
+    if task.error:
+        QMessageBox.critical(parent, tr('安裝失敗'), task.error)
+    return choice if AT.separator_models().get(choice) else ''
+
+
 def run_transcribe(parent, audio_path: str, output_path: str,
-                   want_wav: bool = True) -> Optional[Dict]:
+                   want_wav: bool = True,
+                   separate: Optional[str] = None) -> Optional[Dict]:
     """跑轉譜；成功回傳 worker 的結果（notes / pedals / device / elapsed），否則 None。
 
     `want_wav=False`：非 WAV 的輸入不順便解一份同名 WAV（只要 MIDI 檔的時候用）。
+    `separate=None` 會先問使用者要不要分離鋼琴、用哪個分離器；給空字串就不分離。
     """
-    hint = '%s\n\n%s' % (os.path.basename(audio_path), SOLO_PIANO_HINT)
+    if separate is None:
+        separate = ask_separate(parent, audio_path)
+    hint = '%s\n\n%s' % (os.path.basename(audio_path),
+                         (tr('先用 %s 分離鋼琴。') % SEP.MODELS[separate]['label'])
+                         if separate else SOLO_PIANO_HINT)
     dlg = TaskDialog(parent, 'AI 轉譜', hint,
                      lambda cancel, log, progress: AT.transcribe(
                          audio_path, output_path, cancel, log, progress,
-                         want_wav=want_wav))
+                         want_wav=want_wav, separate=bool(separate),
+                         separate_model=separate or ''))
     dlg.exec_()
     if dlg.result_value is None and dlg.error:
         # 失敗時視窗留著讓使用者看紀錄，關掉後再給一個簡短的錯誤框

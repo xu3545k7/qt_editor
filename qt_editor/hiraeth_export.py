@@ -335,7 +335,10 @@ def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
                         if getattr(n, 'hidden', False) or int(n.hand) in (0, 1)]
     log['auto_notes_dropped'] = before - len(model.notes_tree)
     model.rebuild_display_cache()
-    root = model.build_pan_xml()
+    # 編號重編成 0..N-1：Hiraeth 的驗證寫明「音符 index 沒有從 0 連號」就退件，
+    # 而從官譜匯入的譜編號本來就會跳號（Pure White 是 2067 顆音符編號 0~2608）。
+    # PAN 那條路照舊沿用原編號，兩邊的需求不一樣。
+    root = model.build_pan_xml(preserve_indices=False)
     header = root.find('header')
     header.find('min_scale').text = '1'
     header.find('max_scale').text = '88'

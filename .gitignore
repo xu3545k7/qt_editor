@@ -78,3 +78,6 @@ build_tmp_mac/
 vendor/fluidsynth/mac/
 qt_editor/icon.icns
 *.app/
+
+# 匯出對話框記住的歌曲資訊（使用者資料，不是原始碼）
+qt_editor/song_info.json

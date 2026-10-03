@@ -6174,7 +6174,67 @@ class NoteModel:
                 cleaned.append(ms)
         return cleaned
 
-    def build_pan_xml(self) -> ET.Element:
+    def repair_note_indices(self, ordered: Optional[List['GNote']] = None) -> int:
+        """編號**壞掉時**才重編成 0..N-1，並照幾何重建滑奏鏈結。回傳改了幾顆。
+
+        壞掉＝有些音符有編號、有些沒有（半套），或者編號重複。這兩種都會讓
+        `param1`/`param2` 指到不存在或有歧義的目標。編號齊全又互不重複就**原樣
+        不動**——官譜的編號不從 0 開始也不連號（901、903…），那是原檔帶著的資訊，
+        PAN 繞一圈回來要一樣（見 `build_pan_xml` 的 `preserve_indices`）。
+
+        為什麼 JSON 也要做：**遊戲讀的是 JSON**。`ExternalSongLibrary` 讀
+        param1/param2，`JudgmentManager` 用 `slideNotesByIndex.TryGetValue(param1)`
+        串鏈，`NoteController` 比 `candidate.index != param2` 找下一節——所以 JSON
+        裡的編號壞掉，遊戲的滑奏就會斷。XML 與 Hiraeth ZIP 本來就在 `build_pan_xml`
+        裡修，只有 JSON 這條原樣寫出去。
+
+        順序和 `build_pan_xml` 一樣：**先用原編號把鏈結解析成音符物件，再重編、
+        再把 param 寫成新編號**。反過來做（先重編再解析）等於自己把對照關係毀掉，
+        鏈結會全部變成鏈尾。
+        """
+        notes = list(ordered) if ordered is not None else sorted(
+            self.notes_tree, key=lambda n: (int(n.start), int(n.min_key)))
+        if not notes:
+            return 0
+        originals = [getattr(n, 'note_index', None) for n in notes]
+        if all(v is None for v in originals):
+            return 0                                  # 整份都沒編號，本來就沒有鏈結
+        if all(v is not None for v in originals) \
+                and len(set(int(v) for v in originals)) == len(originals):
+            return 0                                  # 齊全又唯一：原樣保留
+
+        # 1. 先用**原**編號把鏈結解析成音符物件
+        index_map = build_slide_index_map(notes)
+        next_of: Dict[int, 'GNote'] = {}
+        prev_of: Dict[int, 'GNote'] = {}
+        for note in notes:
+            if not note_is_slide(int(note.note_type)):
+                continue
+            nxt = slide_next_note(note, notes, index_map)
+            if nxt is not None and nxt is not note:
+                next_of[id(note)] = nxt
+                prev_of.setdefault(id(nxt), note)
+
+        # 2. 重編
+        changed = 0
+        for i, note in enumerate(notes):
+            if getattr(note, 'note_index', None) != i:
+                note.note_index = i
+                changed += 1
+
+        # 3. 把 param 寫成新編號
+        for note in notes:
+            if not note_is_slide(int(note.note_type)):
+                continue
+            nxt = next_of.get(id(note))
+            prv = prev_of.get(id(note))
+            note.param2 = int(nxt.note_index) if nxt is not None else -1
+            note.param1 = int(prv.note_index) if prv is not None else -1
+        if changed:
+            self.dirty = True
+        return changed
+
+    def build_pan_xml(self, preserve_indices: bool = True) -> ET.Element:
         """組出 PAN 相容的整棵 XML（不動 self.root，也不改音符類型與長度）。
 
         長押的長度**照畫面上的樣子寫出去**。以前這裡會把非官方來源的譜乘上
@@ -6182,6 +6242,11 @@ class NoteModel:
         官方譜的長押比較短」；但這讓製譜器變成不是所見即所得——把長條尾端對齊
         小節線，進遊戲卻短了 20%（一小節 2000ms 的長條差 400ms），而且畫面上
         每一條長押都比遊戲裡長 25%。
+
+        `preserve_indices=False` 時一律把 `<index>` 重編成 0..N-1（param1/param2
+        跟著映射）。**Hiraeth 歌曲包要這個**：它的驗證寫明「音符 index 沒有從 0
+        連號」就退件，而官譜的編號本來就會跳號（實測 Pure White 是 2067 顆音符
+        編號 0~2608）。PAN 那條路維持沿用原編號，不然官譜繞一圈回來會對不上。
         """
         from .pan_format import (DEFAULT_TRACKS, FIELDS, default_track_for_hand,
                                  pan_note_type, typed)
@@ -6206,7 +6271,7 @@ class NoteModel:
             # 讓 param1/param2 指到不存在的編號。
             written = {}
             originals = [getattr(n, 'note_index', None) for n in visible]
-            if visible and all(v is not None for v in originals) \
+            if preserve_indices and visible and all(v is not None for v in originals) \
                     and len(set(int(v) for v in originals)) == len(originals):
                 for n, v in zip(visible, originals):
                     written[id(n)] = int(v)
@@ -6465,6 +6530,7 @@ class NoteModel:
         else:
             meta.pop(self.BEAT_ENTRY_QUARTERS_KEY, None)
         ordered = sorted(self.notes_tree, key=lambda n: (n.start, n.min_key))
+        self.repair_note_indices(ordered)
         meta['notes'] = [n.to_json_dict() for n in ordered]
         # 隱藏音符的「寄主是誰」也要寫進 JSON。以前只有 XML 拆 sub_note 時會
         # 在記憶體裡記 `_sub_host`，JSON 沒有這個資訊——於是 XML→JSON→XML
