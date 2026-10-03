@@ -52,6 +52,9 @@ datas = [
     ('qt_editor/Tap.wav', 'qt_editor'),
     ('qt_editor/settings.json', 'qt_editor'),
     ('qt_editor/ai_transcribe_worker.py', 'qt_editor'),
+    # 轉譜環境裡要跑的分離模組（deploy_worker 會複製過去）
+    ('qt_editor/piano_separate.py', 'qt_editor'),
+    ('qt_editor/vendor', 'qt_editor/vendor'),
     # 轉譜參數表的說明文字要讀這份原始碼（arrange_param_text.py）
     ('qt_editor/smart_chart.py', 'qt_editor'),
 ]
