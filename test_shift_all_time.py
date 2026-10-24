@@ -186,3 +186,192 @@ class ShiftAllTimeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ShiftExpressionTests(unittest.TestCase):
+    """平移踏板與強弱記號（不動音符、不動小節線）。
+
+    使用者：「但是踏板也要往前甚至裁掉阿」——選取平移只搬音符的話，踏法就和
+    音符錯開了。被推到 0 之前的部分要裁掉：一半在外面的切短，整段都在外面的
+    直接消失。
+    """
+
+    def chart(self):
+        m = NoteModel.create_new('t', 120.0, 20.0, 4)
+        m.ensure_precise_beat_grid()
+        m.notes_tree = [make(i, 1000 + 500 * i) for i in range(8)]
+        m.pedal_spans = [[200.0, 1500.0], [2000.0, 3000.0], [5000.0, 6000.0]]
+        m.dynamics = {0: [[300.0, 90.0, 0.0], [2500.0, 60.0, 0.0]]}
+        m.rebuild_display_cache()
+        return m
+
+    def spans(self, m):
+        return [[int(a), int(b)] for a, b in m.pedal_spans]
+
+    def marks(self, m):
+        return [int(x[0]) for x in m.dynamics[0]]
+
+    def test_everything_moves_later(self):
+        m = self.chart()
+        m.shift_expression(700)
+        self.assertEqual(self.spans(m), [[900, 2200], [2700, 3700], [5700, 6700]])
+        self.assertEqual(self.marks(m), [1000, 3200])
+
+    def test_a_span_hanging_off_the_front_is_clipped(self):
+        m = self.chart()
+        info = m.shift_expression(-500)
+        self.assertEqual(self.spans(m)[0], [0, 1000], '該切短，不是整段丟掉')
+        self.assertEqual(info['pedals_dropped'], 0)
+
+    def test_a_span_entirely_before_the_start_is_dropped(self):
+        m = self.chart()
+        info = m.shift_expression(-1800)
+        self.assertEqual(self.spans(m), [[200, 1200], [3200, 4200]])
+        self.assertEqual(info['pedals_dropped'], 1)
+
+    def test_it_never_moves_the_notes(self):
+        m = self.chart()
+        before = [(n.start, n.end) for n in m.notes_tree]
+        m.shift_expression(-500)
+        self.assertEqual([(n.start, n.end) for n in m.notes_tree], before)
+
+    def test_it_never_moves_the_bar_lines(self):
+        m = self.chart()
+        before = list(m.get_beat_entries())
+        m.shift_expression(-500)
+        self.assertEqual(list(m.get_beat_entries()), before)
+
+    def test_a_range_only_moves_what_fits_inside_it(self):
+        m = self.chart()
+        info = m.shift_expression(-400, 1800, 4000)
+        self.assertEqual(self.spans(m), [[200, 1500], [1600, 2600], [5000, 6000]],
+                         '只有完整落在範圍內的那一段該動')
+        self.assertEqual(info['pedals'], 1)
+
+    def test_a_callable_delta_is_measured_at_each_position(self):
+        """變速譜上照每個東西自己的位置換算拍長（和音符同一條規則）。"""
+        m = self.chart()
+        m.shift_expression(lambda ms: -ms / 10.0)
+        self.assertEqual(self.spans(m)[0][0], 180)       # 200 - 20
+        self.assertEqual(self.spans(m)[1][0], 1800)      # 2000 - 200
+
+    def test_marks_squashed_onto_the_same_moment_are_deduped(self):
+        """全部夾到 0 的時候不能疊成一堆。"""
+        m = self.chart()
+        info = m.shift_expression(-99999)
+        self.assertEqual(self.marks(m), [0])
+        self.assertEqual(info['dynamics_dropped'], 1)
+
+    def test_a_chart_without_expression_is_fine(self):
+        m = self.chart()
+        m.pedal_spans = []
+        m.dynamics = {}
+        self.assertEqual(m.shift_expression(-500),
+                         {'pedals': 0, 'pedals_dropped': 0,
+                          'dynamics': 0, 'dynamics_dropped': 0})
+
+
+class SelectionShiftCarriesTheExpressionTests(unittest.TestCase):
+    """選取平移要把踏板與強弱記號一起帶走。
+
+    使用者：「但是踏板也要往前甚至裁掉阿」。選取平移原本只搬 `n.start/end`，
+    踏板留在原地——踏法就和音符錯開了。
+
+    範圍規則：全選＝搬全部；部分選取＝只搬完整落在選取時間範圍內的。全選要
+    特別處理，因為踏板常常在第一顆音符之前就踩下去（實測 8 份 AI 轉譜有 5 份
+    如此）——照「完整落在範圍內」判斷會把那一段留下。
+    """
+
+    def setUp(self):
+        from PyQt5.QtWidgets import QApplication
+        from qt_editor.chart_view import ChartView
+        from qt_editor.settings import settings
+        self.app = QApplication.instance() or QApplication([])
+        self.settings = settings
+        self.before = settings.get('shift_moves_pedal', True)
+        settings.set('shift_moves_pedal', True)
+        self.view = ChartView()
+        self.view.resize(1200, 720)
+
+    def tearDown(self):
+        self.settings.set('shift_moves_pedal', self.before)
+
+    def chart(self):
+        m = NoteModel.create_new('t', 120.0, 20.0, 4)
+        m.ensure_precise_beat_grid()
+        m.notes_tree = [make(i, 1000 + 500 * i) for i in range(8)]
+        m.pedal_spans = [[200.0, 1500.0], [2000.0, 3000.0], [5000.0, 6000.0]]
+        m.dynamics = {0: [[300.0, 90.0, 0.0]]}
+        m.rebuild_display_cache()
+        self.view.load_model(m)
+        self.view.rebuild_mapper()
+        return m
+
+    def spans(self, m):
+        return [[int(a), int(b)] for a, b in m.pedal_spans]
+
+    def test_select_all_moves_every_pedal_span(self):
+        m = self.chart()
+        self.view.select_all()
+        self.view.shift_selected_time(-500)
+        self.assertEqual(self.spans(m), [[0, 1000], [1500, 2500], [4500, 5500]])
+
+    def test_the_notes_still_move(self):
+        m = self.chart()
+        self.view.select_all()
+        self.view.shift_selected_time(-500)
+        self.assertEqual([n.start for n in m.notes_tree][:3], [500, 1000, 1500])
+
+    def test_a_part_selection_only_moves_what_is_inside_it(self):
+        m = self.chart()
+        self.view.selected = {n.idx for n in m.notes_tree[2:5]}
+        self.view.shift_selected_time(-300)
+        self.assertEqual(self.spans(m),
+                         [[200, 1500], [1700, 2700], [5000, 6000]])
+
+    def test_the_bounds_are_measured_before_the_notes_move(self):
+        """搬完才量的話，剛好在邊緣的踏板會被判成在外面。
+
+        實測那個 bug：部分選取往前移 300ms，該動的那一段一動也沒動——因為
+        量到的是移動後的範圍（1700~2900），而踏板是 2000~3000。
+        """
+        m = self.chart()
+        self.view.selected = {n.idx for n in m.notes_tree[2:5]}
+        self.view.shift_selected_time(-300)
+        self.assertNotEqual(self.spans(m)[1], [2000, 3000], '邊緣那一段沒被搬')
+
+    def test_turning_it_off_leaves_the_pedal_alone(self):
+        m = self.chart()
+        self.settings.set('shift_moves_pedal', False)
+        self.view.select_all()
+        self.view.shift_selected_time(-500)
+        self.assertEqual(self.spans(m), [[200, 1500], [2000, 3000], [5000, 6000]])
+        self.assertEqual([n.start for n in m.notes_tree][:3], [500, 1000, 1500],
+                         '關掉只是不搬踏板，音符還是要搬')
+
+    def test_shifting_by_beats_carries_it_too(self):
+        m = self.chart()
+        self.view.select_all()
+        self.view.shift_selected_by_beats(-1.0)        # 120 BPM → 500ms
+        self.assertEqual(self.spans(m), [[0, 1000], [1500, 2500], [4500, 5500]])
+
+    def test_a_span_pushed_off_the_front_is_dropped(self):
+        m = self.chart()
+        self.view.select_all()
+        self.view.shift_selected_time(-2500)
+        self.assertEqual(self.spans(m), [[0, 500], [2500, 3500]])
+
+    def test_undo_puts_the_pedal_back(self):
+        m = self.chart()
+        self.view.select_all()
+        self.view.shift_selected_time(-2500)
+        m.undo()
+        self.assertEqual(self.spans(m), [[200, 1500], [2000, 3000], [5000, 6000]])
+        self.assertEqual([n.start for n in m.notes_tree][:3], [1000, 1500, 2000])
+
+    def test_the_bar_lines_never_move(self):
+        m = self.chart()
+        before = list(m.get_beat_entries())
+        self.view.select_all()
+        self.view.shift_selected_time(-500)
+        self.assertEqual(list(m.get_beat_entries()), before)

@@ -2645,6 +2645,73 @@ class NoteModel:
         self.last_shift_ms = delta   # 實際套用的量（負值可能被夾小）
         return changed
 
+    def shift_expression(self, delta: Any, lo_ms: Optional[float] = None,
+                         hi_ms: Optional[float] = None) -> Dict[str, int]:
+        """把踏板與強弱記號沿時間平移。**不動音符，也不動小節線。**
+
+        使用者：「但是踏板也要往前甚至裁掉阿」——選取平移只搬音符的話，踏法就
+        和音符錯開了。
+
+        `delta` 是毫秒；也可以給一個 `(ms) -> 毫秒` 的函式，變速譜上照每個東西
+        自己的位置換算拍長時用（和 `shift_selected_by_beats` 對音符的做法一致）。
+        `lo_ms`/`hi_ms` 給了就只搬**完整落在**那個範圍內的東西。
+
+        被推到 0 之前的部分**裁掉**：一半在外面的切短，整段都在外面的直接消失
+        （`_normalise_pedal_spans` 本來就會丟掉長度不到 1ms 的段落）。
+
+        回傳 {'pedals', 'pedals_dropped', 'dynamics', 'dynamics_dropped'}。
+        """
+        def _d(ms: float) -> int:
+            return int(round(delta(ms))) if callable(delta) else int(delta)
+
+        def _inside(lo: float, hi: float) -> bool:
+            if lo_ms is None and hi_ms is None:
+                return True
+            return ((lo_ms is None or lo >= float(lo_ms))
+                    and (hi_ms is None or hi <= float(hi_ms)))
+
+        out = {'pedals': 0, 'pedals_dropped': 0, 'dynamics': 0, 'dynamics_dropped': 0}
+        if self.pedal_spans:
+            before = len(self.pedal_spans)
+            kept: List[List[float]] = []
+            for span in self.pedal_spans:
+                a, b = float(span[0]), float(span[1])
+                if not _inside(a, b):
+                    kept.append([a, b])
+                    continue
+                shift = _d(a)
+                na, nb = max(0.0, a + shift), max(0.0, b + shift)
+                if nb - na < 1.0:
+                    continue                      # 整段被推到開頭之前
+                out['pedals'] += 1
+                kept.append([na, nb])
+            self.pedal_spans = self._normalise_pedal_spans(kept)
+            out['pedals_dropped'] = max(0, before - len(self.pedal_spans))
+
+        if self.dynamics:
+            moved: Dict[int, List[List[float]]] = {}
+            dropped = 0
+            for hand, marks in self.dynamics.items():
+                # 用 ms 當鍵：被夾到 0 的記號會落在同一刻，不去重就會疊起來
+                seen: Dict[float, List[float]] = {}
+                for ms, lvl, ramp in marks:
+                    ms = float(ms)
+                    if not _inside(ms, ms):
+                        seen[ms] = [ms, lvl, ramp]
+                        continue
+                    new_ms = max(0.0, ms + _d(ms))
+                    if new_ms in seen:
+                        dropped += 1
+                    out['dynamics'] += 1
+                    seen[new_ms] = [new_ms, lvl, ramp]
+                moved[hand] = [seen[k] for k in sorted(seen)]
+            self.dynamics = moved
+            out['dynamics_dropped'] = dropped
+
+        if out['pedals'] or out['dynamics']:
+            self.dirty = True
+        return out
+
     def rebuild_from_reference_midi(
         self,
         midi_notes: List[Dict[str, Any]],

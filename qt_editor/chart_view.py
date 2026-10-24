@@ -1071,6 +1071,35 @@ class ChartView(QWidget):
         self.update()
         self.note_edited.emit()
 
+    def _expression_shift_bounds(self, sel_notes):
+        """踏板／強弱記號要跟著平移的範圍。關掉那個開關就回傳 None。
+
+        使用者：「但是踏板也要往前甚至裁掉阿」——只搬音符的話踏法就和音符錯開。
+
+        **整份譜的音符都選了**就回 `(None, None)` ＝ 搬全部。全選要特別處理，
+        因為踏板常常在第一顆音符**之前**就踩下去了（實測 8 份 AI 轉譜有 5 份
+        如此，最早的在 0.009 秒）——照「完整落在選取範圍內」判斷會把那一段
+        留在原地。
+
+        **一定要在搬音符之前問。** 搬完再問量到的是移動後的範圍，於是本來剛好
+        在範圍邊緣的踏板就被判成在外面（實測：部分選取往前移 300ms，該動的那
+        一段一動也沒動）。
+        """
+        from .settings import settings as _st
+        if not _st.get('shift_moves_pedal', True):
+            return None
+        pickable = sum(1 for n in self.model.notes if not self._is_ghost(n))
+        if len(self.selected) >= pickable:
+            return (None, None)
+        return (min(int(n.start) for n in sel_notes),
+                max(int(n.end) for n in sel_notes))
+
+    def _shift_expression_for(self, bounds, delta) -> dict:
+        """照 `_expression_shift_bounds` 問到的範圍平移踏板與強弱記號。"""
+        if bounds is None:
+            return {}
+        return self.model.shift_expression(delta, bounds[0], bounds[1])
+
     def shift_selected_time(self, delta_ms: int, push: bool = True) -> None:
         if not self.selected or self.alloc_active:
             return
@@ -1078,10 +1107,12 @@ class ChartView(QWidget):
             self.model.push_history()
         # 用物件參考保存選取集，避免 rebuild 後 idx 重編导致選取失效
         sel_notes = {n for n in self.model.notes_tree if n.idx in self.selected}
+        bounds = self._expression_shift_bounds(sel_notes)    # 要在搬之前問
         for n in sel_notes:
             n.start = max(0, n.start + delta_ms)
             n.end   = max(n.start + 1, n.end + delta_ms)
             n.gate  = n.end - n.start
+        self._shift_expression_for(bounds, int(delta_ms))
         self.model.rebuild_display_cache()
         self.selected = {n.idx for n in sel_notes}
         self.update()
@@ -1115,6 +1146,7 @@ class ChartView(QWidget):
         if push:
             self.model.push_history()
 
+        bounds = self._expression_shift_bounds(sel_notes)    # 要在搬之前問
         moved = 0
         for n in sel_notes:
             delta = deltas[id(n)]
@@ -1127,6 +1159,10 @@ class ChartView(QWidget):
             moved += 1
 
         if moved:
+            # 踏板用它自己位置的拍長換算，和音符同一條規則（變速譜上才精準）
+            self._shift_expression_for(
+                bounds,
+                lambda ms: self._ms_per_beat_at(float(ms)) * float(beats))
             self.model.rebuild_display_cache()
             self.selected = {n.idx for n in sel_notes}
             self.update()
@@ -7090,6 +7126,17 @@ class ChartView(QWidget):
         精準的音符值，不是整首一個平均拍長；固定時間那組則完全不看 BPM。
         """
         menu.setEnabled(has_sel)
+        from .settings import settings as _st
+        together = menu.addAction('連踏板與強弱記號一起移')
+        together.setCheckable(True)
+        together.setChecked(bool(_st.get('shift_moves_pedal', True)))
+        together.setToolTip(chr(10).join([
+            '開著時踏板與強弱記號跟著一起平移，被推到開頭之前的部分會裁掉。',
+            '關掉就只搬音符——踏法會留在原地。',
+            '全選的時候搬全部，部分選取只搬完整落在選取範圍內的。']))
+        together.toggled.connect(
+            lambda on: _st.set('shift_moves_pedal', bool(on)))
+        menu.addSeparator()
         for title, sign in (('往後（延後）', +1), ('往前（提前）', -1)):
             sub = menu.addMenu(title)
             prefix = '+' if sign > 0 else '−'
