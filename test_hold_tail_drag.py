@@ -376,8 +376,10 @@ class MeasuresBpmDialogTests(unittest.TestCase):
         from PyQt5.QtWidgets import QCheckBox, QRadioButton, QSpinBox
         chk = [c for c in dlg.findChildren(QCheckBox) if '拍號' in c.text()][0]
         spins = dlg.findChildren(QSpinBox)
+        # 重排方式那兩顆：標籤都以「音符」開頭（「音符絕對時間不動（只改小節
+        # 線）」／「音符跟著小節線縮放」），上面那組是「調整音符」「不調整音符」。
         radios = [r for r in dlg.findChildren(QRadioButton)
-                  if '均分' in r.text() or '保留' in r.text()]
+                  if r.text().startswith('音符') and '調整' not in r.text()]
         return chk, spins, radios
 
     def test_the_time_signature_fields_start_disabled(self):
@@ -418,8 +420,11 @@ class MeasuresBpmDialogTests(unittest.TestCase):
         from PyQt5.QtWidgets import QRadioButton
 
         def check(dlg):
+            # 只看「調整音符」「不調整音符」那組。重排方式那兩顆的標籤現在也帶
+            # 「音符」（「音符絕對時間不動」／「音符跟著小節線縮放」），但它們
+            # 本來就該在沒勾拍號時變灰。
             return [r.isEnabled() for r in dlg.findChildren(QRadioButton)
-                    if '音符' in r.text()]
+                    if '調整音符' in r.text()]
         self.assertTrue(all(self.open_and(check)), '音符處理和拍號無關，不該變灰')
 
 
@@ -595,7 +600,7 @@ class MeasuresBpmRadioTests(unittest.TestCase):
     """多小節 BPM 的兩組單選鈕。
 
     四顆單選鈕的 parent 都是同一個對話框，Qt 的 autoExclusive 是照 parent 分的
-    ——不各自 `QButtonGroup` 的話，點「保留相對位置」會把「調整音符」取消掉。
+    ——不各自 `QButtonGroup` 的話，點「音符跟著小節線縮放」會把「調整音符」取消掉。
     另外「重排方式」只在調整音符時才有意義，不調整就整排隱藏。
     """
 
@@ -632,7 +637,7 @@ class MeasuresBpmRadioTests(unittest.TestCase):
             text = r.text()
             key = ('adjust' if text == '調整音符' else
                    'keep' if '不調整' in text else
-                   'uniform' if '均分' in text else 'preserve')
+                   'uniform' if '絕對時間' in text else 'preserve')
             out[key] = r
         return out
 

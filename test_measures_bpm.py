@@ -320,3 +320,275 @@ class BpmSnapTests(unittest.TestCase):
         m.rebuild_display_cache()
         self.assertEqual(len(m.tempo_events_from_measures()), 1)
 
+
+
+class ShrinkingMeasuresPileUpTests(unittest.TestCase):
+    """縮短小節時音符不可以疊在一起。
+
+    使用者報的：「選中多個小節修改時，設置『小節內音符絕對時間不變』的基準點
+    是所在小節的開始，當小節時值變少時音符就會錯位疊在一起。」
+
+    機制：均分模式本來是「小節內的音符留在原地、小節之後的音符平移 delta」。
+    兩條規則接起來不是單調映射——起點落在被切掉那一段的音符留在原地，後面的
+    音符滑過來疊在它上面。4 小節 4/4、每拍一顆共 16 顆，前 3 個改成 3/4 之後
+    只剩 13 個不同的起音時刻。
+    """
+
+    def chart(self, bars=8):
+        m = NoteModel.create_new('t', 120.0, bars * 2.0, 4)
+        m.ensure_precise_beat_grid()
+        # 每拍一顆：縮短 4/4 → 3/4 時第 4 拍那顆就落在被切掉的那一段
+        m.notes_tree = [make_note(500 * i, 500 * i + 100, i)
+                        for i in range(bars * 4)]
+        m.rebuild_display_cache()
+        return m
+
+    def shrink(self, m, upto=3, uniform=True, time_uniform=False):
+        for mi in range(upto):
+            m.set_measure_time_signature(mi, 3, 4, uniform=uniform,
+                                         time_uniform=time_uniform)
+
+    def test_no_two_notes_end_up_at_the_same_time(self):
+        for uniform in (True, False):
+            m = self.chart()
+            before = len({int(n.start) for n in m.notes_tree})
+            self.shrink(m, uniform=uniform)
+            after = len({int(n.start) for n in m.notes_tree})
+            self.assertEqual(after, before,
+                             'uniform=%s：不同起音時刻從 %d 掉到 %d'
+                             % (uniform, before, after))
+
+    def test_the_note_count_never_changes(self):
+        for uniform in (True, False):
+            for tu in (True, False):
+                m = self.chart()
+                before = len(m.notes_tree)
+                self.shrink(m, uniform=uniform, time_uniform=tu)
+                self.assertEqual(len(m.notes_tree), before,
+                                 'uniform=%s time_uniform=%s 刪到音符了'
+                                 % (uniform, tu))
+
+    def test_the_view_mode_does_not_decide_whether_notes_survive(self):
+        """`time_uniform` 的值來自檢視模式，不該改變結果。
+
+        它本來會在小節縮短時把尾巴那段的音符刪掉——等於「現在用哪種顯示方式」
+        決定了音符會不會被刪。
+        """
+        for uniform in (True, False):
+            a = self.chart()
+            b = self.chart()
+            self.shrink(a, uniform=uniform, time_uniform=True)
+            self.shrink(b, uniform=uniform, time_uniform=False)
+            self.assertEqual(sorted((n.start, n.end) for n in a.notes_tree),
+                             sorted((n.start, n.end) for n in b.notes_tree),
+                             'uniform=%s：檢視模式改變了結果' % uniform)
+
+    def test_absolute_mode_does_not_move_a_single_note(self):
+        m = self.chart()
+        before = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+        self.shrink(m, uniform=True)
+        after = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+        self.assertEqual(after, before, '均分模式不該動到任何音符')
+
+    def test_absolute_mode_keeps_the_song_length(self):
+        """音符一顆都沒動，音檔也沒變短，曲末就不該跟著 delta 走。"""
+        m = self.chart()
+        before = float(m.music_end_ms)
+        self.shrink(m, uniform=True)
+        self.assertEqual(float(m.music_end_ms), before)
+
+    def test_scaling_mode_keeps_notes_inside_their_measure(self):
+        m = self.chart()
+        self.shrink(m, uniform=False)
+        for mi in range(3):
+            s, e = m.get_measure_time_range(mi)
+            inside = [int(n.start) for n in m.notes_tree if s <= n.start < e]
+            self.assertEqual(len(inside), 4, '第 %d 小節該還有 4 顆' % mi)
+            self.assertEqual(len(set(inside)), 4, '第 %d 小節有音符疊在一起' % mi)
+
+    def test_the_beat_entries_stay_well_formed(self):
+        for uniform in (True, False):
+            m = self.chart()
+            self.shrink(m, uniform=uniform)
+            beats = m.get_beat_entries()
+            idx = [i for i, _ms in beats]
+            mss = [ms for _i, ms in beats]
+            self.assertEqual(idx, sorted(idx), 'uniform=%s index 要遞增' % uniform)
+            self.assertEqual(mss, sorted(mss), 'uniform=%s ms 要遞增' % uniform)
+            self.assertEqual(len(set(mss)), len(mss),
+                             'uniform=%s 有重複的 ms' % uniform)
+
+
+class GridCoverageTests(unittest.TestCase):
+    """均分模式縮短小節會讓格線短一截（音符沒動、小節線往前擠）。
+
+    補回去是呼叫端的事：`_append_measures` 會把 `music_end_ms` 推到新的格線
+    盡頭，在一個範圍上逐小節補就變成棘輪——實測連改 5 個小節，8 小節的譜長成
+    13 小節、曲末從 16000 爬到 23500。
+    """
+
+    def chart(self, bars=8):
+        m = NoteModel.create_new('t', 120.0, bars * 2.0, 4)
+        m.ensure_precise_beat_grid()
+        m.notes_tree = [make_note(500 * i, 500 * i + 100, i)
+                        for i in range(bars * 4)]
+        m.rebuild_display_cache()
+        return m
+
+    def test_grid_end_ms_reports_the_last_bar_line(self):
+        m = self.chart()
+        total = m.count_measures()
+        self.assertEqual(m.grid_end_ms(), m.get_measure_time_range(total - 1)[1])
+
+    def test_shrinking_moves_the_grid_end_earlier(self):
+        m = self.chart()
+        before = m.grid_end_ms()
+        for mi in range(5):
+            m.set_measure_time_signature(mi, 3, 4, uniform=True)
+        self.assertLess(m.grid_end_ms(), before, '格線該變短了')
+
+    def test_extending_puts_it_back(self):
+        m = self.chart()
+        before = m.grid_end_ms()
+        for mi in range(5):
+            m.set_measure_time_signature(mi, 3, 4, uniform=True)
+        added = m.extend_grid_to_cover(float(before))
+        self.assertGreater(added, 0)
+        self.assertGreaterEqual(m.grid_end_ms(), before)
+
+    def test_extending_does_not_touch_the_notes(self):
+        m = self.chart()
+        before_grid = m.grid_end_ms()
+        before_notes = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+        for mi in range(5):
+            m.set_measure_time_signature(mi, 3, 4, uniform=True)
+        m.extend_grid_to_cover(float(before_grid))
+        self.assertEqual(sorted((int(n.start), int(n.end)) for n in m.notes_tree),
+                         before_notes)
+
+    def test_batching_covers_the_gap_without_overshooting(self):
+        """整批補一次：剛好蓋過目標，不多補。"""
+        m = self.chart()
+        target = m.grid_end_ms()
+        before_count = m.count_measures()
+        for mi in range(5):
+            m.set_measure_time_signature(mi, 3, 4, uniform=True)
+        gap = target - m.grid_end_ms()
+        added = m.extend_grid_to_cover(float(target))
+        self.assertGreaterEqual(m.grid_end_ms(), target, '沒蓋到目標')
+        # 一個小節 2000ms，缺口 2500ms → 兩個小節剛好；不該補第三個
+        self.assertEqual(added, 2, '缺口 %dms 補了 %d 個小節' % (gap, added))
+        self.assertEqual(m.count_measures(), before_count + 2)
+
+    def test_calling_it_per_measure_is_what_ratchets(self):
+        """所以呼叫端要整批做一次。
+
+        這個測試不是在要求逐小節也要正確——它擋的是「把 extend 搬回
+        `set_measure_time_signature` 裡面」。`_append_measures` 一次只能接整個
+        小節，所以每改一小節就補一次會一路超補上去。
+        """
+        batched = self.chart()
+        target = batched.grid_end_ms()
+        for mi in range(5):
+            batched.set_measure_time_signature(mi, 3, 4, uniform=True)
+        batched.extend_grid_to_cover(float(target))
+
+        per_measure = self.chart()
+        for mi in range(5):
+            t = per_measure.grid_end_ms()
+            per_measure.set_measure_time_signature(mi, 3, 4, uniform=True)
+            per_measure.extend_grid_to_cover(float(t))
+        self.assertGreater(per_measure.count_measures(),
+                           batched.count_measures(),
+                           '逐小節補居然沒有超補？那就可以搬回去了')
+
+    def test_extending_does_not_change_the_song_length(self):
+        """補小節線不是把歌變長。"""
+        m = self.chart()
+        target = m.grid_end_ms()
+        before = float(m.music_end_ms)
+        for mi in range(5):
+            m.set_measure_time_signature(mi, 3, 4, uniform=True)
+        m.extend_grid_to_cover(float(target))
+        self.assertEqual(float(m.music_end_ms), before)
+
+    def test_it_stops_instead_of_spinning(self):
+        """接不上去的時候要停，不要空轉。"""
+        m = self.chart()
+        end = m.grid_end_ms()
+        self.assertEqual(m.extend_grid_to_cover(float(end)), 0,
+                         '已經蓋到了就不該補')
+
+
+class DialogSequenceTests(unittest.TestCase):
+    """對話框「多小節 BPM／拍號」實際跑的那一串呼叫。
+
+    `change_measures_bpm_dialog` 對範圍內每個小節依序呼叫 `set_measure_bpm`
+    ＋ `set_measure_time_signature`，整批跑完才補一次格線。這裡複製那個順序，
+    因為真正會壞的是**連續套用**，不是單一次呼叫。
+    """
+
+    def chart(self, bars=20):
+        m = NoteModel.create_new('t', 120.0, bars * 2.0, 4)
+        m.ensure_precise_beat_grid()
+        m.notes_tree = [make_note(500 * i, 500 * i + 100, i)
+                        for i in range(bars * 4)]
+        m.rebuild_display_cache()
+        return m
+
+    def run_dialog(self, m, first, last, bpm, num, den, uniform,
+                   adjust_notes=True, time_uniform=False):
+        grid_end_before = m.grid_end_ms()
+        for mi in range(first, last + 1):
+            m.set_measure_bpm(mi, bpm, uniform=time_uniform,
+                              adjust_notes=adjust_notes)
+            m.set_measure_time_signature(mi, num, den, uniform=uniform,
+                                         time_uniform=time_uniform)
+        added = 0
+        if uniform and grid_end_before is not None and (m.grid_end_ms() or 0) < grid_end_before:
+            added = m.extend_grid_to_cover(float(grid_end_before))
+        return added
+
+    def test_the_absolute_mode_never_piles_notes_up(self):
+        for time_uniform in (True, False):
+            m = self.chart()
+            before = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+            self.run_dialog(m, 5, 12, 150.0, 3, 4, uniform=True,
+                            adjust_notes=False, time_uniform=time_uniform)
+            after = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+            self.assertEqual(len(after), len(before),
+                             'time_uniform=%s 掉了音符' % time_uniform)
+            self.assertEqual(len({s for s, _e in after}), len({s for s, _e in before}),
+                             'time_uniform=%s 有音符疊在一起' % time_uniform)
+            self.assertEqual(after, before,
+                             'time_uniform=%s 不調整音符時不該動到任何音符' % time_uniform)
+
+    def test_the_scaling_mode_never_piles_notes_up(self):
+        m = self.chart()
+        before = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+        self.run_dialog(m, 5, 12, 150.0, 3, 4, uniform=False)
+        after = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+        self.assertEqual(len(after), len(before), '掉了音符')
+        self.assertEqual(len({s for s, _e in after}), len({s for s, _e in before}),
+                         '有音符疊在一起')
+
+    def test_the_grid_is_topped_back_up_once(self):
+        m = self.chart()
+        before = m.grid_end_ms()
+        added = self.run_dialog(m, 5, 12, 150.0, 3, 4, uniform=True,
+                                adjust_notes=False)
+        self.assertGreater(added, 0, '格線縮短了卻沒補')
+        self.assertGreaterEqual(m.grid_end_ms(), before)
+
+    def test_the_beat_entries_stay_well_formed_through_the_whole_batch(self):
+        for uniform in (True, False):
+            m = self.chart()
+            self.run_dialog(m, 5, 12, 150.0, 3, 4, uniform=uniform,
+                            adjust_notes=not uniform)
+            beats = m.get_beat_entries()
+            idx = [i for i, _ms in beats]
+            mss = [ms for _i, ms in beats]
+            self.assertEqual(idx, sorted(idx), 'uniform=%s index 要遞增' % uniform)
+            self.assertEqual(mss, sorted(mss), 'uniform=%s ms 要遞增' % uniform)
+            self.assertEqual(len(set(mss)), len(mss),
+                             'uniform=%s 有重複的 ms' % uniform)

@@ -3149,8 +3149,15 @@ class MainWindow(QMainWindow):
         rearrange_label = QLabel('小節內音符重排方式（拍號變更時）：')
         vbox.addWidget(rearrange_label)
         hb = QHBoxLayout()
-        rb_uniform = QRadioButton('均分小節內拍子（等距）')
-        rb_preserve = QRadioButton('保留相對位置（只縮放）')
+        rb_uniform = QRadioButton('音符絕對時間不動（只改小節線）')
+        rb_preserve = QRadioButton('音符跟著小節線縮放')
+        rb_uniform.setToolTip(
+            '小節線重新鋪，音符一顆都不動。改的是譜面底層的格線結構，'
+            '適合「音符時間是對的、只有小節／BPM 判錯」的譜。'
+            '小節縮短時譜尾會自動補上小節，把格線補回原本的長度。')
+        rb_preserve.setToolTip(
+            '音符對小節的相對位置不變：小節縮短，裡面的音符就跟著按比例靠攏，'
+            '小節之後的音符整段平移。適合「格線是對的、要改小節結構」的譜。')
         rb_uniform.setChecked(True)
         hb.addWidget(rb_uniform)
         hb.addWidget(rb_preserve)
@@ -3226,11 +3233,17 @@ class MainWindow(QMainWindow):
                                                      time_uniform=bool(self.view.time_uniform))
                     except Exception:
                         continue
+            if (apply_ts and uniform_choice and grid_end_before is not None
+                    and (m.grid_end_ms() or 0) < grid_end_before):
+                added = m.extend_grid_to_cover(float(grid_end_before))
+                if added:
+                    snap_text += ("\n\n格線被縮短了，已在譜尾補 %d 個小節"
+                                  "補回原本的長度。") % added
             if snap_bars and anchor_ms is not None and old_end_ms is not None:
                 from . import bpm_snap
                 result = bpm_snap.snap(m, s_idx, e_idx, float(anchor_ms), float(old_end_ms))
                 m.rebuild_display_cache()
-                snap_text = '\n\n' + bpm_snap.describe(result)
+                snap_text += '\n\n' + bpm_snap.describe(result)
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.update()
@@ -3292,8 +3305,15 @@ class MainWindow(QMainWindow):
 
         vbox.addWidget(QLabel('小節內音符重排方式：'))
         hb = QHBoxLayout()
-        rb_uniform = QRadioButton('均分小節內拍子（等距）')
-        rb_preserve = QRadioButton('保留相對位置（只縮放）')
+        rb_uniform = QRadioButton('音符絕對時間不動（只改小節線）')
+        rb_preserve = QRadioButton('音符跟著小節線縮放')
+        rb_uniform.setToolTip(
+            '小節線重新鋪，音符一顆都不動。改的是譜面底層的格線結構，'
+            '適合「音符時間是對的、只有小節／BPM 判錯」的譜。'
+            '小節縮短時譜尾會自動補上小節，把格線補回原本的長度。')
+        rb_preserve.setToolTip(
+            '音符對小節的相對位置不變：小節縮短，裡面的音符就跟著按比例靠攏，'
+            '小節之後的音符整段平移。適合「格線是對的、要改小節結構」的譜。')
         # 默認為小節均分
         rb_uniform.setChecked(True)
         hb.addWidget(rb_uniform)
@@ -3311,6 +3331,7 @@ class MainWindow(QMainWindow):
         new_num = int(num_spin.value())
         new_den = int(den_spin.value())
         uniform_choice = bool(rb_uniform.isChecked())
+        grid_end_before = m.grid_end_ms()
         try:
             m.push_history()
             m.set_measure_time_signature(
@@ -3320,6 +3341,10 @@ class MainWindow(QMainWindow):
                 uniform=uniform_choice,
                 time_uniform=bool(self.view.time_uniform),
             )
+            # 均分模式音符不動、小節線往前擠；把格線補回原本的長度。
+            if (uniform_choice and grid_end_before is not None
+                    and (m.grid_end_ms() or 0) < grid_end_before):
+                m.extend_grid_to_cover(float(grid_end_before))
             self.view.rebuild_mapper()
             self.view._update_unit_bounds()
             self.view.update()

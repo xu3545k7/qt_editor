@@ -7666,6 +7666,186 @@ class NoteModel:
             out = [0]
         return (out, span)
 
+    def measure_grid_rows(self) -> List[Tuple[int, int, float]]:
+        """每個小節現在的 `(分子, 分母, BPM)`。給「每小節 BPM」的表當初始值。"""
+        rows: List[Tuple[int, int, float]] = []
+        for (num, den), i in zip(self._signature_by_measure(),
+                                 range(self.count_measures())):
+            try:
+                bpm = float(self.get_measure_bpm(i))
+            except Exception:                                    # noqa: BLE001
+                bpm = float(self.bpm)
+            rows.append((int(num), int(den), bpm))
+        return rows
+
+    #: 「每小節 BPM」表裡 BPM 差多少才算改過。`get_measure_bpm` 的值是吸附過的
+    #: （`snap_measured_bpm`），讀出來再寫回去本來就會差一點。
+    MEASURE_BPM_EPS = 0.02
+
+    def set_measure_grid(self, rows: List[Tuple[int, int, float]],
+                         move_notes: bool = False) -> Dict[str, Any]:
+        """用「一小節一行 `(分子, 分母, BPM)`」套用新的每小節 BPM。回傳摘要。
+
+        這是「小節線是譜面底層的結構」那條路（使用者：「小節線編輯功能需要處在
+        譜面編輯更底層的位置」）：**預設音符一顆都不動**，只有格線變。
+
+        **只重鋪真的被改過的小節**，其餘的 entry 原樣平移。這一點很重要：
+
+        BPM 不是存在檔案裡的東西——檔案存的是毫秒，BPM 是 `get_measure_bpm`
+        由小節長度反推、而且還吸附過（`snap_measured_bpm`）的「看法」。所以
+        「讀出每小節 BPM 再整條照它重鋪」**不是恆等操作**：實測 400 份真譜有
+        三成對不起來，小節邊界累積偏到 6~84 秒、小節數甚至翻倍（一筆拍點不是
+        一個四分音符的譜，entry 筆數會猜錯）。那會讓「打開表格按個確定」就毀掉
+        譜面。
+
+        只動改過的小節就沒有這個問題：沒改的小節連 entry 的 index 和筆數都照
+        原樣搬，改過的小節在自己原本的 entry 筆數上重新等分。
+
+        **分子／分母只用來算長度，不會改拍號標記。** 改拍號要走
+        `set_measure_time_signature`（它要處理 entry 筆數變動，是另一套邏輯）。
+        """
+        total = self.count_measures()
+        if total <= 0 or not rows:
+            return {'measures': 0, 'changed': 0, 'reason': '沒有小節'}
+        orig = self.measure_grid_rows()
+        entries = list(self.get_beat_entries())
+        if not entries:
+            return {'measures': 0, 'changed': 0, 'reason': '沒有拍點'}
+        slices = [self._measure_entry_slice(i) for i in range(total)]
+        bounds = [self.get_measure_time_range(i) for i in range(total)]
+        keep_end = float(self.music_end_ms or 0.0)
+
+        out: List[Tuple[int, int]] = []
+        first = slices[0][0] if slices else 0
+        for k in range(0, max(0, first)):          # 小節線之前的（通常沒有）
+            out.append((int(entries[k][0]), int(entries[k][1])))
+
+        delta = 0.0
+        changed = 0
+        for i in range(total):
+            s, e = slices[i]
+            s = max(0, min(s, len(entries)))
+            e = max(s, min(e, len(entries)))
+            start_ms, end_ms = bounds[i]
+            if start_ms is None or end_ms is None:
+                for k in range(s, e):
+                    out.append((int(entries[k][0]),
+                                int(round(entries[k][1] + delta))))
+                continue
+            old_dur = float(end_ms - start_ms)
+            row = rows[i] if i < len(rows) else orig[i]
+            ref = orig[i] if i < len(orig) else row
+            same = (int(row[0]), int(row[1])) == (int(ref[0]), int(ref[1])) and                 abs(float(row[2]) - float(ref[2])) <= self.MEASURE_BPM_EPS
+            if same or float(row[2]) <= 0:
+                for k in range(s, e):              # 原樣平移
+                    out.append((int(entries[k][0]),
+                                int(round(entries[k][1] + delta))))
+                delta += 0.0
+                continue
+            changed += 1
+            new_dur = (self._bar_units_for(int(row[0]), int(row[1]))
+                       * 60000.0 / max(1e-6, float(row[2])))
+            count = max(1, e - s)
+            for k in range(count):
+                out.append((int(entries[s + k][0]),
+                            int(round(start_ms + delta + new_dur * k / count))))
+            delta += new_dur - old_dur
+
+        tail = slices[-1][1] if slices else 0
+        for k in range(max(0, tail), len(entries)):   # 收尾標記
+            out.append((int(entries[k][0]), int(round(entries[k][1] + delta))))
+
+        self._write_beat_entries(out)
+        # 音符不動 ＝ 音檔也沒變短，曲末原封不動。
+        self._set_music_end_ms(keep_end)
+        moved = 0
+        max_shift = 0.0
+        if move_notes:
+            from . import smart_resnap as _SR
+            moved, max_shift = _SR.snap_notes(self, [float(ms) for _i, ms in out])
+        self.rebuild_display_cache()
+        self.dirty = True
+        return {'measures': total, 'changed': changed, 'beats': len(out),
+                'shift_ms': int(round(delta)), 'moved': int(moved),
+                'max_shift_ms': float(max_shift)}
+
+    def grid_end_ms(self) -> Optional[int]:
+        """最後一個小節的結尾，也就是小節線鋪到哪裡。沒有格線時回傳 None。"""
+        total = self.count_measures()
+        if total <= 0:
+            return None
+        rng = self.get_measure_time_range(total - 1)
+        if not rng or rng[1] is None:
+            return None
+        return int(rng[1])
+
+    def extend_grid_to_cover(self, target_ms: Optional[float] = None,
+                             limit: int = 512) -> int:
+        """補小節到格線蓋過 `target_ms`（預設＝曲末與最後一顆音符的較大值）。
+
+        均分模式改拍號會把後面的小節線往前擠，而音符一顆都不動，於是尾端多出
+        一段沒有小節線的區域（實測：4 小節的譜把前 3 個改成 3/4，格線只到
+        6500 而最後一顆音符在 7500）。回傳補了幾個小節。
+
+        **目標要用「改之前的格線盡頭」，不要用預設值。** 預設值裡的
+        `music_end_ms` 會被 `_append_measures` 自己推高，拿它當目標、又在一個
+        範圍上逐小節呼叫的話會一路補下去（棘輪）。另外很多譜本來的格線就短於
+        曲末（實測 8 小節的譜格線到 15500、曲末 16000），拿曲末當目標等於憑空
+        多補一個小節。
+
+        每一輪都把缺口一次算完再 `_append_measures(count)`，不逐個呼叫——
+        那個函式的註解寫得很清楚，接完一個之後「倒數第二個小節」又變回被
+        汙染的那個範本。
+        """
+        if target_ms is None:
+            last_note = max((int(n.end) for n in self.notes_tree), default=0)
+            target_ms = max(float(self.music_end_ms or 0.0), float(last_note))
+        # `_append_measures` 會把曲末推到新的格線盡頭（接一般的空白小節時那是
+        # 對的）。這裡是「把被擠短的格線補回去」，音檔長度沒變，所以存一份原值
+        # 最後放回去。不放回去的話下一次呼叫的預設目標會被自己推高（棘輪）。
+        keep_end = float(self.music_end_ms or 0.0)
+        added = 0
+        touched = False
+        for _round in range(8):
+            total = self.count_measures()
+            if total <= 0:
+                break
+            grid_end = self.grid_end_ms()
+            if grid_end is None or float(grid_end) >= float(target_ms):
+                break
+            # 小節長度取倒數第二個小節：最後一個的結尾是收尾標記、量出來會縮水
+            bar_ms = 0.0
+            ref = self.get_measure_time_range(max(0, total - 2))
+            if ref and ref[0] is not None and ref[1] is not None:
+                bar_ms = float(ref[1] - ref[0])
+            if bar_ms <= 0:
+                bar_ms = float(self._bar_ms_at_ms(float(grid_end), self.bpm))
+            if bar_ms <= 0:
+                break
+            deficit = float(target_ms) - float(grid_end)
+            need = max(1, int(math.ceil(deficit / bar_ms)))
+            need = min(need, max(1, limit - added))
+            # 有些譜 `_append_measures` 接不出小節來，而是把最後一個小節撐長：
+            # `entries_per_bar` 是 4 卻走 per-bar 路徑的譜一次只接一筆拍點，
+            # 於是 61 小節的 op2end 最後一小節從 2400ms 變成 5700ms、小節數
+            # 一個都沒加。那是既有的缺陷（[[measure-grid-tiny-bars]] 記的
+            # 「append 11 份壞掉」），這裡只要不被它拖下水：先存一份拍點，
+            # 接完發現小節數沒長就原封不動放回去。
+            snapshot = [(int(i), int(ms)) for i, ms in self.get_beat_entries()]
+            before = self.count_measures()
+            self._append_measures(need)
+            touched = True
+            if self.count_measures() <= before:
+                self._write_beat_entries(snapshot)
+                self._set_music_end_ms(keep_end)
+                break
+            added += self.count_measures() - before
+            if added >= limit:
+                break
+        if touched and keep_end > 0:
+            self._set_music_end_ms(keep_end)
+        return added
+
     def add_measure(self, new_bpm: Optional[float] = None, count: int = 1) -> None:
         """在譜面末尾新增 `count` 個小節（預設 1 個）。
 
@@ -8178,6 +8358,13 @@ class NoteModel:
     ) -> None:
         """設定第 measure_idx 小節的拍號（numerator / denominator）。
         會在內存與檔案結構中新增或更新 time_signature_changes。
+
+        `uniform=True`（均分）＝只改小節線，音符一顆都不動。
+        `uniform=False`（保留相對位置）＝小節內按比例縮放、小節之後整段平移。
+
+        `time_uniform` 已經不影響音符了，留著只為了不動現有呼叫端。它本來會在
+        小節縮短時把尾巴那段的音符刪掉——而它的值來自**檢視模式**，所以同一個
+        操作會因為當下的顯示方式而刪或不刪。
         """
         if numerator < 1 or denominator < 1:
             return
@@ -8271,59 +8458,61 @@ class NoteModel:
         # and avoid shifting the same note twice.
         orig_pos: Dict[int, Tuple[int, int]] = {id(n): (int(n.start), int(n.end)) for n in self.notes_tree}
 
-        # If bar duration shrinks in time-uniform mode, remove notes that start in the cut tail.
-        # Example: 4/4 -> 3/4 removes notes whose start lies in the removed last beat region.
-        if time_uniform and new_dur < old_dur:
-            cut_start = int(start_ms + new_dur)
-            kept: List[GNote] = []
-            for n in self.notes_tree:
-                o_s, _o_e = orig_pos[id(n)]
-                if start_ms <= o_s < end_ms and o_s >= cut_start:
-                    continue
-                kept.append(n)
-            self.notes_tree = kept
-            orig_pos = {id(n): (int(n.start), int(n.end)) for n in self.notes_tree}
-
         notes_in_measure: List[GNote] = [n for n in self.notes_tree if start_ms <= orig_pos[id(n)][0] < end_ms]
         notes_in_measure.sort(key=lambda x: (x.start, x.min_key))
-        in_measure_ids = {id(n) for n in notes_in_measure}
 
-        if notes_in_measure:
-            if uniform:
-                # 均分模式：保留音符原始開始時間與長度，不做縮放。
-                # 只有小節長度/後續平移會依 time_uniform 決定是否變動。
-                pass
-            else:
-                # 保留相對位置：以比例縮放每個音符的 offset
-                for n in notes_in_measure:
-                    o_s, o_e = orig_pos[id(n)]
-                    rel_s = o_s - start_ms
-                    rel_e = o_e - start_ms
-                    ns = start_ms + int(round(rel_s * ratio))
-                    ne = start_ms + int(round(rel_e * ratio))
-                    ns = max(start_ms, min(start_ms + new_dur - 1, ns))
-                    ne = max(ns + 1, min(start_ms + new_dur, ne))
-                    n.start = ns
-                    n.end = ne
-                    n.gate = max(1, n.end - n.start)
-
-        # In shrink case, clip surviving in-measure notes that cross the new bar end.
-        if time_uniform and new_dur < old_dur:
-            new_end = int(start_ms + new_dur)
+        if uniform:
+            # 均分模式 ＝「只改小節線，音符一顆都不動」。
+            #
+            # 小節線是譜面底層的結構（使用者：「小節線編輯功能需要處在譜面
+            # 編輯更底層的位置」），改它不該改到音符的絕對時間。
+            #
+            # 以前這裡是「小節內的音符留在原地、小節之後的音符平移 delta」。
+            # 那兩條規則接起來**不是單調映射**：縮短一小節時，起點落在被切掉
+            # 那一段的音符留在原地，而後面的音符滑過來疊在它上面。
+            # 實測 4 小節 4/4、每拍一顆共 16 顆，第 1~3 小節改成 3/4 之後
+            # 只剩 13 個不同的起音時刻（1500/3000/4500 各疊兩顆）。
+            #
+            # 另一條路更糟：`time_uniform` 為真時直接把尾巴那段的音符**刪掉**，
+            # 而 `time_uniform` 是**檢視模式**——等於「現在用哪種顯示方式」
+            # 決定了音符會不會被刪。兩條都移除了。
+            #
+            # 想讓音符跟著小節線走的人要的是另一個選項（保留相對位置）。
+            pass
+        else:
+            # 保留相對位置：小節內按比例縮放、小節之後整段平移。這是單調映射，
+            # 不會有兩顆音符被映到同一刻。
+            in_measure_ids = {id(n) for n in notes_in_measure}
+            # 比例縮放會壓掉毫秒解析度：ratio 0.75 的時候原本差 1ms 的兩顆會
+            # 落到同一刻。實測 479 份真譜有 6 份少掉一個起音時刻（最多的
+            # Immaculate 是 2480→2479）。原本不同刻的就讓它們保持不同刻——
+            # `notes_in_measure` 已經照 (start, min_key) 排序，往後推一格就夠。
+            prev_src: Optional[int] = None
+            prev_dst: Optional[int] = None
             for n in notes_in_measure:
-                if n.end > new_end:
-                    n.end = max(n.start + 1, new_end)
-                    n.gate = max(1, n.end - n.start)
-
-        # shift only notes that were originally after this measure (constant delta)
-        for n in self.notes_tree:
-            o_s, o_e = orig_pos[id(n)]
-            if id(n) in in_measure_ids:
-                continue
-            if o_s >= end_ms:
-                n.start = max(0, o_s + delta)
-                n.end = max(n.start + 1, o_e + delta)
+                o_s, o_e = orig_pos[id(n)]
+                rel_s = o_s - start_ms
+                rel_e = o_e - start_ms
+                ns = start_ms + int(round(rel_s * ratio))
+                ne = start_ms + int(round(rel_e * ratio))
+                if (prev_src is not None and prev_dst is not None
+                        and o_s > prev_src and ns <= prev_dst):
+                    ns = prev_dst + 1
+                    ne = max(ne, ns + 1)
+                ns = max(start_ms, min(start_ms + new_dur - 1, ns))
+                ne = max(ns + 1, min(start_ms + new_dur, ne))
+                prev_src, prev_dst = o_s, ns
+                n.start = ns
+                n.end = ne
                 n.gate = max(1, n.end - n.start)
+            for n in self.notes_tree:
+                o_s, o_e = orig_pos[id(n)]
+                if id(n) in in_measure_ids:
+                    continue
+                if o_s >= end_ms:
+                    n.start = max(0, o_s + delta)
+                    n.end = max(n.start + 1, o_e + delta)
+                    n.gate = max(1, n.end - n.start)
 
         # 2. 更新拍點（XML beat_data 與 JSON beat_timings 走同一條路）
         all_beats = list(self.get_beat_entries())
@@ -8387,7 +8576,12 @@ class NoteModel:
         self._sync_time_sig_changes_out()
 
         # 3. 更新 music_finish_time_msec
-        self.music_end_ms = max(0.0, self.music_end_ms + delta)
+        #
+        # 均分模式音符一顆都沒動，音檔也沒變短，所以曲末不跟著 delta 走。
+        # 以前無條件 +delta：把三個小節從 4/4 改成 3/4 之後曲末被往前拉
+        # 1500ms，最後幾顆音符就落到曲末之後去了。
+        if not uniform:
+            self.music_end_ms = max(0.0, self.music_end_ms + delta)
         if self.root is not None:
             fin_el = self.root.find('header/music_finish_time_msec')
             if fin_el is not None:
@@ -8397,6 +8591,12 @@ class NoteModel:
             jm['music_finish_time_msec'] = int(self.music_end_ms)
             self.json_meta = jm
 
+        # 均分模式把小節縮短時，後面的小節線整段往前擠而音符沒動，尾端就空出
+        # 一段沒有小節線的區域。**補回去是呼叫端的事**，不在這裡做：
+        # `_append_measures` 會把 `music_end_ms` 推到新的格線盡頭，而「對一個
+        # 範圍逐小節套用」是正常用法——每一小節都補一次就變成棘輪（實測連改
+        # 5 個小節，8 小節的譜長成 13 小節、曲末 16000 爬到 23500）。
+        # 呼叫端的做法見 `grid_end_ms` 與 `extend_grid_to_cover`。
         self.rebuild_display_cache()
         self.dirty = True
         # 完成：此方法不應回傳任何 deleted 變數（可能來自其他函式）
