@@ -600,3 +600,86 @@ class LeadInZeroTests(unittest.TestCase):
             settings.set('ai_trim_lead_in', before[0])
             settings.set('ai_lead_in_bars', before[1])
         self.assertIsInstance(app, QApplication)
+
+
+class NegativeTickTests(unittest.TestCase):
+    """導入空白＝0 時，落在第一顆音符之前的事件不能把存檔弄壞。
+
+    使用者實測踩到：`ValueError: message time must be non-negative in MIDI file`。
+    基準是**第一顆音符**，而踏板常常在它之前就按下去了——實測 8 份 AI 轉譜有
+    5 份如此（最早的在 0.009 秒），那 5 份一份都轉不出來。
+
+    負的 tick 一律收到 0：踏板在音樂開始之前就已經按住了，收到 0 正是那個意思。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='ai_neg_test_')
+        self.src = os.path.join(self.dir, 'song.ai.mid')
+        self.dst = os.path.join(self.dir, 'out.mid')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, pedals):
+        notes = [(s, s + 0.2, p, v) for s, p, v in _song(bpm=150, downbeat=2.5)]
+        _write_ai_midi(self.src, notes, pedals=pedals)
+        return min(n[0] for n in notes)
+
+    def settings(self, bars=0):
+        return G.GridSettings(bpm=150.0, downbeat=2.5, numerator=4, division=4,
+                              trim_lead_in=True, lead_in_bars=bars)
+
+    def test_a_pedal_before_the_first_note_does_not_break_the_save(self):
+        first = self.write([(0.2, 3.0), (3.1, 5.0)])
+        self.assertLess(0.2, first, '這個測試需要踏板在第一顆音符之前')
+        stats = G.build(self.src, self.dst, self.settings())
+        self.assertTrue(os.path.exists(self.dst))
+        self.assertGreater(stats.notes, 0)
+
+    def test_it_says_how_many_it_pulled_back(self):
+        self.write([(0.2, 3.0), (3.1, 5.0)])
+        self.assertEqual(G.build(self.src, self.dst, self.settings()).lead_clamped, 1)
+
+    def test_nothing_is_clamped_when_there_is_nothing_early(self):
+        first = self.write([(2.6, 4.0)])
+        self.assertLess(first, 2.6)
+        self.assertEqual(G.build(self.src, self.dst, self.settings()).lead_clamped, 0)
+
+    def test_every_tick_in_the_file_is_non_negative(self):
+        self.write([(0.05, 3.0), (3.1, 5.0)])
+        G.build(self.src, self.dst, self.settings())
+        for track in mido.MidiFile(self.dst).tracks:
+            for msg in track:
+                self.assertGreaterEqual(msg.time, 0, msg)
+
+    def test_a_pedal_entirely_before_the_start_is_dropped_not_zero_length(self):
+        """整段都在開頭之前的踏板收到 0 之後沒有長度了，直接丟掉。"""
+        self.write([(0.05, 0.1), (3.1, 5.0)])
+        stats = G.build(self.src, self.dst, self.settings())
+        self.assertEqual(stats.pedals, 1, '零長度的踏板段落該被丟掉')
+
+    def test_the_pedal_order_survives(self):
+        """收到 0 之後不能和下一段疊起來。"""
+        self.write([(0.05, 3.0), (3.1, 5.0), (5.2, 7.0)])
+        G.build(self.src, self.dst, self.settings())
+        spans, down = [], None
+        for track in mido.MidiFile(self.dst).tracks:
+            tick = 0
+            for msg in track:
+                tick += msg.time
+                if msg.type == 'control_change' and msg.control == 64:
+                    if msg.value >= 64:
+                        down = tick
+                    elif down is not None:
+                        spans.append((down, tick))
+                        down = None
+        self.assertTrue(spans)
+        for a, b in zip(spans, spans[1:]):
+            self.assertLessEqual(a[1], b[0], '踏板段落疊在一起了：%s %s' % (a, b))
+
+    def test_it_also_covers_a_lead_in_of_one_bar(self):
+        """>=1 的時候也可能有東西落在 0 之前（踏板比保留的小節還早）。"""
+        self.write([(0.05, 3.0), (3.1, 5.0)])
+        stats = G.build(self.src, self.dst, self.settings(bars=1))
+        self.assertTrue(os.path.exists(self.dst))
+        self.assertGreaterEqual(stats.lead_clamped, 0)

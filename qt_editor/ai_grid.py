@@ -90,6 +90,8 @@ class GridStats:
     trimmed: int               #: 因為和下一顆同音重疊而截短的
     pedals: int
     bars: int
+    #: 吸附後落在 0 之前、被收到 0 的事件數（導入空白＝0 時的踏板最常見）
+    lead_clamped: int = 0
     tempos: int = 1            #: 寫進 MIDI 的速度事件數（1 = 定速）
     bpm_min: float = 0.0
     bpm_max: float = 0.0
@@ -381,6 +383,40 @@ def build(src_path: str, dst_path: str, settings: GridSettings) -> GridStats:
                 pedal_ticks[-1] = (prev_d, d)
             pedal_ticks.append((d, u))
 
+    # 吸附之後可能出現**負的** tick。導入空白＝0 的時候基準是「第一顆音符」，
+    # 而踏板常常在它之前就按下去了（實測 8 份 AI 轉譜有 5 份如此，最早的在
+    # 0.009 秒）。MIDI 的 delta time 不能是負的，mido 會直接丟
+    # 'message time must be non-negative in MIDI file'——使用者踩到的就是這個，
+    # 那 5 份一份都轉不出來。
+    #
+    # 負的一律收到 0：踏板在音樂開始之前就已經按住了，收到 0 正好是那個意思。
+    clamped = 0
+    if final and final[0][0] < 0:
+        fixed: List[Tuple[int, int, int, int]] = []
+        for t0, t1, pitch, vel in final:
+            if t0 < 0:
+                clamped += 1
+                t0 = 0
+            fixed.append((t0, max(t1, t0 + 1), pitch, vel))
+        final = sorted(fixed)
+    if any(d < 0 for d, _u in pedal_ticks):
+        kept: List[Tuple[int, int]] = []
+        for d, u in pedal_ticks:
+            if d < 0:
+                clamped += 1
+                d = 0
+            u = max(0, u)
+            if u <= d:
+                continue                      # 整段都在開頭之前，沒有長度了
+            if kept and d < kept[-1][1]:
+                # 收到 0 之後可能和下一段疊在一起：上一段在這裡放開
+                prev_d, _prev_u = kept[-1]
+                if d <= prev_d:
+                    continue
+                kept[-1] = (prev_d, d)
+            kept.append((d, u))
+        pedal_ticks = kept
+
     # 同一個 tick：先放開（音、踏板）再按下，避免零長度與配錯
     events: List[Tuple[int, int, mido.Message]] = []
     for t0, t1, pitch, vel in final:
@@ -420,6 +456,7 @@ def build(src_path: str, dst_path: str, settings: GridSettings) -> GridStats:
     bpms = [60.0 / (microseconds / 1e6) for _tick, microseconds in tempos]
     return GridStats(pad_ms=pad_ms, notes=len(final), merged=merged, trimmed=trimmed,
                      pedals=len(pedal_ticks), bars=total_bars, tempos=len(tempos),
+                     lead_clamped=clamped,
                      bpm_min=round(min(bpms), 2), bpm_max=round(max(bpms), 2))
 
 

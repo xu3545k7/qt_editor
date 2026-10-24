@@ -3924,7 +3924,15 @@ class MainWindow(QMainWindow):
             grid = grid_dlg.settings()
             settings.set('ai_grid_division', grid.division)
             load_path = G.output_path(out, grid.bpm, variable=grid.variable)
-            stats = G.build(out, load_path, grid)
+            # 失敗要說出來。這一步原本沒有防護，例外會直接穿到 Qt 的事件迴圈：
+            # 從主控台啟動只看到一段 traceback，從捷徑啟動就是「按了沒反應」。
+            try:
+                stats = G.build(out, load_path, grid)
+            except Exception as exc:                        # noqa: BLE001
+                QMessageBox.critical(self, 'AI 轉譜失敗', (chr(10) * 2).join([
+                    '對齊小節線的時候出錯了：', str(exc),
+                    '轉出來的 MIDI 本身還在：' + chr(10) + out]))
+                return
             cut_sound = 0
             if audio_for_editor and stats.pad_ms:
                 from .audio_lead_in import apply_lead_in
@@ -3941,7 +3949,11 @@ class MainWindow(QMainWindow):
                 summary, '%s，%s' % (tempo_text, lead_text),
                 # 剪到的不只是靜音時一定要講：那是真的被切掉的聲音
                 ('⚠ 剪掉了 %d ms 的聲音' % cut_sound) if cut_sound else '',
-                ('吸附後合併 %d 顆同格同音' % stats.merged) if stats.merged else '']))
+                ('吸附後合併 %d 顆同格同音' % stats.merged) if stats.merged else '',
+                # 落在開頭之前的事件（幾乎都是踏板比第一顆音符還早按下去）被
+                # 收到 0。不講的話等於悄悄改了踏板。
+                ('%d 個事件原本落在開頭之前，已收到 0' % stats.lead_clamped)
+                if stats.lead_clamped else '']))
 
         self._load_path(load_path)
         if os.path.normcase(self.view.model.current_file or '') != os.path.normcase(load_path):
