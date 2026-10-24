@@ -3,7 +3,11 @@
 編輯器的慣例是「譜面第 0 毫秒＝音檔第 0 毫秒＝第一小節起點」。音樂的第一個
 小節起點（downbeat）通常不在 0，所以和「音訊開頭空白」同一套做法：音檔前面
 補 `pad_ms` 的靜音，讓 downbeat 剛好落在某條小節線上，音符也一起往後移同樣的量。
-補的量永遠在 [0, 一小節) 之間，開頭多出來的那段正好當作進場空間。
+補的量本身永遠在 [0, 一小節) 之間，開頭多出來的那段正好當作進場空間。
+
+`trim_lead_in` 打開時 `pad_ms` 可以是**負的**：音檔開頭本來就沉默好幾小節的話，
+補完之後再往回扣整數個小節，只留 `lead_in_bars` 小節的導入（扣整小節不會破壞
+小節線對齊）。負的量交給 `audio_lead_in.apply_lead_in`，它支援刪減。
 
 吸附（量化）照 quantize_dialog 的精神保留強度：100% 貼齊格點，50% 只收一半。
 吸附之後同音高的兩顆可能擠到同一格或互相重疊——同一格留力度大的那顆，重疊的
@@ -20,6 +24,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import mido
 
 TICKS_PER_BEAT = 480
+
+#: 滑音（一串 tap）判定：音高每一步最多幾個半音
+RUN_MAX_STEP = 3
+#: 至少幾顆才算一串
+RUN_MIN_NOTES = 4
+#: 相鄰起音要比一格的這個比例更密。0.75 是實測挑的：0.5 會把漂流那條 10 顆的
+#: 下行滑音切成兩半（只認得 6 顆），1.0 則開始誤抓 280 BPM 譜裡 4 顆的快速音階
+#: ——那種間隔就在一格附近，本來就該吸附。
+RUN_MAX_GAP = 0.75
 
 #: 吸附格選項：(顯示文字, 每拍幾格)；0 = 不吸附，只對齊小節線
 GRID_CHOICES: Sequence[Tuple[str, int]] = (
@@ -41,6 +54,15 @@ class GridSettings:
     division: int = 4          #: 每拍幾格，0 = 不吸附
     strength: float = 1.0      #: 0~1
     snap_length: bool = True
+    #: 自動刪掉開頭多餘的空白。對齊小節線只需要補 [0, 一小節) 的靜音，但音檔
+    #: 本身開頭可能先有好幾小節的沉默，補完之後譜面就從一大段空白開始。打開
+    #: 之後會再往回扣**整數個**小節，只留 `lead_in_bars` 小節的導入——扣整小節
+    #: 不會破壞小節線對齊，這是這個做法成立的關鍵。
+    trim_lead_in: bool = False
+    #: 保留幾小節的導入（`trim_lead_in` 開著才有意義）
+    lead_in_bars: int = 1
+    #: 滑音／音階跑動不吸附（整串只對齊第一顆）
+    keep_runs: bool = True
     #: 變速用：每一拍的時間（秒）。給了就以它為格線，`bpm` 只當第一段的速度。
     beats: Optional[Sequence[float]] = None
 
@@ -80,6 +102,43 @@ def pad_ms_for(settings: GridSettings) -> int:
     pad = (-downbeat * 1000.0) % bar_ms
     pad_ms = int(round(pad))
     return 0 if pad_ms >= int(round(bar_ms)) else pad_ms
+
+
+def lead_shift_ms(settings: GridSettings,
+                  first_note_s: Optional[float] = None) -> int:
+    """音檔開頭要補（正）或刪（負）多少毫秒。
+
+    先照 `pad_ms_for` 補到小節線上，再視 `trim_lead_in` 往回扣整數個小節。
+    `first_note_s` 給了就不會把第一顆音符扣到負的時間（弱起的音在 downbeat
+    之前），少給只是保守一點。
+    """
+    pad_ms = pad_ms_for(settings)
+    if not settings.trim_lead_in:
+        return pad_ms
+    bar_ms = settings.bar_s * 1000.0
+    if bar_ms <= 0:
+        return pad_ms
+    # 基準是**第一顆音符**，不是 downbeat。使用者說的「前面空白」是音樂開始前
+    # 的那一段，而這兩者常常差很多：實測漂流的 downbeat 在 0.327 秒（不到一
+    # 小節），但第一顆音在 8.27 秒——空白是音樂晚進來造成的，拿 downbeat 當
+    # 基準會算出「不用刪」。
+    anchor_ms = 1000.0 * (float(first_note_s) if first_note_s is not None
+                          else (float(settings.beats[0]) if settings.variable
+                                else float(settings.downbeat)))
+    keep = max(0, int(settings.lead_in_bars))
+    if keep == 0:
+        # **0 就是真的 0。**只扣整小節的話第一顆音符會停在「不到一小節」的
+        # 餘數上（實測 POTENTIAL：1725ms 的空白扣掉 1 小節還剩 525ms），控制項
+        # 寫 0 卻留了半個小節。使用者要的是「導入空白是 0」，所以整段扣掉。
+        #
+        # 代價是格線的相位改由第一顆音符決定（它變成 downbeat）。keep >= 1 時
+        # 仍然只扣整小節，原本的相位不動。
+        return int(round(-anchor_ms))
+    # 取 floor：保留「至少」這麼多整小節的導入。第一顆音通常不在小節線上，
+    # 用 round 會把它推到目標線之前。
+    bars_before = int((anchor_ms + pad_ms) // bar_ms)
+    drop = max(0, bars_before - keep)
+    return int(round(pad_ms - drop * bar_ms))
 
 
 class _BeatMap:
@@ -161,6 +220,50 @@ def _snap(beat: float, settings: GridSettings) -> float:
     return beat + settings.strength * (grid - beat)
 
 
+def _run_starts(notes, beat_map: '_BeatMap', settings: GridSettings,
+                shift: float) -> Dict[int, float]:
+    """找出「一串 tap」的音符，回傳 {在 notes 裡的序號: 要用的拍位置}。
+
+    滑音（華音）和音階跑動是一串單音，顆與顆之間的時間差本身就是它的樣子。
+    照格線吸附會把整串壓到同幾個格子上——實測漂流那條 10 顆、橫跨 185ms 的
+    下行滑音，16 分吸附後只剩 3 個格子，變成三個五連音和弦。所以整串只把
+    第一顆對到格線上，其餘保留原本的相對時間，起點仍然對拍。
+
+    判定要音高**單調小步**：擠在一起的和弦也一樣密，但它音高亂跳、跨好幾個
+    八度（實測有 5 顆在 20ms 內、音高 85/97/30/42/82），那種本來就該一起吸到
+    同一格。
+    """
+    out: Dict[int, float] = {}
+    if not settings.keep_runs or settings.division <= 0 or len(notes) < RUN_MIN_NOTES:
+        return out
+    gap = RUN_MAX_GAP / float(settings.division)       # 拍
+    beats = [beat_map.position(n[0]) + shift for n in notes]
+
+    def flush(run: List[int]) -> None:
+        if len(run) < RUN_MIN_NOTES:
+            return
+        head = beats[run[0]]
+        anchor = _snap(head, settings)
+        for idx in run:
+            out[idx] = anchor + (beats[idx] - head)
+
+    run = [0]
+    for i in range(1, len(notes)):
+        step = notes[i][2] - notes[run[-1]][2]
+        dt = beats[i] - beats[run[-1]]
+        ok = 0.0 < dt < gap and 0 < abs(step) <= RUN_MAX_STEP
+        if ok and len(run) >= 2:
+            prev = notes[run[-1]][2] - notes[run[-2]][2]
+            ok = step * prev > 0                       # 整串同方向
+        if ok:
+            run.append(i)
+        else:
+            flush(run)
+            run = [i]
+    flush(run)
+    return out
+
+
 def _shift_beats(settings: GridSettings, beat_map: '_BeatMap', pad: float) -> float:
     """拍點表的第 0 拍，在輸出裡是第幾拍。
 
@@ -215,7 +318,8 @@ def _tempo_events(beat_map: '_BeatMap', shift: float, total_bars: int, numerator
 def build(src_path: str, dst_path: str, settings: GridSettings) -> GridStats:
     """讀 AI MIDI、對齊並吸附，寫出新的 MIDI。回傳統計。"""
     notes, pedals = read_ai_midi(src_path)
-    pad_ms = pad_ms_for(settings)
+    first_note_s = min((n[0] for n in notes), default=None)
+    pad_ms = lead_shift_ms(settings, first_note_s)
     pad = pad_ms / 1000.0
     beat_map = _BeatMap(settings)
     shift = _shift_beats(settings, beat_map, pad)
@@ -224,14 +328,19 @@ def build(src_path: str, dst_path: str, settings: GridSettings) -> GridStats:
 
     placed: Dict[Tuple[int, int], Tuple[int, int]] = {}   # (音高, 開始 tick) → (結束 tick, 力度)
     merged = 0
-    for start, end, pitch, vel in notes:
-        b0 = _snap(beat_map.position(start) + shift, settings)
+    runs = _run_starts(notes, beat_map, settings, shift)
+    for idx, (start, end, pitch, vel) in enumerate(notes):
+        in_run = idx in runs
+        b0 = runs[idx] if in_run else _snap(beat_map.position(start) + shift, settings)
         b1 = beat_map.position(end) + shift
-        if settings.snap_length:
+        if settings.snap_length and not in_run:
             b1 = _snap(b1, settings)
+        elif in_run:
+            # 一串 tap：長度跟著起音一起平移，不吸附也不撐到一格
+            b1 += b0 - (beat_map.position(start) + shift)
         t0 = int(round(b0 * TICKS_PER_BEAT))
         t1 = int(round(b1 * TICKS_PER_BEAT))
-        if settings.snap_length and settings.strength >= 0.999:
+        if settings.snap_length and settings.strength >= 0.999 and not in_run:
             t1 = max(t1, t0 + min_len_ticks)
         t1 = max(t1, t0 + 1)
         key = (pitch, t0)

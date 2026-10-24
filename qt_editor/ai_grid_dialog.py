@@ -88,6 +88,9 @@ class AiGridDialog(QDialog):
             self._grid.addItem(tr(label), div)
         self._grid.setCurrentIndex(max(0, self._grid.findData(division)))
         self._grid.currentIndexChanged.connect(self._refresh_enabled)
+        self._grid.setToolTip(tr(
+            '滑音和快速音階不吸附：音高單調小步、又比格子密的一串，只把第一顆對到'
+            '格線上，其餘保留原本的相對時間。整串照格線吸附會被壓成幾個和弦。'))
         form.addRow(tr('吸附到'), self._grid)
 
         self._strength = QSpinBox()
@@ -99,6 +102,25 @@ class AiGridDialog(QDialog):
         self._snap_length = QCheckBox(tr('長度（放開的時間）也吸附'))
         self._snap_length.setChecked(True)
         form.addRow('', self._snap_length)
+
+        from .settings import settings as _prefs
+        self._trim_lead = QCheckBox(tr('自動刪掉開頭多餘的空白'))
+        self._trim_lead.setChecked(bool(_prefs.get('ai_trim_lead_in', False)))
+        self._trim_lead.setToolTip(tr(
+            '對齊小節線只需要補不到一小節的靜音，但音檔開頭常常本來就沉默好幾小節，補完之後譜面就從一大段空白開始。\n打開之後會再往回扣整數個小節（扣整小節不會破壞小節線對齊），只留下面指定的導入小節數。\n不會把第一顆音符扣到負的時間；真的剪到聲音時會在狀態列提醒。'))
+        self._trim_lead.toggled.connect(self._refresh_enabled)
+        form.addRow('', self._trim_lead)
+
+        self._lead_bars = QSpinBox()
+        self._lead_bars.setRange(0, 16)
+        self._lead_bars.setValue(int(_prefs.get('ai_lead_in_bars', 1) or 0))
+        self._lead_bars.setSuffix(tr(' 小節'))
+        self._lead_bars.setToolTip(tr(
+            '要留幾小節的導入空白。\n'
+            '**0 就是真的 0**：第一顆音符會落在 0 ms，格線的相位改由它決定。\n'
+            '1 以上只扣整數個小節，所以原本的拍子相位不會變，但留下來的空白'
+            '可能比指定的多（最多多不到一小節）。'))
+        form.addRow(tr('保留導入'), self._lead_bars)
 
         self._variable = QCheckBox(tr('跟著音樂的速度變化（分段偵測）'))
         self._variable.setToolTip(tr(
@@ -199,6 +221,15 @@ class AiGridDialog(QDialog):
         self._refresh_info()
 
     # ── 顯示 ──
+    def _remember(self) -> None:
+        """把開頭空白的選擇存進偏好設定。"""
+        try:
+            from .settings import settings as _prefs
+            _prefs.set('ai_trim_lead_in', bool(self._trim_lead.isChecked()))
+            _prefs.set('ai_lead_in_bars', int(self._lead_bars.value()))
+        except Exception:                               # noqa: BLE001
+            pass
+
     def _refresh_enabled(self, *_args) -> None:
         on = self._enable.isChecked()
         self._body.setEnabled(on)
@@ -207,6 +238,7 @@ class AiGridDialog(QDialog):
         self._snap_length.setEnabled(on and snapping)
         # 變速時整條拍點表來自偵測，手動改起點沒有意義（每段拍長都不同）
         self._downbeat.setEnabled(on and not self.variable())
+        self._lead_bars.setEnabled(on and self._trim_lead.isChecked())
         self._refresh_info()
 
     def _refresh_info(self) -> None:
@@ -214,12 +246,23 @@ class AiGridDialog(QDialog):
             self._info.setText(tr('不設定：照原本 120 BPM 匯入，時間就是音檔秒數。'))
             return
         settings = self.settings()
-        pad = G.pad_ms_for(settings)
+        # 要把第一顆音符傳進去：刪減的基準是它，不給的話預覽會嚴重低報
+        # （實測漂流：downbeat 基準算出「補 1273ms」，實際會刪 5127ms）。
+        first = min((t for t, _p, _v in self._onsets), default=None)
+        pad = G.lead_shift_ms(settings, first)
         bar_ms = settings.bar_s * 1000.0
         downbeat = (settings.beats[0] if settings.variable else settings.downbeat) * 1000.0
-        text = tr('一小節 %.0f ms。音檔開頭會補 %d ms 靜音（音符一起往後移），'
-                  '第一小節起點落在第 %d 小節的小節線上。') % (
-            bar_ms, pad, int(round((downbeat + pad) / bar_ms)) + 1)
+        bar_no = int(round((downbeat + pad) / bar_ms)) + 1
+        if pad < 0:
+            text = tr('一小節 %.0f ms。音檔開頭刪掉 %d ms（音符一起往前移），'
+                      '第一顆音符會落在第 %.1f 小節。') % (
+                bar_ms, -pad,
+                (min((t for t, _p, _v in self._onsets), default=0.0) * 1000.0
+                 + pad) / bar_ms + 1)
+        else:
+            text = tr('一小節 %.0f ms。音檔開頭會補 %d ms 靜音（音符一起往後移），'
+                      '第一小節起點落在第 %d 小節的小節線上。') % (
+                bar_ms, pad, bar_no)
         if settings.variable:
             text += tr('（第一小節的長度；後面每段各自的速度見上面）')
         self._info.setText(text)
@@ -235,6 +278,8 @@ class AiGridDialog(QDialog):
     def settings(self) -> G.GridSettings:
         variable = self.variable()
         curve = self._curve if variable else None
+        # 記住開頭空白的選擇：使用者講過兩次「導入空白要 0」，不該每次重新勾
+        self._remember()
         return G.GridSettings(
             bpm=curve.bpm_first if curve else float(self._bpm.value()),
             downbeat=curve.beats[0] if curve else self._downbeat.value() / 1000.0,
@@ -242,5 +287,7 @@ class AiGridDialog(QDialog):
             division=int(self._grid.currentData() or 0),
             strength=self._strength.value() / 100.0,
             snap_length=self._snap_length.isChecked(),
+            trim_lead_in=self._trim_lead.isChecked(),
+            lead_in_bars=int(self._lead_bars.value()),
             beats=curve.beats if curve else None,
         )

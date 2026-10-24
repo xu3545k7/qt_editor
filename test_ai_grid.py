@@ -299,3 +299,304 @@ class MidiTempoTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GlissandoTests(unittest.TestCase):
+    """滑音（華音）不能被吸附。
+
+    使用者：「他應該是一串 tap，不能被改時間」。實測漂流那條 10 顆、橫跨 185ms
+    的下行滑音，16 分吸附後只剩 3 個格子——變成三個五連音和弦。但擠在一起的
+    和弦（實測 5 顆在 20ms 內、音高 85/97/30/42/82）本來就該吸到同一格，所以
+    判定必須看音高是不是單調小步，不能只看時間密。
+    """
+
+    GRID = 0.25            # 150 BPM 的 16 分 = 0.25 拍 = 100ms
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='ai_gliss_test_')
+        self.src = os.path.join(self.dir, 'song.ai.mid')
+        self.dst = os.path.join(self.dir, 'out.mid')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _run(self, notes, **kw):
+        _write_ai_midi(self.src, notes)
+        opts = dict(bpm=150, downbeat=0.0, division=4)
+        opts.update(kw)
+        G.build(self.src, self.dst, G.GridSettings(**opts))
+        mid = mido.MidiFile(self.dst)
+        out, tick = [], 0
+        for msg in mid.tracks[1]:
+            tick += msg.time
+            if msg.type == 'note_on' and msg.velocity > 0:
+                out.append((tick / 480.0, msg.note))
+        return sorted(out)
+
+    @staticmethod
+    def _gliss(t0=2.010, step=0.020, top=101, down=2, count=10, length=0.5):
+        return [(t0 + i * step, t0 + i * step + length, top - i * down, 80)
+                for i in range(count)]
+
+    def test_a_glissando_keeps_every_onset(self):
+        got = self._run(self._gliss())
+        self.assertEqual(len(got), 10)
+        self.assertEqual(len({t for t, _p in got}), 10, '每一顆都還是自己的時間')
+
+    def test_only_the_first_note_is_pulled_onto_the_grid(self):
+        got = self._run(self._gliss())
+        first = got[0][0]
+        self.assertAlmostEqual(first, 5.0, places=6, msg='起點要對拍')
+        # 其餘保留原本的相對時間：20ms = 0.05 拍，9 段共 0.45 拍
+        self.assertAlmostEqual(got[-1][0] - first, 0.45, delta=0.02)
+        for (a, _pa), (b, _pb) in zip(got, got[1:]):
+            self.assertAlmostEqual(b - a, 0.05, delta=0.01)
+
+    def test_a_tight_chord_still_snaps_together(self):
+        """音高亂跳、跨好幾個八度的密集群是和弦，該一起吸到同一格。"""
+        notes = [(3.010 + i * 0.005, 3.5, p, 80)
+                 for i, p in enumerate((85, 97, 30, 42, 82))]
+        got = self._run(notes)
+        self.assertEqual(len({t for t, _p in got}), 1)
+        self.assertAlmostEqual(got[0][0], 7.5, places=6)
+
+    def test_a_zigzag_is_not_a_run(self):
+        """上下來回跳的不算滑音——那是顫音或裝飾音，照舊吸附。"""
+        notes = [(2.010 + i * 0.020, 2.5, p, 80)
+                 for i, p in enumerate((60, 62, 60, 62, 60, 62))]
+        got = self._run(notes)
+        self.assertLessEqual(len({t for t, _p in got}), 2)
+
+    def test_three_notes_are_too_few(self):
+        got = self._run(self._gliss(count=3))
+        self.assertEqual(len({t for t, _p in got}), 1, '短的裝飾音不算一串')
+
+    def test_notes_already_a_grid_apart_are_untouched(self):
+        """一般的 16 分音符串（間隔剛好一格）不在例外範圍內。"""
+        notes = [(2.010 + i * 0.100, 2.5, 60 + i, 80) for i in range(8)]
+        got = self._run(notes)
+        for t, _p in got:
+            self.assertAlmostEqual(t / self.GRID, round(t / self.GRID), places=6)
+
+    def test_turning_the_exemption_off_brings_the_old_behaviour_back(self):
+        got = self._run(self._gliss(), keep_runs=False)
+        self.assertLessEqual(len({t for t, _p in got}), 3,
+                             '沒有例外時 10 顆會塌成 3 個格子')
+
+    def test_a_run_keeps_its_length_instead_of_being_stretched_to_a_cell(self):
+        """一串 tap 的長度跟著起音平移，不吸附也不撐到一整格。"""
+        _write_ai_midi(self.src, self._gliss(length=0.030))
+        G.build(self.src, self.dst, G.GridSettings(bpm=150, downbeat=0.0, division=4))
+        mid = mido.MidiFile(self.dst)
+        spans, active, tick = [], {}, 0
+        for msg in mid.tracks[1]:
+            tick += msg.time
+            if msg.type == 'note_on' and msg.velocity > 0:
+                active[msg.note] = tick
+            elif msg.type == 'note_on':
+                spans.append((tick - active.pop(msg.note)) / 480.0)
+        self.assertEqual(len(spans), 10)
+        for span in spans:
+            self.assertLess(span, self.GRID, '30ms 的 tap 不該被撐成一格')
+            self.assertAlmostEqual(span, 0.075, delta=0.01)
+
+
+class LeadInTrimTests(unittest.TestCase):
+    """自動刪掉開頭多餘的空白。
+
+    使用者：「轉譜沒有前面空白自動刪減再貼合小節線的選項」。對齊小節線只需要補
+    不到一小節的靜音，但音檔開頭常常本來就沉默好幾小節，補完之後譜面就從一大段
+    空白開始（實測漂流：downbeat 0.327 秒、一小節 1.6 秒，補 1273ms 之後第一顆音
+    落在第 3 小節）。
+
+    成立的關鍵是**扣整數個小節不會破壞小節線對齊**，所以先補到線上、再往回扣。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='ai_lead_test_')
+        self.src = os.path.join(self.dir, 'song.ai.mid')
+        self.dst = os.path.join(self.dir, 'out.mid')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _settings(self, **kw):
+        # 150 BPM 4/4 → 一小節 1.6 秒；downbeat 5.1 秒 ＝ 第 3 小節多一點
+        opts = dict(bpm=150.0, downbeat=5.1, numerator=4, division=4)
+        opts.update(kw)
+        return G.GridSettings(**opts)
+
+    def test_off_by_default_so_nothing_changes(self):
+        st = self._settings()
+        self.assertFalse(st.trim_lead_in)
+        self.assertEqual(G.lead_shift_ms(st), G.pad_ms_for(st))
+
+    def test_the_pad_alone_leaves_the_music_four_bars_in(self):
+        """純補靜音會把音樂推到第 4 條小節線上——開頭 6.4 秒什麼都沒有。"""
+        st = self._settings()
+        pad = G.pad_ms_for(st)
+        self.assertEqual(pad, 1300)                     # (-5100) % 1600
+        self.assertAlmostEqual((5100 + pad) / 1600.0, 4.0, places=6)
+
+    def test_trimming_keeps_only_the_asked_for_bars(self):
+        for bars in (0, 1, 2):
+            st = self._settings(trim_lead_in=True, lead_in_bars=bars)
+            shift = G.lead_shift_ms(st)
+            landed = (5100 + shift) / 1600.0
+            self.assertAlmostEqual(landed, bars, places=6,
+                                   msg='保留 %d 小節時落在第 %.2f 小節' % (bars, landed))
+
+    def test_trimming_stays_on_the_bar_line(self):
+        """扣掉的量一定是整數個小節，否則對齊就白做了。"""
+        st = self._settings(trim_lead_in=True, lead_in_bars=1)
+        dropped = G.pad_ms_for(st) - G.lead_shift_ms(st)
+        self.assertAlmostEqual(dropped / 1600.0, round(dropped / 1600.0), places=6)
+
+    def test_it_never_pushes_the_first_note_before_zero(self):
+        """弱起的音在 downbeat 之前，不能被扣到負的時間。"""
+        st = self._settings(trim_lead_in=True, lead_in_bars=0)
+        # 第一顆音在 0.2 秒（遠早於 downbeat）→ 幾乎不能扣
+        shift = G.lead_shift_ms(st, first_note_s=0.2)
+        self.assertGreaterEqual(200 + shift, 0, '第一顆音被扣到負的時間')
+
+    def test_build_shifts_the_notes_earlier(self):
+        notes = [(5.1 + i * 0.4, 5.1 + i * 0.4 + 0.2, 60 + i, 80) for i in range(8)]
+        _write_ai_midi(self.src, notes)
+        kept = G.build(self.src, self.dst,
+                       self._settings(trim_lead_in=True, lead_in_bars=1))
+        padded = G.build(self.src, self.dst, self._settings())
+        self.assertLess(kept.pad_ms, padded.pad_ms, '刪減後的位移要比純補小')
+        self.assertEqual(kept.notes, padded.notes, '刪減不該弄掉音符')
+
+    def test_the_dialog_offers_it(self):
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        from qt_editor.ai_grid_dialog import AiGridDialog
+        onsets = [(0.4 * i, 60 + i % 12, 80) for i in range(60)]
+        dlg = AiGridDialog(None, onsets, 'song.wav', bpm_hint=150.0)
+        self.assertTrue(hasattr(dlg, '_trim_lead'), '對話框沒有這個選項')
+        dlg._trim_lead.setChecked(True)
+        dlg._lead_bars.setValue(2)
+        got = dlg.settings()
+        self.assertTrue(got.trim_lead_in)
+        self.assertEqual(got.lead_in_bars, 2)
+        self.assertIsInstance(app, QApplication)
+
+
+class LeadInAnchorTests(unittest.TestCase):
+    """刪減的基準必須是第一顆音符，不是 downbeat。
+
+    這兩者常常差很多：實測漂流的 downbeat 在 0.327 秒（不到一小節），但第一顆
+    音在 8.27 秒——開頭那 6 小節的空白是音樂晚進來造成的。第一版拿 downbeat 當
+    基準，結果對這首算出「不用刪」，等於功能沒生效。
+    """
+
+    def test_an_early_downbeat_with_a_late_first_note_still_trims(self):
+        st = G.GridSettings(bpm=150.0, downbeat=0.327, numerator=4, division=4,
+                            trim_lead_in=True, lead_in_bars=1)
+        self.assertGreater(G.lead_shift_ms(st, first_note_s=8.27) * -1, 4000,
+                           '第一顆音在 8.27 秒卻幾乎沒刪，基準抓錯了')
+        # 不給第一顆音時退回 downbeat：保守，但不能比給了還激進
+        self.assertGreaterEqual(G.lead_shift_ms(st),
+                                G.lead_shift_ms(st, first_note_s=8.27))
+
+    def test_what_is_dropped_is_always_whole_bars(self):
+        """只有整小節才不會破壞小節線對齊。"""
+        for first in (2.0, 5.5, 8.27, 13.9):
+            st = G.GridSettings(bpm=150.0, downbeat=0.327, numerator=4, division=4,
+                                trim_lead_in=True, lead_in_bars=1)
+            dropped = G.pad_ms_for(st) - G.lead_shift_ms(st, first)
+            self.assertAlmostEqual(dropped / 1600.0, round(dropped / 1600.0),
+                                   places=6, msg='第一顆音 %.2f 秒時扣了 %d ms' % (first, dropped))
+
+    def test_at_least_the_asked_for_bars_survive(self):
+        """用 floor 而不是 round：第一顆音通常不在小節線上，round 會把它推過頭。"""
+        for bars in (0, 1, 2, 3):
+            st = G.GridSettings(bpm=150.0, downbeat=0.327, numerator=4, division=4,
+                                trim_lead_in=True, lead_in_bars=bars)
+            landed = (8270 + G.lead_shift_ms(st, 8.27)) / 1600.0
+            self.assertGreaterEqual(landed, bars,
+                                    '要求留 %d 小節卻只剩 %.2f' % (bars, landed))
+            self.assertLess(landed, bars + 1,
+                            '要求留 %d 小節卻留了 %.2f' % (bars, landed))
+
+    def test_the_dialog_preview_counts_the_first_note(self):
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        from qt_editor.ai_grid_dialog import AiGridDialog
+        # 第一顆音在 8.27 秒之後才開始密集敲
+        onsets = [(8.27 + 0.4 * i, 60 + i % 12, 80) for i in range(60)]
+        dlg = AiGridDialog(None, onsets, 'song.wav', bpm_hint=150.0)
+        dlg._enable.setChecked(True)
+        dlg._trim_lead.setChecked(True)
+        dlg._lead_bars.setValue(1)
+        dlg._refresh_info()
+        self.assertIn('刪掉', dlg._info.text(),
+                      '預覽沒講會刪：%r' % dlg._info.text())
+        self.assertIsInstance(app, QApplication)
+
+
+class LeadInZeroTests(unittest.TestCase):
+    """「保留導入 = 0」要是真的 0。
+
+    使用者：「我是希望導入空白是 0」。第一版只扣整數個小節，所以第一顆音符會停在
+    不到一小節的餘數上（實測 POTENTIAL：1725ms 的空白扣掉 1 小節還剩 525ms）——
+    控制項寫 0 卻留了半個小節。
+
+    代價是 0 的時候格線相位改由第一顆音符決定；>=1 時只扣整小節、相位不變。
+    """
+
+    def _settings(self, bars, **kw):
+        return G.GridSettings(bpm=199.95, downbeat=1.712, numerator=4, division=4,
+                              trim_lead_in=True, lead_in_bars=bars, **kw)
+
+    def test_zero_really_means_zero(self):
+        shift = G.lead_shift_ms(self._settings(0), first_note_s=1.712)
+        self.assertEqual(round(1712 + shift), 0, '保留 0 小節卻還有空白')
+
+    def test_zero_works_whatever_the_first_note_is(self):
+        for first in (0.2, 1.712, 8.27, 31.4):
+            shift = G.lead_shift_ms(self._settings(0), first_note_s=first)
+            self.assertEqual(round(first * 1000 + shift), 0)
+
+    def test_one_bar_or_more_still_only_drops_whole_bars(self):
+        """>=1 時相位不能變，所以只扣整小節（留下來的可能比指定的多）。"""
+        bar = 60000.0 / 199.95 * 4
+        for bars in (1, 2, 3):
+            st = self._settings(bars)
+            dropped = G.pad_ms_for(st) - G.lead_shift_ms(st, first_note_s=8.27)
+            # 位移會被 int(round()) 取整到毫秒，所以容許 1.5ms 的誤差——不是
+            # 容許「不到整小節」，而是容許整小節的毫秒取整。
+            off = abs(dropped - round(dropped / bar) * bar)
+            self.assertLess(off, 1.5,
+                            '保留 %d 小節時扣了 %.1f ms，離整小節差 %.2f ms'
+                            % (bars, dropped, off))
+
+    def test_at_least_the_asked_for_bars_survive_when_not_zero(self):
+        bar = 60000.0 / 199.95 * 4
+        for bars in (1, 2):
+            shift = G.lead_shift_ms(self._settings(bars), first_note_s=8.27)
+            self.assertGreaterEqual((8270 + shift) / bar, bars - 1e-6)
+
+    def test_the_choice_is_remembered(self):
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        from qt_editor.ai_grid_dialog import AiGridDialog
+        from qt_editor.settings import settings
+        before = (settings.get('ai_trim_lead_in', False),
+                  settings.get('ai_lead_in_bars', 1))
+        try:
+            onsets = [(1.712 + 0.3 * i, 60 + i % 12, 80) for i in range(60)]
+            dlg = AiGridDialog(None, onsets, 'song.wav', bpm_hint=199.95)
+            dlg._trim_lead.setChecked(True)
+            dlg._lead_bars.setValue(0)
+            got = dlg.settings()
+            self.assertTrue(got.trim_lead_in)
+            self.assertEqual(got.lead_in_bars, 0)
+            again = AiGridDialog(None, onsets, 'song.wav', bpm_hint=199.95)
+            self.assertTrue(again._trim_lead.isChecked(), '沒記住勾選')
+            self.assertEqual(again._lead_bars.value(), 0, '沒記住小節數')
+        finally:
+            settings.set('ai_trim_lead_in', before[0])
+            settings.set('ai_lead_in_bars', before[1])
+        self.assertIsInstance(app, QApplication)

@@ -3738,14 +3738,22 @@ class MainWindow(QMainWindow):
             settings.set('ai_grid_division', grid.division)
             load_path = G.output_path(out, grid.bpm, variable=grid.variable)
             stats = G.build(out, load_path, grid)
+            cut_sound = 0
             if audio_for_editor and stats.pad_ms:
                 from .audio_lead_in import apply_lead_in
-                audio_for_editor = apply_lead_in(audio_for_editor, stats.pad_ms).path
+                # pad_ms 可能是負的（自動刪掉開頭空白），apply_lead_in 支援刪減
+                lead = apply_lead_in(audio_for_editor, stats.pad_ms)
+                audio_for_editor = lead.path
+                cut_sound = int(getattr(lead, 'cut_sound', 0) or 0)
             tempo_text = ('%.2f BPM' % grid.bpm if stats.tempos <= 1
                           else '%d 段速度 %.2f–%.2f BPM' % (stats.tempos, stats.bpm_min,
                                                           stats.bpm_max))
+            lead_text = ('開頭刪 %d ms' % -stats.pad_ms if stats.pad_ms < 0
+                         else '開頭補 %d ms' % stats.pad_ms)
             summary = '　'.join(filter(None, [
-                summary, '%s，開頭補 %d ms' % (tempo_text, stats.pad_ms),
+                summary, '%s，%s' % (tempo_text, lead_text),
+                # 剪到的不只是靜音時一定要講：那是真的被切掉的聲音
+                ('⚠ 剪掉了 %d ms 的聲音' % cut_sound) if cut_sound else '',
                 ('吸附後合併 %d 顆同格同音' % stats.merged) if stats.merged else '']))
 
         self._load_path(load_path)
