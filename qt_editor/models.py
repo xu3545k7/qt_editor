@@ -4517,7 +4517,16 @@ class NoteModel:
                 continue
             order = (getattr(note, '_sub_order', None) or [10_000])[0]
             subs = list(getattr(note, 'sub_elems', []) or [])
-            se = subs[0] if subs else self._make_sub_elem(note)
+            if subs:
+                se = subs[0]
+                # 一定要先把編輯過的時間／音高寫回去。以前這裡直接沿用載入時
+                # 那個 sub 元素，所以在編輯器裡改隱藏音符的位置或音高、存成
+                # XML 之後**整個回到原值**（實測官方 menuetto：把一顆隱藏音符
+                # 往後移 137ms、拉長 192ms、音高 +2，存檔再開回來拿到的是原值）。
+                # JSON 沒這個問題，它把隱藏音符平鋪成一般欄位。
+                self._write_note_into_sub_elem(note, se, host)
+            else:
+                se = self._make_sub_elem(note)
             hosts.setdefault(id(host), []).append((order, se))
         if orphans:
             logging.warning(
@@ -4547,6 +4556,37 @@ class NoteModel:
         for host, original in reversed(getattr(self, '_merged_hosts', None) or []):
             host.sub_elems = original
         self._merged_hosts = []
+
+    @staticmethod
+    def _write_note_into_sub_elem(note: Any, se: ET.Element,
+                                  host: Any = None) -> bool:
+        """把隱藏音符現在的時間與音高寫回它自己的 sub 元素。回傳有沒有改到。
+
+        隱藏音符不會單獨寫成 `<note>`，它的資料存在寄主的 `sub_note_data` 裡
+        （見 `_merge_hidden_into_hosts`）。所以「編輯隱藏音符」要能存下來，就得
+        把 `GNote` 的值寫回那個元素。
+
+        **只在值真的不一樣時才寫**：官方檔的往返是逐位元組比對的（12/12 份譜
+        要一模一樣），無條件重寫會把 `__type` 或數字格式正規化掉。
+        """
+        changed = False
+        for tag, val in (('start_timing_msec', int(note.start)),
+                         ('end_timing_msec', int(note.end))):
+            if _child_int(se, tag) != val:
+                _set_child_int(se, tag, val, 's32')
+                changed = True
+        pitch = getattr(note, 'pitch', None)
+        if pitch is not None and se.find('scale_piano') is not None:
+            want = int(midi_to_official_piano_index(int(pitch)))
+            if _child_int(se, 'scale_piano') != want:
+                _set_child_int(se, 'scale_piano', want, 'u8')
+                changed = True
+        # **鍵道不寫**。隱藏音符的鍵道在官方格式裡沒有欄位可以放，而 XML 是
+        # PAN 相容輸出：`save_xml` 會把編輯器自己的 `src_*` 欄位全部濾掉（見它
+        # 的說明）。試過寫 src_min_key/src_max_key，元素裡確實有、存出來是 0 處。
+        # 隱藏音符的鍵道只有 JSON 存得住（`startLane`/`endLane`），而 JSON 才是
+        # 編輯器的原始檔。
+        return changed
 
     @staticmethod
     def _make_sub_elem(note: Any) -> ET.Element:
@@ -4658,6 +4698,9 @@ class NoteModel:
                 if ghost.end <= ghost.start:
                     ghost.end = ghost.start + max(1, int(note.gate))
                 ghost.gate = ghost.end - ghost.start
+                # 鍵道沿用寄主的：官方格式的 sub_note 沒有鍵道欄位，所以從
+                # XML 載入時只有這個值可用。**在 XML 裡改隱藏音符的鍵道存不下來**
+                # （見 `_write_note_into_sub_elem`），JSON 才存得住。
                 ghost.min_key, ghost.max_key = int(note.min_key), int(note.max_key)
                 ghost.note_type = int(note.note_type)
                 ghost.hand = int(note.hand)
