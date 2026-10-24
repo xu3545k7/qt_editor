@@ -1477,6 +1477,13 @@ class MainWindow(QMainWindow):
              '修改目前視窗中央所在小節的 BPM'),
             (t('tb_measures_bpm'), self.change_measures_bpm_dialog,
              t('tb_measures_bpm_tip')),
+            ('修補缺漏的拍點…', self.repair_beat_entries,
+             '拍點間距不均勻時補上缺的那些。修的是小節／拍點結構，所以放這裡'),
+            ('每小節 BPM…', self.measure_bpm_table_dialog,
+             '一個小節一行，各自填自己的 BPM。只有改過的行會重鋪，音符預設不動。'),
+            ('智慧重排吸附…', self.smart_resnap_dialog,
+             '照「幾個小節 ＋ BPM」的順序重建整條小節線，再把音符吸附上去。\n'
+             '用在「AI 把整首判成一個固定 BPM、而實際是變拍」的譜。有自動偵測。'),
             (self._tool_label('action_set_measure_time_signature', '修改小節拍號…'),
              self.set_measure_time_sig_dialog,
              '修改目前視窗中央所在小節的拍號。整首的總拍號請用 工具 → 樂曲總資訊'),
@@ -1516,7 +1523,6 @@ class MainWindow(QMainWindow):
             ('節奏與音高', [
                 ('量化（對齊到格點）…', self.quantize_dialog),
                 ('把音符吸到調內', self.snap_notes_to_key),
-                ('修補缺漏的拍點（BPM 不對時）…', self.repair_beat_entries),
             ]),
             ('音符整理', [
                 (t('action_resolve_hold_tails'), self.resolve_hold_tails_dialog),
@@ -3252,6 +3258,94 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '完成', f'已將第 {start} 到第 {end} 小節的 BPM 設為 {bpm:.2f}' + (f'，並修改拍號為 {new_num}/{new_den}' if apply_ts else '') + snap_text)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
+
+    def measure_bpm_table_dialog(self) -> None:
+        """每小節 BPM 的表。細節見 `measure_bpm_dialog`。"""
+        from .measure_bpm_dialog import MeasureBpmDialog
+        m = self.view.model
+        if m.count_measures() <= 0:
+            QMessageBox.information(self, '資訊', '這份譜還沒有小節線。')
+            return
+        dlg = MeasureBpmDialog(self, m)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        changed = dlg.changed_rows()
+        if not changed:
+            return
+        try:
+            m.push_history()
+            info = m.set_measure_grid(dlg.rows(), move_notes=dlg.snap_enabled())
+            oplog.params(measures=info.get('measures'),
+                         changed=info.get('changed'),
+                         shift_ms=info.get('shift_ms'),
+                         moved=info.get('moved'),
+                         snap=dlg.snap_enabled())
+            self.view.rebuild_mapper()
+            self.view._update_unit_bounds()
+            self.view.update()
+            self._rebuild_hit_times()
+            self.view.note_edited.emit()
+            text = '改了 %d 個小節的 BPM。' % int(info.get('changed') or 0)
+            shift = int(info.get('shift_ms') or 0)
+            if shift:
+                text += "\n之後的小節線往%s移了 %d ms。" % (
+                    '後' if shift > 0 else '前', abs(shift))
+            if info.get('moved'):
+                text += "\n吸附了 %d 顆音符，最大位移 %.0f ms。" % (
+                    int(info['moved']), float(info.get('max_shift_ms') or 0.0))
+            else:
+                text += "\n音符沒有被動到。"
+            QMessageBox.information(self, '完成', text)
+        except Exception as exc:                            # noqa: BLE001
+            QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
+
+    def smart_resnap_dialog(self) -> None:
+        """智慧重排吸附：用「幾個小節 ＋ BPM」的序列重建整條小節線。
+
+        用在「AI 把整首判成一個固定 BPM、實際是變拍」的譜。細節見
+        `smart_resnap` 的模組說明；這裡只負責取得計畫、push_history、套用、
+        刷新畫面，並把段落記進操作紀錄（調演算法時會想知道使用者給了什麼）。
+        """
+        from PyQt5.QtWidgets import QMessageBox
+
+        from . import oplog
+        from . import smart_resnap as SR
+        from .smart_resnap_dialog import SmartResnapDialog
+
+        m = self.view.model
+        if not m.get_beat_entries():
+            QMessageBox.warning(self, t('dlg_warn'), t('dlg_delete_measure_no_data'))
+            return
+        dlg = SmartResnapDialog(self, m)
+        if dlg.exec_() != SmartResnapDialog.Accepted:
+            return
+        segments = dlg.segments()
+        item = SR.plan(m, segments)
+        if not item.ok:
+            QMessageBox.warning(self, t('dlg_warn'), SR.describe(item))
+            return
+        # 整條格線都會被覆寫，而且音符會被搬——沒有 push_history 就救不回來
+        try:
+            oplog.params(segments=[(s.bars, s.numerator, s.denominator, s.bpm)
+                                   for s in segments],
+                         snap=dlg.snap_enabled(), division=dlg.division())
+        except Exception:                               # noqa: BLE001
+            pass
+        m.push_history()
+        try:
+            item = SR.apply(m, item, snap=dlg.snap_enabled(),
+                            division=dlg.division())
+        except Exception as exc:                        # noqa: BLE001
+            QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
+            return
+        m.rebuild_display_cache()
+        for pane in self._panes:
+            pane.rebuild_mapper()
+            pane._update_unit_bounds()
+            pane.update()
+        self._rebuild_hit_times()
+        self.view.note_edited.emit()
+        QMessageBox.information(self, '完成', SR.describe(item))
 
     def set_measure_time_sig_dialog(self) -> None:
         """以視窗中央小節為目標，彈出修改拍號對話框。"""
