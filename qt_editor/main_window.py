@@ -529,6 +529,7 @@ class MainWindow(QMainWindow):
         v.note_input_changed.connect(self._on_note_input_mode_changed)
         v.set_measure_bpm_requested.connect(self.set_measure_bpm_at)
         v.set_measure_time_sig_requested.connect(self.set_measure_time_sig_at)
+        v.time_shift_requested.connect(self.time_shift_dialog)
         v.insert_measure_requested.connect(self.insert_measure_at)
         v.delete_measure_requested.connect(self.delete_measure_at)
 
@@ -1270,6 +1271,10 @@ class MainWindow(QMainWindow):
         edit_m.addSeparator()
         self._add_action(edit_m, t('action_copy'), lambda: self.view.copy_to_clipboard(), QKeySequence.Copy)
         self._add_action(edit_m, t('action_paste'), lambda: self.view.paste_from_clipboard(), QKeySequence.Paste)
+        edit_m.addSeparator()
+        # 唯一負責「在時間上搬東西」的入口。原本同一件事散在九個地方、用五種
+        # 說法講（見 time_shift_dialog 的模組說明）。
+        self._add_action(edit_m, '時間位移…', self.time_shift_dialog)
         edit_m.addSeparator()
 
         # 寬度
@@ -3258,6 +3263,77 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '完成', f'已將第 {start} 到第 {end} 小節的 BPM 設為 {bpm:.2f}' + (f'，並修改拍號為 {new_num}/{new_den}' if apply_ts else '') + snap_text)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(e))
+
+    def time_shift_dialog(self) -> None:
+        """時間位移：量、範圍、動到哪幾層，三件事各一欄。細節見 `time_shift_dialog`。"""
+        from .time_shift_dialog import (SCOPE_MEASURES, SCOPE_SELECTION,
+                                        TimeShiftDialog)
+        m = self.view.model
+        has_audio = bool(getattr(self.audio, 'wav_path', None)
+                         or getattr(self.audio, 'audio_path', None))
+        dlg = TimeShiftDialog(self, m, selected_count=len(self.view.selected),
+                              has_audio=has_audio)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        layers = dlg.layers()
+        lo, hi = dlg.range_ms()
+        if dlg.scope() == SCOPE_SELECTION:
+            sel = [n for n in m.notes_tree if n.idx in self.view.selected]
+            if sel:
+                lo = min(int(n.start) for n in sel)
+                hi = max(int(n.end) for n in sel)
+        if dlg.unit() == 'ms':
+            delta = dlg.delta_ms()
+        else:
+            beats = dlg.beats()
+            delta = (lambda ms: self.view._ms_per_beat_at(float(ms)) * beats)
+        try:
+            m.push_history()
+            info = m.shift_time(delta, notes=layers['notes'],
+                                expression=layers['expression'],
+                                grid=layers['grid'], lo_ms=lo, hi_ms=hi)
+        except ValueError as exc:
+            QMessageBox.warning(self, '時間位移', str(exc))
+            return
+        audio_text = ''
+        if layers['audio'] and dlg.unit() == 'ms':
+            audio_text = self._shift_audio_lead_in(int(dlg.delta_ms()))
+        oplog.params(unit=dlg.unit(), scope=dlg.scope(), layers=layers,
+                     applied_ms=info.get('applied_ms'),
+                     notes=info.get('notes'), expression=info.get('expression'))
+        self.view.rebuild_mapper()
+        self.view._update_unit_bounds()
+        self.view.update()
+        self._rebuild_hit_times()
+        self.view.note_edited.emit()
+        parts = ['音符 %d 顆' % int(info.get('notes') or 0)] if layers['notes'] else []
+        if layers['expression']:
+            parts.append('表情 %d 項' % int(info.get('expression') or 0))
+            dropped = int(info.get('pedals_dropped') or 0)
+            if dropped:
+                parts.append('踏板裁掉 %d 段' % dropped)
+        if layers['grid']:
+            parts.append('小節線 %+d ms' % int(info.get('applied_ms') or 0))
+        if audio_text:
+            parts.append(audio_text)
+        QMessageBox.information(self, '時間位移',
+                                '移動了：' + ('、'.join(parts) or '沒有東西'))
+
+    def _shift_audio_lead_in(self, delta_ms: int) -> str:
+        """音訊跟著加／減開頭的靜音。回傳給人看的一句話（失敗就回原因）。"""
+        from .audio_lead_in import apply_lead_in
+        path = getattr(self.audio, 'wav_path', None) or getattr(
+            self.audio, 'audio_path', None)
+        if not path or not delta_ms:
+            return ''
+        self.stop_audio()
+        try:
+            result = apply_lead_in(path, int(delta_ms))
+        except Exception as exc:                            # noqa: BLE001
+            return '音訊沒處理成功（%s）' % exc
+        if not self.audio.load_wav(result.path):
+            return '音訊重新載入失敗'
+        return '音訊 %+d ms' % int(result.applied_ms)
 
     def measure_bpm_table_dialog(self) -> None:
         """每小節 BPM 的表。細節見 `measure_bpm_dialog`。"""
@@ -6986,19 +7062,21 @@ class MainWindow(QMainWindow):
         sig_box.setToolTip('整首的預設拍號。個別小節要變拍號請用右鍵「小節」選單。')
         vbox.addWidget(sig_box)
 
+        # 整體位移搬到 編輯 → 時間位移。那邊是唯一負責「在時間上搬東西」的
+        # 地方：量／範圍／動到哪幾層各一欄，而且動到什麼寫在畫面上。留在這裡
+        # 的話同一件事有兩個入口、說法又不一樣，而這個對話框也就不只做一件事。
+        from PyQt5.QtWidgets import QPushButton as _QPushButton
         off_box = QGroupBox('整體時間偏移')
         off_form = QFormLayout(off_box)
-        sp_off = QSpinBox()
-        sp_off.setRange(-100000, 100000)
-        sp_off.setValue(0)
-        sp_off.setSuffix(' ms')
-        sp_off.setToolTip(
-            '把整個時間軸往後（正）或往前（負）移，**小節線一起搬**。0 = 不動。\n'
-            '往後移會在最前面留下一段不屬於任何小節的空白（遊戲顯示的 BPM 取自第一小節，平移不影響它）。\n'
-            '往前移碰到 0 會夾住。\n'
-            '這是改譜面資料；只想調「播放時聽起來對不對齊」請用播放頁的偏移。'
-        )
-        off_form.addRow('整體位移（含小節線）', sp_off)
+        off_hint = QLabel(chr(10).join([
+            '移到 編輯 → 時間位移…',
+            '那邊可以選要移動音符、表情、小節線還是音訊，',
+            '也可以只移動某幾小節或選取的音符。']))
+        off_hint.setWordWrap(True)
+        off_form.addRow(off_hint)
+        go = _QPushButton('開啟時間位移…')
+        go.clicked.connect(lambda _c=False: (dlg.reject(), self.time_shift_dialog()))
+        off_form.addRow('', go)
         vbox.addWidget(off_box)
 
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -7012,7 +7090,7 @@ class MainWindow(QMainWindow):
         new_bpm = float(sp_bpm.value())
         new_num = int(sp_num.value())
         new_den = int(sp_den.value())
-        offset = int(sp_off.value())
+        offset = 0          # 整體位移搬到 編輯 → 時間位移
         changed = []
 
         if abs(new_bpm - cur_bpm) > 1e-9 and new_bpm > 0:

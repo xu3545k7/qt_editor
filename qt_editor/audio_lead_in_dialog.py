@@ -54,7 +54,9 @@ class AudioLeadInDialog(QDialog):
         form.addRow('加（＋）／減（－）', self.ms_spin)
         form.addRow('換算成拍數（BPM %.2f）' % self._bpm, self.beat_spin)
 
-        self.move_notes = QCheckBox('音符、小節線一起移（保持和音訊對齊）')
+        # 詞彙和「時間位移」統一：音符／表情（踏板·強弱）／小節線。
+        # 原本只寫「音符、小節線」，但這條路也會搬表情，標籤講得比實際少。
+        self.move_notes = QCheckBox('譜面跟著移：音符、表情、小節線（保持和音訊對齊）')
         self.move_notes.setChecked(True)
         self.move_notes.setToolTip(
             '勾選：加 500 ms 空白，所有音符、小節線、踏板也往後 500 ms，兩邊還是對齊——用來留前奏空白。\n'

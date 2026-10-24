@@ -2645,6 +2645,123 @@ class NoteModel:
         self.last_shift_ms = delta   # 實際套用的量（負值可能被夾小）
         return changed
 
+    #: `shift_time` 認得的層。詞彙統一就用這三個（＋音訊是呼叫端的事）。
+    SHIFT_LAYERS = ('notes', 'expression', 'grid')
+
+    def shift_grid_only(self, delta_ms: int) -> int:
+        """只把小節線（拍點、拍號標記、曲末）平移，音符與表情原地不動。
+
+        回傳實際套用的量。往前移會夾在 0——格線被壓成同一個時間的話小節長度
+        歸零、BPM 變成天文數字（`shift_all_time` 的註解記了這件事）。
+        """
+        delta = int(delta_ms)
+        beats = self.get_beat_entries()
+        if not delta or not beats:
+            return 0
+        if delta < 0:
+            delta = max(delta, -min(int(ms) for _i, ms in beats))
+            if delta == 0:
+                return 0
+
+        def _s(v) -> int:
+            return max(0, int(round(float(v))) + delta)
+
+        if self.root is not None:
+            br = self.root.find('beat_data')
+            if br is not None:
+                for b in br.findall('beat'):
+                    cur = _child_int(b, 'start_timing_msec')
+                    if cur is not None:
+                        _set_child_int(b, 'start_timing_msec', _s(cur))
+        jm = self.json_meta or {}
+        bt = jm.get('beat_timings')
+        if isinstance(bt, (list, tuple)) and bt:
+            jm['beat_timings'] = [_s(x) for x in bt]
+            self.json_meta = jm
+        if self.time_sig_changes:
+            self.time_sig_changes = [(_s(ms), num, den)
+                                     for (ms, num, den) in self.time_sig_changes]
+            self._sync_time_sig_changes_out()
+        self._set_music_end_ms(max(0.0, float(self.music_end_ms) + delta))
+        self._epb_mode = None       # 拍點時間變了，格式判斷重來
+        self._epb_count = None
+        self.dirty = True
+        return delta
+
+    def shift_notes_only(self, delta: Any, lo_ms: Optional[float] = None,
+                         hi_ms: Optional[float] = None) -> int:
+        """只平移音符（起點落在 `[lo_ms, hi_ms]` 內的），格線與表情不動。
+
+        `delta` 是毫秒，也可以給 `(ms) -> 毫秒` 的函式。回傳搬了幾顆。
+        """
+        def _d(ms: float) -> int:
+            return int(round(delta(ms))) if callable(delta) else int(delta)
+
+        moved = 0
+        for n in self.notes_tree:
+            start = float(n.start)
+            if lo_ms is not None and start < float(lo_ms):
+                continue
+            if hi_ms is not None and float(n.end) > float(hi_ms):
+                continue
+            shift = _d(start)
+            if not shift:
+                continue
+            length = max(1, int(n.end) - int(n.start))
+            n.start = max(0, int(n.start) + shift)
+            n.end = n.start + length
+            n.gate = length
+            for se in getattr(n, 'sub_elems', None) or []:
+                for tag in ('start_timing_msec', 'end_timing_msec'):
+                    cur = _child_int(se, tag)
+                    if cur is not None:
+                        _set_child_int(se, tag, max(0, cur + shift))
+            moved += 1
+        if moved:
+            self.dirty = True
+        return moved
+
+    def shift_time(self, delta: Any, notes: bool = True, expression: bool = True,
+                   grid: bool = False, lo_ms: Optional[float] = None,
+                   hi_ms: Optional[float] = None) -> Dict[str, int]:
+        """「時間位移」的單一基本操作：把指定的幾層在時間上搬動。
+
+        三層分別是 **音符 / 表情（踏板·強弱）/ 小節線**——整個介面都用這三個詞，
+        不要再出現「不調整音符」「保留相對位置」「吸附到新格線」這種各說各話的
+        講法。音訊是呼叫端的事（`audio_lead_in.apply_lead_in`）。
+
+        `lo_ms`/`hi_ms` 只對音符與表情有意義：**格線不能只搬一段**，那會把格線
+        撕開。呼叫端要自己擋住「範圍 ≠ 整首時勾小節線」。
+
+        三層全開而且沒有範圍限制時直接走 `shift_all_time`——那條路已經被 29 個
+        測試釘住，不要為了漂亮而繞過它。
+        """
+        if notes and expression and grid and lo_ms is None and hi_ms is None                 and not callable(delta):
+            expression_count = len(self.pedal_spans or []) + sum(
+                len(marks) for marks in (self.dynamics or {}).values())
+            moved = self.shift_all_time(int(delta))
+            applied = int(getattr(self, 'last_shift_ms', delta))
+            return {'notes': moved, 'grid': 1 if applied else 0,
+                    'expression': expression_count if applied else 0,
+                    'applied_ms': applied,
+                    'pedals_dropped': 0, 'dynamics_dropped': 0}
+        out: Dict[str, int] = {'notes': 0, 'expression': 0, 'grid': 0,
+                               'applied_ms': 0 if callable(delta) else int(delta)}
+        if grid:
+            if lo_ms is not None or hi_ms is not None:
+                raise ValueError('小節線只能整條一起搬，不能只搬一段')
+            applied = self.shift_grid_only(int(delta))
+            out['grid'] = 1 if applied else 0
+            out['applied_ms'] = applied
+        if notes:
+            out['notes'] = self.shift_notes_only(delta, lo_ms, hi_ms)
+        if expression:
+            info = self.shift_expression(delta, lo_ms, hi_ms)
+            out['expression'] = int(info.get('pedals', 0)) + int(info.get('dynamics', 0))
+            out['pedals_dropped'] = int(info.get('pedals_dropped', 0))
+            out['dynamics_dropped'] = int(info.get('dynamics_dropped', 0))
+        return out
+
     def shift_expression(self, delta: Any, lo_ms: Optional[float] = None,
                          hi_ms: Optional[float] = None) -> Dict[str, int]:
         """把踏板與強弱記號沿時間平移。**不動音符，也不動小節線。**

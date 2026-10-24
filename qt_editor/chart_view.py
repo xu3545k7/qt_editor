@@ -507,6 +507,7 @@ class ChartView(QWidget):
     resume_requested  = pyqtSignal()
     note_input_changed = pyqtSignal(bool)        # 放置模式開關
     set_measure_bpm_requested = pyqtSignal(int)  # 右鍵小節空白，傳小節編號
+    time_shift_requested = pyqtSignal()          # 打開「時間位移」對話框
     set_measure_time_sig_requested = pyqtSignal(int)
     insert_measure_requested = pyqtSignal(int)   # 在此小節前插入一個空白小節
     delete_measure_requested = pyqtSignal(int)   # 刪除此小節
@@ -611,6 +612,10 @@ class ChartView(QWidget):
         self._barline_drag_start_ms: Optional[int] = None
         self._barline_drag_orig_end_ms: Optional[int] = None
         self._barline_drag_py: Optional[int] = None
+        #: 拖曳小節線時音符要不要跟著走。預設**不跟**——和其他改格線的操作
+        #: （每小節 BPM、改拍號的均分）一致。拖的途中按住 Alt 就切成「連音符
+        #: 一起拖」，提示文字即時跟著變。
+        self._barline_drag_moves_notes: bool = False
 
         # ── 預覽模式 ──────────────────────────────────────────
         self.preview_mode: bool = False
@@ -3811,7 +3816,10 @@ class ChartView(QWidget):
                     den = self.model.time_sig_denominator
                     new_bpm = num * 4.0 * 60000.0 / (den * float(new_dur))
                     qp.setPen(TIME_LABEL)
-                    qp.drawText(6, int(self._barline_drag_py) - 6, f'{new_bpm:.2f} BPM')
+                    mode = ('連音符一起拖' if self._barline_drag_moves_notes
+                            else '只動小節線')
+                    qp.drawText(6, int(self._barline_drag_py) - 6,
+                                '%.2f BPM　%s（Alt 切換）' % (new_bpm, mode))
             except Exception:
                 pass
 
@@ -6053,6 +6061,8 @@ class ChartView(QWidget):
                             if start_ms is not None and end_ms is not None:
                                 # 開始拖曳：目標為前一小節（改變前一小節 BPM）
                                 self._barline_dragging = True
+                                self._barline_drag_moves_notes = bool(
+                                    event.modifiers() & Qt.AltModifier)
                                 self._barline_drag_measure = prev_idx
                                 self._barline_drag_start_ms = start_ms
                                 self._barline_drag_orig_end_ms = end_ms
@@ -6169,6 +6179,8 @@ class ChartView(QWidget):
 
         # 小節線拖曳 - 更新顯示位置與暫時 BPM
         if getattr(self, '_barline_dragging', False) and (event.buttons() & Qt.LeftButton):
+            # 拖的途中隨時可以切換（使用者要的是「拖的時候可以切換」）
+            self._barline_drag_moves_notes = bool(event.modifiers() & Qt.AltModifier)
             self._barline_drag_py = pos.y()
             # 計算暫時 BPM 並更新狀態欄
             try:
@@ -6296,7 +6308,16 @@ class ChartView(QWidget):
                 new_bpm = num * 4.0 * 60000.0 / (den * float(new_dur))
                 # 推入歷史並套用
                 self.model.push_history()
-                self.model.set_measure_bpm(target_idx, float(new_bpm), uniform=True)
+                grid_end_before = self.model.grid_end_ms()
+                self.model.set_measure_bpm(
+                    target_idx, float(new_bpm), uniform=True,
+                    adjust_notes=self._barline_drag_moves_notes)
+                if not self._barline_drag_moves_notes:
+                    # 只動格線時小節線會往前擠而音符沒動，尾端就空出一段沒有
+                    # 小節線的區域。和改拍號那條路同一個處置。
+                    if (grid_end_before is not None
+                            and (self.model.grid_end_ms() or 0) < grid_end_before):
+                        self.model.extend_grid_to_cover(float(grid_end_before))
                 self.rebuild_mapper()
                 self._barline_drag_py = None
                 self._barline_drag_measure = None
@@ -7173,6 +7194,12 @@ class ChartView(QWidget):
             a = sub.addAction('自訂拍數…')
             a.triggered.connect(
                 lambda checked=False, _s=sign: self._ctx_shift_custom_dialog(_s))
+
+        menu.addSeparator()
+        a = menu.addAction('時間位移…（量、範圍、動到哪幾層）')
+        a.setEnabled(True)       # 這個不需要選取：裡面可以選「整首」
+        a.setToolTip('量、套用範圍、要移動音符／表情／小節線／音訊，三件事各一欄。')
+        a.triggered.connect(lambda checked=False: self.time_shift_requested.emit())
 
     def _ctx_set_beats_dialog(self) -> None:
         """把選取音符的時長設成指定拍數（分數 / 小數雙向同步）。"""
