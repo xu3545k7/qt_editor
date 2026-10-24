@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from math import exp
 from time import perf_counter
 from statistics import median
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
+                    Tuple)
 
 
 @dataclass(frozen=True)
@@ -101,10 +102,22 @@ class SmartChartSettings:
     sequence_knee_semitones: int = 12
     sequence_wide_lanes_per_semitone: float = 0.25
     sequence_interval_weight: float = 6.0
-    # 單一修復通道的時間預算（秒），超過就收手避免卡住 UI
-    # 3 秒會讓密集譜多留 2 個順序違規；8 秒收斂到和不限時間一樣（14 個），
-    # 而且總耗時只從 10.8 增到 17 秒左右。
-    repair_time_budget_sec: float = 8.0
+    # 兩道順序修復通道的收手條件用「處理過幾組順序違規」，**不是**牆上時鐘。
+    # 時鐘會讓輸出取決於當下機器多忙：實測同一份 3425 顆的密譜連跑四次，有
+    # 133 顆（3.9%）的音符落在不同鍵道，而且會在兩個狀態之間交替。那不只是
+    # 不可重現，還讓任何 A/B 量測都帶著 ±2 個百分點的噪音——掃參數時真正
+    # 的效果會被它蓋掉。
+    #
+    # 兩個數字是照原本 8 秒預算在那首譜上實際做到的量訂的。每組違規的成本
+    # 兩個迴圈差了 20 倍，所以不能共用一個值（實測三次呼叫各自的量）：
+    #   _discrete_final_order_repair  6348~8227 組 / 18~47 輪（約 1ms/組）
+    #   _greedy_group_order_repair     356~425 組 /  1~3 輪（約 21ms/組）
+    discrete_repair_work_budget: int = 8000
+    greedy_repair_work_budget: int = 400
+    # 最後的保險（秒）。工作量上限已經把時間框住了，這個只防病態輸入把 UI
+    # 卡死，所以放得很寬。真的踩到會記進 `stats.repair_timeouts`——那一次的
+    # 輸出不可重現，不能讓它悄悄發生。
+    repair_time_budget_sec: float = 60.0
     pitch_order_projection_passes: int = 12
     edge_margin: int = 1
     #: 同一刻的音符可不可以在鍵道上重疊。False（預設）＝肩並肩排開，這是這個
@@ -154,6 +167,12 @@ class SmartChartSettings:
     # 用位置表現就好；跨度接近八度時位置擠不下，收窄才真的解決問題。
     # 這也正好是他自己手寫譜的形狀（k=3 各跨度收窄率 12%/28%/33%/13%，峰值 7~11）。
     narrow_span_min: int = 7
+    #: 同手 3 顆以上時的收窄下限。比 `narrow_span_min` 低：使用者在跨度 5~6 的
+    #: 三音組收窄率 84%，而 0~4 只有 33%（見 _hand_span_wants_narrowing）。
+    narrow_span_min_dense: int = 5
+    #: 同手**兩顆**時收窄的跨度上限（含）。兩顆的方向和三顆以上相反：收緊的、
+    #: 不收寬的，因為兩顆寬度 3 的中心距最少就是 3，小度數全部擠在一起。
+    narrow_pair_span_max: int = 6
     narrow_span_max: int = 11
     # 整組收窄的跨度帶：7~11 半音 = 不到一個八度、但也不是擠在一起的短度數
     narrow_whole_span_min: int = 7
@@ -406,6 +425,69 @@ def settings_for_style(
     return SmartChartSettings(**base)
 
 
+#: 進度回報：progress(階段, 已完成, 總數)。和 ai_transcribe 同一個慣例。
+Progress = Callable[[str, int, int], None]
+
+#: 排譜的階段。名稱是給使用者看的，所以講「在做什麼」而不是函式名稱。
+#:
+#: 每個階段帶一個權重，因為進度條要照**實際耗時**走：三輪順序修復佔掉整趟的
+#: 八成五，一條在 4/8 卡十幾秒不動的條看起來就像當掉了。
+#:
+#: 權重是實測的（3425 顆的密譜，排譜 51.6 秒，逐階段計時）：
+#:   分組與分手 0.0s／推算目標鍵道 0.4s／整體輪廓 0.4s／順序修復 14.0+15.7+14.0s
+#:   ／一致性與收窄 7.2s／收尾 0.0s
+ARRANGE_STAGES: Sequence[Tuple[str, int]] = (
+    ('分組與分手', 1),
+    ('推算目標鍵道', 1),
+    ('整體輪廓', 1),
+    ('順序修復 1/3', 27),
+    ('順序修復 2/3', 30),
+    ('順序修復 3/3', 27),
+    ('一致性與收窄', 14),
+    ('收尾檢查', 1),
+)
+ARRANGE_WORK_TOTAL = sum(weight for _name, weight in ARRANGE_STAGES)
+
+
+class _Reporter:
+    """把「第幾階段」和「階段內部的比例」換算成一條單調遞增的進度。
+
+    `progress=None` 時每個方法都是空操作，所以呼叫端不用到處寫 if。
+    """
+
+    def __init__(self, progress: Optional[Progress] = None) -> None:
+        self._progress = progress
+        self._base = 0
+        self._weight = 0
+        self._name = ''
+        self._last = -1
+
+    def stage(self, index: int) -> None:
+        self._name, self._weight = ARRANGE_STAGES[index]
+        self._base = sum(w for _n, w in ARRANGE_STAGES[:index])
+        self._send(self._base)
+
+    def part(self, lo: float, hi: float) -> Callable[[float], None]:
+        """這個階段裡的一小段，給耗時的修復通道回報內部進度用。
+
+        回傳的函式捕捉當下的階段（不是讀 self），所以先取好幾個 part 再分別
+        丟給不同通道也不會互相覆蓋。
+        """
+        base, weight, name = self._base, self._weight, self._name
+
+        def tick(fraction: float) -> None:
+            span = lo + (hi - lo) * max(0.0, min(1.0, float(fraction)))
+            self._send(base + int(round(weight * span)), name)
+
+        return tick
+
+    def _send(self, done: int, name: Optional[str] = None) -> None:
+        if self._progress is None or done == self._last:
+            return
+        self._last = done
+        self._progress(name or self._name, done, ARRANGE_WORK_TOTAL)
+
+
 @dataclass
 class SmartChartStats:
     notes: int = 0
@@ -428,6 +510,8 @@ class SmartChartStats:
     macro_trend_violations: int = 0
     top_edge_violations: int = 0
     articulation_changes: int = 0
+    #: 修復通道踩到時間保險的次數。>0 代表這次排譜不可重現。
+    repair_timeouts: int = 0
     slide_notes: int = 0
     trill_patterns: int = 0
     hold_corridor_conflicts: int = 0
@@ -2738,12 +2822,33 @@ def _hand_span_wants_narrowing(
         return False
     pitches = [_pitch(note) for note in hand_notes]
     span = max(pitches) - min(pitches)
-    if len(hand_notes) < 2:
+    count = len(hand_notes)
+    if count < 2:
         return False
-    # 兩顆和三顆以上用同一條帶子：度數短（跨度 < narrow_span_min）就不收窄，
-    # 那種靠位置表現得出來。真的排不下的情形另外由容量預算 allow_close 處理。
-    return (int(settings.narrow_span_min) <= span
-            <= int(settings.narrow_span_max))
+    # **先看幾顆、再看跨度。** 原本兩顆和三顆以上共用同一條跨度帶，實測和使用者
+    # 的 94 份譜差很遠（他的 / 排譜器）：
+    #   k=2、跨度 7~11   約 11% 的組 / 51%   ← 過度五倍，他的回報是「亂收窄」
+    #   k=3、跨度 <7     33~84%     / 0%     ← 他的回報是「低於八度完全失效」
+    #   k>=4            ~90%+      / ~93%   ← 這一段本來就對（dense_hand_threshold）
+    # 所以兩顆基本不靠跨度收窄（真的排不下由容量預算 allow_close 處理），
+    # 三顆以上則不設下限——他在跨度很小的三音組也會收窄，靠位置表現不出來。
+    if count == 2:
+        # 兩顆時收「緊」的、不收「寬」的——和三顆以上相反。使用者的 94 份譜：
+        #   k=2 跨度 0~4   23%      k=2 跨度 7~11   9%
+        # 道理在 close_chord_interval_semitones 的註解裡：兩顆寬度 3 的音符
+        # 中心距最少就是 3，所以半音到五度全部擠在同一個距離上、看不出度數
+        # 差別，收成 2 才降得到 2。跨度到了七度以上本來就排得開，不用收。
+        #
+        # 這一格原本是反的（收 7~11、不收 0~4），使用者的回報是「很多都不到
+        # 八度，結果自動超寬」——那首 I Wanna 有 46% 的音符是同手兩顆，其中
+        # 不到八度的 552 顆收窄率只有 0~1%。
+        return span <= int(settings.narrow_pair_span_max)
+    # 三顆以上的下限用 narrow_span_min_dense（5）而不是 narrow_span_min（7）。
+    # `<7` 這一箱其實分兩種（使用者的譜，k=3 的組層級收窄率）：
+    #   跨度 0~4   33%（只有 30 組，很少見）   ← 這種還是靠位置排開
+    #   跨度 5~6   84%（326 組）              ← 這種要收窄，原本的下限 7 漏掉了
+    # 所以下限降到 5，不是取消下限。
+    return int(settings.narrow_span_min_dense) <= span <= int(settings.narrow_span_max)
 
 
 def _initial_hand_widths_full(
@@ -3954,6 +4059,7 @@ def _discrete_final_order_repair(
     notes: Sequence[Any],
     groups: Sequence[Sequence[Any]],
     settings: SmartChartSettings,
+    tick: Optional[Callable[[float], None]] = None,
 ) -> int:
     """Resolve residual half-lane inversions with feasible integer moves."""
     note_group: Dict[int, Sequence[Any]] = {
@@ -4036,14 +4142,22 @@ def _discrete_final_order_repair(
         return result
 
     # 48 輪全跑完在密譜上要十幾秒，而且這是整條流程裡呼叫三次的熱點。
-    # 順序修復是收斂式的，後面幾輪本來就撿不到多少，超時就收手。
+    # 順序修復是收斂式的，後面幾輪本來就撿不到多少，做滿工作量就收手。
+    budget = max(0, int(settings.discrete_repair_work_budget))
+    spent = 0
     deadline = perf_counter() + max(0.0, float(settings.repair_time_budget_sec))
     for pass_index in range(48):
+        if pass_index and budget and spent >= budget:
+            break
         if pass_index and perf_counter() > deadline:
+            _note_repair_timeout()
             break
         violations = _violating_voice_pairs(notes, settings)
         if not violations:
             break
+        spent += len(violations)
+        if tick is not None and budget:
+            tick(spent / float(budget))
         # Dense edge chords can make two different note widths differ by half
         # a lane even though neither note has anywhere left to move.  Pitch
         # order is the hard rule, so after ordinary moves have had a chance,
@@ -4202,6 +4316,7 @@ def _greedy_group_order_repair(
     notes: Sequence[Any],
     groups: Sequence[Sequence[Any]],
     settings: SmartChartSettings,
+    tick: Optional[Callable[[float], None]] = None,
 ) -> int:
     """Move complete onset groups when local note fixes would merely oscillate."""
     note_group: Dict[int, Sequence[Any]] = {
@@ -4247,13 +4362,21 @@ def _greedy_group_order_repair(
     # 病態輸入下會跑滿 256 輪、單曲多花數十秒。加上時間預算讓它在收斂
     # 不了時提早收手 —— 剩下的違規交給後面的通道處理。
     tabu = set()
+    budget = max(0, int(settings.greedy_repair_work_budget))
+    spent = 0
     deadline = perf_counter() + max(0.0, float(settings.repair_time_budget_sec))
-    for _ in range(256):
-        if perf_counter() > deadline:
+    for round_index in range(256):
+        if round_index and budget and spent >= budget:
+            break
+        if round_index and perf_counter() > deadline:
+            _note_repair_timeout()
             break
         violations = _violating_voice_pairs(notes, settings)
         if not violations:
             break
+        spent += len(violations)
+        if tick is not None and budget:
+            tick(spent / float(budget))
         current_score = score()
         best: Optional[
             Tuple[Tuple[int, float], Sequence[Any], int, Tuple[str, int]]
@@ -4392,6 +4515,16 @@ def _greedy_group_order_repair(
         tabu.add((target_key, delta))
         repairs += 1
     return repairs
+
+
+#: 修復通道踩到時間保險的次數。那兩道通道只拿得到 notes/groups/settings，
+#: 所以和 _ALLOW_OVERLAP 一樣走模組變數，由 arrange_midi_notes 歸零與收集。
+_REPAIR_TIMEOUTS = 0
+
+
+def _note_repair_timeout() -> None:
+    global _REPAIR_TIMEOUTS
+    _REPAIR_TIMEOUTS += 1
 
 
 #: 允許和絃鍵道重疊時，所有「這樣擺會不會重疊」的守門都要放行。那些守門散在
@@ -4896,6 +5029,75 @@ def _shift_notes(
     return True
 
 
+def _widen_notes_with_free_room(
+    notes: Sequence[Any],
+    groups: Sequence[Sequence[Any]],
+    settings: SmartChartSettings,
+) -> int:
+    """最後一道：把「左右其實都空著」的收窄音符往低音側加寬回正常寬度。
+
+    使用者的原話是「偶發沒有必要縮寬度的被縮寬度（左右都有空間阿?）」。實測
+    3426 顆的譜，排譜器收窄 196 顆，其中 **57 顆兩側都空著**。
+
+    為什麼獨立一道、而且排在最後：`_restore_unneeded_narrowing` 在中段，還原
+    一顆會改變版面、後面十幾道通道又去收窄別的，所以在那裡放寬條件實測是平手
+    （2→3 少 13 顆、3→2 多 13 顆）。這一道跑在所有搬動與收窄之後，看到的是
+    最終版面。
+
+    只往低音側加寬：右緣 `max_key` 是排序與視覺的權威，不動它就不會翻掉任何
+    順序結論。兩側都要空著才動——只有一側空的留給 `_restore_unneeded_narrowing`
+    判斷，實測放行只有右側的會變差。
+
+    實測效果（對照使用者定稿）：寬度相同 97.4% → 98.5%（他得手動加寬的從 77
+    顆降到 30 顆），鍵道差 ≤1 格 77.8% → 78.1%、≤2 格 92.2% → 92.5%。
+
+    **注意**：這只修「原地加寬就對了」的那一類。那 57 顆裡有 35 顆使用者是
+    加寬**同時把鍵道搬走**，那些的真正問題是位置不對、收窄只是症狀，不在這
+    一道的能力範圍內。
+    """
+    target = max(1, int(settings.normal_width))
+    activity = _build_hold_activity(groups, settings)
+    lane_hi = int(settings.total_lanes) - 1
+    widened = 0
+    for group in groups:
+        # 刻意收窄的那些不要還原。「度數不到八度就收窄」正好常常兩側有空間
+        # （收窄是為了**表現度數**，不是因為擠不下），所以只看「有沒有空間」
+        # 會把它們全部加寬回去——實測跨度 7~11 半音的收窄率從 52% 崩到 13%，
+        # 使用者的回報是「低於八度的度數收窄完全失效」。
+        deliberate = set()
+        by_hand: Dict[int, List[Any]] = {}
+        for note in group:
+            by_hand.setdefault(int(getattr(note, "hand", 0)), []).append(note)
+        for hand_notes in by_hand.values():
+            # 只保護「真的塞不下」的那種（同手 4 音以上＝容量問題）。三音組的
+            # 收窄是取捨而不是必要：使用者的 k=3 組有一半一顆都不收，差別就在
+            # 有沒有空間，所以讓它可以被這道通道還原。
+            if len(hand_notes) >= max(2, int(settings.dense_hand_threshold)):
+                deliberate.update(id(n) for n in hand_notes)
+        for note in group:
+            if id(note) in deliberate:
+                continue
+            low, high = int(note.min_key), int(note.max_key)
+            if high - low + 1 >= target or low <= 0 or high + 1 > lane_hi:
+                continue
+            busy = set()
+            for other in group:
+                if other is note:
+                    continue
+                busy.update(range(int(other.min_key), int(other.max_key) + 1))
+            # 兩側都空：低音側是要用的，高音側空著代表它不是被右邊擠窄的
+            if (low - 1) in busy or (high + 1) in busy:
+                continue
+            if not _range_avoids_hold(notes, group, note, activity, low - 1, high):
+                continue
+            note.min_key = low - 1
+            if _group_overlaps(group) or _pitch_order_violations(group):
+                note.min_key = low
+                continue
+            widened += 1
+    return widened
+
+
 def _clamp_note_widths(
     notes: Sequence[Any],
     settings: SmartChartSettings,
@@ -4958,6 +5160,20 @@ def _restore_unneeded_narrowing(
                 # 其餘（例如三顆擠在 4 個半音內）中途被修復通道收掉的寬度
                 # 仍然要還原——手寫譜在那一段的收窄率只有 12%，放著不管會
                 # 變成 75%。
+                #
+                # 實測過改成「跨度在帶子內**且真的擠不下**才否決」：一致率
+                # 97.4% 沒變（2→3 少 13 顆、3→2 多 13 顆）。
+                #
+                # **「有空間卻被收窄」不要在寬度這一層修。**使用者反映過
+                # 「偶發沒有必要縮寬度的被縮寬度（左右都有空間阿?）」，實測
+                # 3426 顆的譜確實有 57 顆兩側都空著。但去看他最後怎麼處理那
+                # 57 顆：**35 顆是加寬同時把鍵道搬走**，只有 11 顆是原地加寬、
+                # 10 顆他也維持 2 格。也就是那些音符真正的問題是位置不對，
+                # 收窄只是症狀。
+                #
+                # 「兩側都空就往低音側加寬」改由最後一道
+                # `_widen_notes_with_free_room` 處理——在這一層放寬會被後面
+                # 十幾道通道重新收窄掉。
                 continue
             for note in hand_notes:
                 while int(note.max_key) - int(note.min_key) + 1 < target:
@@ -4968,6 +5184,10 @@ def _restore_unneeded_narrowing(
                     # 一律往左（低音側）加寬：右緣 max_key 是排序與視覺的
                     # 權威，2→3 如果往右長，那條線就跟著跑掉了。左邊卡住就
                     # 維持寬度 2，不改右緣。
+                    #
+                    # 實測過放行右側（26 顆只有右邊有空間）：和使用者定稿的
+                    # 寬度一致率 97.4% → 97.3%，2→3 少 4 顆但 3→2 多 9 顆。
+                    # 保守是對的，不要再試。
                     for new_low, new_high in ((low - 1, high),):
                         if new_low < 0 or new_high > lane_hi:
                             continue
@@ -6147,18 +6367,26 @@ def _pitch_order_violations(group: Sequence[Any]) -> int:
 def arrange_midi_notes(
     notes: Iterable[Any],
     settings: SmartChartSettings | None = None,
+    progress: Optional[Progress] = None,
 ) -> SmartChartStats:
-    """Arrange MIDI-backed notes in place without removing or retiming them."""
+    """Arrange MIDI-backed notes in place without removing or retiming them.
+
+    `progress` 給的話會照 `ARRANGE_STAGES` 逐段回報（見 `_Reporter`）。整趟在
+    密譜上要一分多鐘，沒有回報的話介面只能轉圈、看不出走到哪裡。
+    """
     config = settings or SmartChartSettings()
+    report = _Reporter(progress)
     note_list = list(notes)
-    global _ALLOW_OVERLAP
+    global _ALLOW_OVERLAP, _REPAIR_TIMEOUTS
     _ALLOW_OVERLAP = bool(getattr(config, 'allow_chord_overlap', False))
+    _REPAIR_TIMEOUTS = 0
     _clear_cluster_cache()
     stats = SmartChartStats(notes=len(note_list))
     if not note_list:
         return stats
     _prime_pitch_cache(note_list)
 
+    report.stage(0)
     groups = _clusters(note_list, config.onset_tolerance_ms)
     stats.groups = len(groups)
     stats.hand_changes = _assign_hands(note_list, groups, config)
@@ -6175,6 +6403,7 @@ def arrange_midi_notes(
             stats.slide_notes,
             stats.trill_patterns,
         ) = _classify_articulations(note_list, config)
+    report.stage(1)
     desired = _local_pitch_maps(note_list, groups, config)
     stats.block_layouts = _apply_block_layout(note_list, groups, desired, config)
     stats.motif_reuses = _apply_motif_memory(groups, desired, config)
@@ -6184,6 +6413,7 @@ def arrange_midi_notes(
         stats.context_compressed_groups,
         stats.global_edge_anchored_groups,
     ) = _optimize_group_shifts(note_list, groups, desired, config)
+    report.stage(2)
     stats.macro_adjusted_groups = _apply_macro_group_contours(
         groups, desired, config
     )
@@ -6240,14 +6470,15 @@ def arrange_midi_notes(
 
         stats.unresolved_overlaps += _group_overlaps(group)
 
+    report.stage(3)
     stats.nearby_order_repairs += _repair_final_nearby_pitch_order(
         note_list, groups, config
     )
     stats.nearby_order_repairs += _discrete_final_order_repair(
-        note_list, groups, config
+        note_list, groups, config, tick=report.part(0.1, 0.55)
     )
     stats.nearby_order_repairs += _greedy_group_order_repair(
-        note_list, groups, config
+        note_list, groups, config, tick=report.part(0.55, 0.95)
     )
     stats.nearby_order_repairs += _repair_top_edge_order(
         note_list, groups, config
@@ -6262,6 +6493,7 @@ def arrange_midi_notes(
         stats.nearby_order_repairs += repaired
         if not repaired:
             break
+    report.stage(4)
     stats.nearby_order_repairs += _repair_sustain_directionally(
         note_list, groups, config
     )
@@ -6275,10 +6507,10 @@ def arrange_midi_notes(
     # but an inversion that was blocked by the original chord boundaries may
     # become movable afterward. Give the hard local constraint one final pass.
     stats.nearby_order_repairs += _discrete_final_order_repair(
-        note_list, groups, config
+        note_list, groups, config, tick=report.part(0.1, 0.5)
     )
     stats.nearby_order_repairs += _greedy_group_order_repair(
-        note_list, groups, config
+        note_list, groups, config, tick=report.part(0.5, 0.9)
     )
     # The top-note right edge is the final visual authority.
     stats.nearby_order_repairs += _repair_top_edge_order(
@@ -6302,15 +6534,16 @@ def arrange_midi_notes(
     stats.small_interval_restores += _repair_small_interval_distinction(
         note_list, groups, config
     )
+    report.stage(5)
     # Movement-based small-interval recovery may propagate a chromatic run
     # into a neighbouring voice. Restore the hard pitch order while keeping
     # every candidate outside active hold corridors, then use width only for
     # any final small interval that has no free lane.
     stats.nearby_order_repairs += _discrete_final_order_repair(
-        note_list, groups, config
+        note_list, groups, config, tick=report.part(0.1, 0.5)
     )
     stats.nearby_order_repairs += _greedy_group_order_repair(
-        note_list, groups, config
+        note_list, groups, config, tick=report.part(0.5, 0.9)
     )
     stats.nearby_order_repairs += _repair_hold_corridors(
         note_list, groups, config
@@ -6325,6 +6558,7 @@ def arrange_midi_notes(
     # 步進量其實是寬鬆的（實測 50.7% 不符合固定比例），硬套反而會把音符
     # 從正確的縱向間距上推開。步進比例修復保留在 _repair_top_edge_proportion，
     # 需要時再接回流程。
+    report.stage(6)
     stats.pitch_consistency_moves = _repair_pitch_position_consistency(
         note_list, groups, config
     )
@@ -6404,6 +6638,12 @@ def arrange_midi_notes(
         )
     # 寬度的不變量收尾：只收左緣，右緣（排序權威）不動，所以不會推翻上面任何
     # 一道的結論。
+    report.stage(7)
+    # 最後一道寬度修正：這裡看到的是最終版面，「左右都空著卻只有 2 格」在這裡
+    # 判斷才算得準（見 _widen_notes_with_free_room）。
+    stats.width_restored_notes += _widen_notes_with_free_room(
+        note_list, groups, config
+    )
     stats.width_clamped_notes = _clamp_note_widths(note_list, config)
     stats.width_two_notes = sum(
         int(note.max_key) - int(note.min_key) + 1 == 2 for note in note_list
@@ -6427,6 +6667,7 @@ def arrange_midi_notes(
     stats.small_interval_unresolved = _small_interval_unresolved(
         note_list, config
     )
+    stats.repair_timeouts = _REPAIR_TIMEOUTS
     _clear_cluster_cache()
     _prime_pitch_cache(note_list, False)
     return stats

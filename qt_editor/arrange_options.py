@@ -247,10 +247,13 @@ def flat_layout(notes: Iterable[Any], lane_lo: int = 0,
 
 def arrange_notes(notes: Iterable[Any], options: ArrangeOptions,
                   beat_ms: float = 500.0,
-                  classify_articulations: bool = True) -> Tuple[Any, ArrangeOptions]:
+                  classify_articulations: bool = True,
+                  progress=None) -> Tuple[Any, ArrangeOptions]:
     """照選項排一批音符（就地修改）。回傳 (統計, 正規化後的選項)。
 
     直接平攤沒有統計可言，回傳 None。
+
+    `progress` 是 `smart_chart.Progress`（階段, 已完成, 總數），原封轉下去。
     """
     opt = options.normalised()
     note_list = list(notes)
@@ -261,6 +264,7 @@ def arrange_notes(notes: Iterable[Any], options: ArrangeOptions,
         note_list,
         opt.build_settings(beat_ms=beat_ms,
                            classify_articulations=classify_articulations),
+        progress=progress,
     )
     shift_notes_into_range(note_list, opt.lane_lo)
     return stats, opt

@@ -3941,13 +3941,16 @@ class NoteModel:
         return beat_entries
 
     def load_midi(self, path: str, auto_arrange: bool = True,
-                  arrange_options=None) -> None:
+                  arrange_options=None, progress=None) -> None:
         """載入 MIDI。
 
         `auto_arrange=False` 時只匯入音符、不做自動排譜，維持 MIDI 編輯模式。
         `arrange_options` 給的話（見 `arrange_options.ArrangeOptions`）就照那份
         選項轉譜——模式、鍵道範圍、和絃重疊、自訂參數都在裡面；沒給就照偏好
         設定裡記住的風格。
+
+        `progress` 是 `smart_chart.Progress`（階段, 已完成, 總數）。匯入一份密譜
+        的排譜要五十幾秒，介面要靠它顯示走到哪一個階段。
         """
         if mido is None:
             raise RuntimeError('mido is not available.')
@@ -4173,12 +4176,16 @@ class NoteModel:
         if auto_arrange:
             # 踏板殘響造成的長音先裁掉，再排版 —— 否則那些過長的長條會佔住
             # 走廊，把後面的排版空間吃光。
+            if progress is not None:
+                progress('裁掉踏板殘響', 0, 1)
             self._provisional_hands_for_trim()
             self.trim_pedal_sustained_holds()
             if arrange_options is not None:
-                self.last_smart_chart_stats = self.arrange_with_options(arrange_options)
+                self.last_smart_chart_stats = self.arrange_with_options(
+                    arrange_options, progress=progress)
             else:
-                self.last_smart_chart_stats = self.smart_arrange_midi()
+                self.last_smart_chart_stats = self.smart_arrange_midi(
+                    progress=progress)
             # 排完再裁一次。上面那一次跑在分手之前——單軌來源（AI 音訊轉譜就是）
             # 那時候整份都是同一隻手，`_trim_to_same_hand_next_onset` 的第一道
             # 閘門會擋掉，Tap 的踏板長度就留了下來（實測那份 AI 譜 571 顆「類型
@@ -4779,16 +4786,20 @@ class NoteModel:
             n.min_key = max(0, min(TOTAL_GAME_KEYS - 3, centre))
             n.max_key = n.min_key + 2
 
-    def arrange_with_options(self, options):
+    def arrange_with_options(self, options, progress=None):
         """照「MIDI 轉譜」對話框給的選項轉譜（模式／鍵道範圍／和絃重疊／自訂）。
 
         直接平攤沒有統計，回傳 None；其餘回傳 SmartChartStats。兩種都會把譜面
         標成排過了（`midi_unarranged = False`），其他檢視模式才解得開。
+
+        `progress` 是 `smart_chart.Progress`：排譜在密譜上要一分多鐘，介面靠它
+        才顯示得出走到哪一個階段。
         """
         from .arrange_options import arrange_notes
 
         beat_ms = 60_000.0 / max(1.0, float(self.bpm or 120.0))
-        stats, opt = arrange_notes(self.notes_tree, options, beat_ms=beat_ms)
+        stats, opt = arrange_notes(self.notes_tree, options, beat_ms=beat_ms,
+                                   progress=progress)
         self.chart_style = opt.style()
         self.midi_unarranged = False
         self.last_smart_chart_stats = stats
@@ -4796,7 +4807,7 @@ class NoteModel:
         self.dirty = True
         return stats
 
-    def smart_arrange_midi(self, style: Optional[str] = None):
+    def smart_arrange_midi(self, style: Optional[str] = None, progress=None):
         """Keep all notes while arranging lanes from MIDI pitch and timing.
 
         `style` 是轉譜風格（`smart_chart.STYLE_EATHER` / `STYLE_OFFICIAL`）。
@@ -4820,6 +4831,7 @@ class NoteModel:
             settings_for_style(
                 style, beat_ms=beat_ms, classify_articulations=True
             ),
+            progress=progress,
         )
         self.chart_style = style
         self.midi_unarranged = False        # 排過了，其他檢視方式解鎖

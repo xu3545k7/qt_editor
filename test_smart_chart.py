@@ -1,11 +1,13 @@
 import unittest
 import tempfile
+from unittest import mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import mido
 from qt_editor.models import GNote, NoteModel
 from qt_editor.midi_to_xml_converter import MIDIToXMLConverter
+from qt_editor import smart_chart
 from qt_editor.smart_chart import SmartChartSettings, arrange_midi_notes
 
 
@@ -656,11 +658,19 @@ class SmartChartTests(unittest.TestCase):
         """兩套風格是實測出來的兩種做法，不是鬆緊度的差別。
 
         官方靠「讓鍵道重疊」擠空間、只有單手同時 4 音才收窄、會自動標滑音；
-        Eather 靠「收窄」擠空間（整組跨度 8~10 半音就收）、表情記號自己標。
-        收窄帶 2026-09-18 從 7~11 縮成 8~10：原本收窄率 21.3%，他自己的譜是
-        16.1%，改完 14.3%，旋律步伐差距同時變好。
+        Eather 靠「收窄」擠空間、表情記號自己標。
         和絃內部幾何、分手上限、度數階梯表兩者共用 —— 那些是官方語料量出來
         的物理事實，手寫譜也遵守。
+
+        **收窄的判準 2026-10-23 從「只看跨度」改成「先看幾顆、再看跨度」**，
+        三顆以上的下限因此從 8 降到 5（使用者的譜在跨度 5~6 的三音組收窄率
+        84%，原本整段漏掉）。在那之前這裡斷言「跨度 7 不收窄」——那是舊帶子
+        8~11 的邊界，現在跨度 7 的三音組要收窄（實測 7~11 帶 76%）。
+
+        順帶記一下被推翻的那次調整：2026-09-18 把帶子從 7~11 縮成 8~10，理由
+        是整體收窄率 21.3% → 14.3%、接近使用者的 16.1%。但那個「整體率」是被
+        **和絃大小分布**混淆的——排譜器的 k>=4 佔 19.1%、使用者只有 4.8%，而
+        k>=4 一律收窄，所以光是分布差異就能解釋那幾個百分點。要比就要逐格比。
         """
         from qt_editor.smart_chart import (
             STYLE_EATHER, STYLE_OFFICIAL, settings_for_style,
@@ -677,7 +687,10 @@ class SmartChartTests(unittest.TestCase):
             return [n.max_key - n.min_key + 1 for n in notes[:3]]
 
         self.assertEqual(widths_for(STYLE_EATHER), [2, 2, 2])        # 跨度 8：收窄
-        self.assertEqual(widths_for(STYLE_EATHER, top=70), [3, 3, 3])  # 跨度 7：不收了
+        self.assertEqual(widths_for(STYLE_EATHER, top=70)[1:], [2, 2],
+                         '跨度 7 的三音組要收窄（實測 7~11 帶 76%）')
+        self.assertEqual(widths_for(STYLE_EATHER, top=67)[1:], [3, 3],
+                         '跨度 4 太緊，收窄也排不開（使用者只做 33%）')
         self.assertEqual(widths_for(STYLE_OFFICIAL), [3, 3, 3])
 
         def slides_for(style):
@@ -944,15 +957,48 @@ class InsufficientDegreeNarrowingTests(unittest.TestCase):
         self.assertTrue(wants([60, 65, 71]), '跨度 11')
         self.assertFalse(wants([60, 67, 74]), '跨度 14：本來就放得下')
 
-    def test_two_note_hands_use_the_same_band(self):
-        """兩顆和三顆以上走同一條帶子——度數短就不收窄，靠位置表現。"""
+    def test_two_note_hands_go_the_other_way(self):
+        """兩顆的方向和三顆以上**相反**：收緊的、不收寬的。
+
+        實測使用者的 94 份譜（同手兩顆的逐音符收窄率）：
+            跨度 0~4   23%      跨度 7~11   9%      跨度 12+   2%
+        道理在 `close_chord_interval_semitones` 的註解：兩顆寬度 3 的中心距
+        最少就是 3，所以半音到五度全部擠在同一個距離上、看不出度數差別。
+        跨度到七度以上本來就排得開。
+
+        原本兩顆和三顆共用一條 8~11 的帶子，使用者的回報是「很多都不到八度，
+        結果自動超寬」（那首 I Wanna 有 46% 的音符是同手兩顆）。
+        """
         from qt_editor.smart_chart import _hand_span_wants_narrowing
         settings = SmartChartSettings()
         pair = lambda a, b: [note(0, a, index=0), note(0, b, index=1)]
-        self.assertTrue(_hand_span_wants_narrowing(pair(60, 67), settings))
-        self.assertFalse(_hand_span_wants_narrowing(pair(60, 62), settings),
-                         '跨度 2：太短，不收窄')
+        self.assertTrue(_hand_span_wants_narrowing(pair(60, 62), settings),
+                        '跨度 2：兩顆時要收窄（中心距才降得到 2）')
+        self.assertTrue(_hand_span_wants_narrowing(pair(60, 66), settings),
+                        '跨度 6：還在範圍內')
+        self.assertFalse(_hand_span_wants_narrowing(pair(60, 67), settings),
+                         '跨度 7：兩顆時已經排得開，不收窄')
         self.assertFalse(_hand_span_wants_narrowing(pair(60, 74), settings),
+                         '跨度 14：本來就放得下')
+
+    def test_three_note_hands_narrow_from_five_semitones(self):
+        """三顆以上的下限是 5，不是 8。
+
+        使用者的譜，k=3 的組層級收窄率：
+            跨度 0~4   33%（只有 30 組）   跨度 5~6   84%（326 組）
+            跨度 7~11  76%                跨度 12+   19%
+        原本下限 8 把 5~6 那一段漏掉了，使用者的回報是「低於八度的度數收窄
+        完全失效」。
+        """
+        from qt_editor.smart_chart import _hand_span_wants_narrowing
+        settings = SmartChartSettings()
+        trio = lambda a, b, c: [note(0, a, index=0), note(0, b, index=1),
+                                note(0, c, index=2)]
+        self.assertTrue(_hand_span_wants_narrowing(trio(60, 63, 65), settings),
+                        '跨度 5：三顆時要收窄')
+        self.assertFalse(_hand_span_wants_narrowing(trio(60, 62, 64), settings),
+                         '跨度 4：太緊，靠位置排不開也沒用（使用者只做 33%）')
+        self.assertFalse(_hand_span_wants_narrowing(trio(60, 67, 74), settings),
                          '跨度 14：本來就放得下')
 
     def test_a_single_note_never_triggers_it(self):
@@ -1026,10 +1072,21 @@ class InsufficientDegreeNarrowingTests(unittest.TestCase):
             self.assertLess(int(n.max_key), settings.total_lanes)
 
     def test_the_band_is_configurable(self):
+        """三顆以上看 narrow_span_min_dense ~ narrow_span_max。"""
         from qt_editor.smart_chart import _hand_span_wants_narrowing
-        wide = SmartChartSettings(narrow_span_min=0, narrow_span_max=99)
-        self.assertTrue(_hand_span_wants_narrowing(
-            [note(0, p, index=i) for i, p in enumerate((60, 62, 64))], wide))
+        trio = [note(0, p, index=i) for i, p in enumerate((60, 62, 64))]
+        wide = SmartChartSettings(narrow_span_min_dense=0, narrow_span_max=99)
+        self.assertTrue(_hand_span_wants_narrowing(trio, wide))
+        shut = SmartChartSettings(narrow_span_min_dense=99, narrow_span_max=0)
+        self.assertFalse(_hand_span_wants_narrowing(trio, shut),
+                         '官方風格就是這樣關掉跨度收窄的（min > max）')
+
+    def test_the_pair_band_is_configurable(self):
+        from qt_editor.smart_chart import _hand_span_wants_narrowing
+        pair = [note(0, 60, index=0), note(0, 62, index=1)]
+        self.assertFalse(_hand_span_wants_narrowing(
+            pair, SmartChartSettings(narrow_pair_span_max=-1)),
+            '設成負的就是兩顆完全不靠跨度收窄')
 
 
 class HoldTailSequentialGapTests(unittest.TestCase):
@@ -1126,3 +1183,218 @@ class HoldTailSequentialGapTests(unittest.TestCase):
         self.assertEqual(m.resolve_hold_tail_overlaps(40), 0)
         m2 = self.chart(spec)
         self.assertEqual(m2.resolve_hold_tail_overlaps(40, max_ring_notes=3), 1)
+
+
+class DeterminismTests(unittest.TestCase):
+    """同樣的輸入必須排出同樣的譜。
+
+    兩道順序修復通道本來用 `perf_counter()` 的牆上時鐘當收手條件，所以跑幾輪
+    取決於當下機器多忙。實測一首 3425 顆的密譜連跑四次，有 133 顆（3.9%）的
+    音符落在不同鍵道，而且在兩個狀態之間交替。那不只是不可重現——它讓任何
+    調參的 A/B 量測都帶著 ±2 個百分點的噪音（同一個一致率量測在 56.1~58.1%
+    之間跳動），真正的效果會被噪音蓋掉。改成以「處理過幾組順序違規」收手。
+    """
+
+    def _dense(self):
+        """會真的讓修復通道做事的譜：兩手各三顆同時、音程擠在一起。
+
+        實測這 384 顆會產生 3000 次以上的修復，壓低工作量上限會改變 150 顆
+        以上的鍵道——也就是這份譜量得到收手條件的效果。
+        """
+        notes, index = [], 0
+        for bar in range(8):
+            for step in range(8):
+                when = bar * 480 + step * 60
+                for k in range(3):
+                    notes.append(lane_note(when, 70 + k * 2 + step % 3, 16 + k,
+                                           hand=0, track=0, index=index))
+                    index += 1
+                    notes.append(lane_note(when, 44 + k * 2 + step % 3, 4 + k,
+                                           hand=1, track=1, index=index))
+                    index += 1
+        return notes
+
+    def _arrange(self, clock_step=None, **overrides):
+        notes = self._dense()
+        settings = SmartChartSettings(**overrides)
+        if clock_step is None:
+            stats = arrange_midi_notes(notes, settings)
+        else:
+            # 假時鐘：每次問時間就跳 clock_step 秒，等於模擬一台慢得離譜的機器
+            state = {'now': 0.0}
+
+            def clock():
+                state['now'] += clock_step
+                return state['now']
+
+            with mock.patch.object(smart_chart, 'perf_counter', clock):
+                stats = arrange_midi_notes(notes, settings)
+        return [(n.start, n.pitch, n.min_key, n.max_key, n.hand) for n in notes], stats
+
+    def test_the_same_input_arranges_the_same_way(self):
+        first, _ = self._arrange()
+        for attempt in range(2):
+            again, _ = self._arrange()
+            self.assertEqual(again, first, '第 %d 次排出來不一樣' % (attempt + 2))
+
+    def test_a_slow_machine_does_not_change_the_result(self):
+        """這條就是壞掉過的不變量：輸出不能取決於機器多快。
+
+        假時鐘每次跳 1 秒，等於整個排譜「花掉」幾十秒。舊版的 8 秒預算在這個
+        速度下第 8 輪就會收手、排出不同的譜；現在必須一顆都不差。
+        """
+        fast, _ = self._arrange()
+        slow, stats = self._arrange(clock_step=1.0)
+        self.assertEqual(slow, fast, '時鐘走得快就排出不同的譜')
+        self.assertEqual(stats.repair_timeouts, 0)
+
+    def test_the_work_budget_is_what_stops_the_repair(self):
+        loose, _ = self._arrange()
+        tight, _ = self._arrange(discrete_repair_work_budget=1,
+                                 greedy_repair_work_budget=1)
+        changed = sum(1 for x, y in zip(loose, tight) if x != y)
+        self.assertGreater(changed, 50, '壓低工作量上限應該明顯改變結果')
+        again, _ = self._arrange(discrete_repair_work_budget=1,
+                                 greedy_repair_work_budget=1)
+        self.assertEqual(again, tight, '壓低上限之後仍然要可重現')
+
+    def test_the_clock_is_only_a_safety_net_and_leaves_a_trace(self):
+        """保險踩到就要記下來——那一次的輸出不可重現，不能悄悄發生。"""
+        _lanes, stats = self._arrange()
+        self.assertEqual(stats.repair_timeouts, 0, '正常的譜不該踩到時間保險')
+        _lanes, stats = self._arrange(clock_step=5.0)
+        self.assertGreater(stats.repair_timeouts, 0, '踩到了卻沒記錄')
+
+
+class ProgressReportTests(unittest.TestCase):
+    """排譜要回報進度。
+
+    密譜上排一次要五十幾秒（三輪順序修復佔掉其中 85%），介面原本只有一個不定量
+    的轉圈，使用者看不出走到哪裡、也不知道還要多久。所以分成有名字的階段，
+    而且階段權重照實測耗時配——每段等寬的話進度條會在「順序修復 1/3」卡十幾秒。
+    """
+
+    def _chart(self):
+        notes, index = [], 0
+        for bar in range(4):
+            for step in range(8):
+                when = bar * 480 + step * 60
+                for k in range(2):
+                    notes.append(lane_note(when, 70 + k * 3 + step % 3, 16 + k * 2,
+                                           hand=0, track=0, index=index))
+                    index += 1
+                    notes.append(lane_note(when, 44 + k * 3 + step % 3, 4 + k * 2,
+                                           hand=1, track=1, index=index))
+                    index += 1
+        return notes
+
+    def _collect(self):
+        seen = []
+        arrange_midi_notes(self._chart(), SmartChartSettings(),
+                           progress=lambda stage, done, total: seen.append(
+                               (stage, done, total)))
+        return seen
+
+    def test_every_stage_reports(self):
+        names = [stage for stage, _d, _t in self._collect()]
+        for stage, _weight in smart_chart.ARRANGE_STAGES:
+            self.assertIn(stage, names, '沒有回報「%s」' % stage)
+
+    def test_the_stages_arrive_in_order(self):
+        order = {stage: i for i, (stage, _w) in enumerate(smart_chart.ARRANGE_STAGES)}
+        seen = [order[stage] for stage, _d, _t in self._collect()]
+        self.assertEqual(seen, sorted(seen), '階段回報的順序亂了')
+
+    def test_progress_never_goes_backwards(self):
+        done = [d for _s, d, _t in self._collect()]
+        self.assertEqual(done, sorted(done), '進度倒退了')
+        self.assertGreater(len(done), len(smart_chart.ARRANGE_STAGES),
+                           '耗時的階段要回報內部進度，不能只在階段開頭報一次')
+
+    def test_the_total_is_the_sum_of_the_weights(self):
+        totals = {t for _s, _d, t in self._collect()}
+        self.assertEqual(totals, {smart_chart.ARRANGE_WORK_TOTAL})
+        self.assertEqual(smart_chart.ARRANGE_WORK_TOTAL,
+                         sum(w for _n, w in smart_chart.ARRANGE_STAGES))
+
+    def test_the_repair_stages_carry_most_of_the_weight(self):
+        """實測三輪修復佔 85% 的時間，權重要跟著，不然進度條會騙人。"""
+        repair = sum(w for name, w in smart_chart.ARRANGE_STAGES
+                     if name.startswith('順序修復'))
+        self.assertGreater(repair / float(smart_chart.ARRANGE_WORK_TOTAL), 0.7)
+
+    def test_without_a_callback_nothing_breaks(self):
+        notes = self._chart()
+        lanes = [n.min_key for n in notes]
+        arrange_midi_notes(notes, SmartChartSettings())
+        self.assertEqual(len(lanes), len(notes))
+
+
+class FreeRoomWideningTests(unittest.TestCase):
+    """「左右都有空間卻被收窄」要還原。
+
+    使用者：「偶發沒有必要縮寬度的被縮寬度（左右都有空間阿?）」。實測 3426 顆的
+    譜，排譜器收窄 196 顆，其中 57 顆兩側都空著。加上這一道之後：寬度和定稿
+    相同 97.5% → 98.5%（他得手動加寬的從 76 顆降到 30 顆），鍵道差 ≤1 格
+    77.8% → 78.1%、平均誤差 0.801 → 0.791，沒有任何一項變差。
+
+    為什麼排在最後而不是放寬 `_restore_unneeded_narrowing`：在中段放寬會被後面
+    十幾道通道重新收窄，實測是平手（2→3 少 13 顆、3→2 多 13 顆）。
+    """
+
+    def _widen(self, notes):
+        settings = SmartChartSettings()
+        groups = smart_chart._clusters(notes, settings.onset_tolerance_ms)
+        return smart_chart._widen_notes_with_free_room(notes, groups, settings)
+
+    def _narrow(self, note, low):
+        note.min_key, note.max_key = low, low + 1
+        return note
+
+    def test_a_lone_narrow_note_with_room_is_widened(self):
+        n = self._narrow(note(0, 72, hand=0), 15)
+        self.assertEqual(self._widen([n]), 1)
+        self.assertEqual((n.min_key, n.max_key), (14, 16))
+
+    def test_it_grows_to_the_low_side_so_the_right_edge_never_moves(self):
+        """右緣 max_key 是排序與視覺的權威，加寬不能動到它。"""
+        n = self._narrow(note(0, 72, hand=0), 15)
+        before = n.max_key
+        self._widen([n])
+        self.assertEqual(n.max_key, before)
+
+    def test_a_blocked_low_side_is_left_alone(self):
+        other = note(0, 66, hand=0)
+        other.min_key, other.max_key = 12, 14
+        n = self._narrow(note(0, 72, hand=0), 15)
+        self.assertEqual(self._widen([other, n]), 0)
+        self.assertEqual((n.min_key, n.max_key), (15, 16))
+
+    def test_a_blocked_high_side_is_left_alone_too(self):
+        """兩側都要空。只有一側空的那種實測放行會變差，留給中段那一道判斷。"""
+        other = note(0, 80, hand=0)
+        other.min_key, other.max_key = 17, 19
+        n = self._narrow(note(0, 72, hand=0), 15)
+        self.assertEqual(self._widen([other, n]), 0)
+
+    def test_the_left_wall_is_respected(self):
+        n = self._narrow(note(0, 72, hand=0), 0)
+        self.assertEqual(self._widen([n]), 0)
+        self.assertEqual((n.min_key, n.max_key), (0, 1))
+
+    def test_already_full_width_notes_are_untouched(self):
+        n = note(0, 72, hand=0)
+        n.min_key, n.max_key = 14, 16
+        self.assertEqual(self._widen([n]), 0)
+        self.assertEqual((n.min_key, n.max_key), (14, 16))
+
+    def test_widening_never_creates_an_overlap(self):
+        """整組跑完不能留下重疊——加寬壞了順序或重疊就要自己退回來。"""
+        notes = []
+        for k in range(4):
+            n = note(0, 60 + k * 4, hand=0)
+            n.min_key, n.max_key = 4 + k * 2, 5 + k * 2
+            notes.append(n)
+        self._widen(notes)
+        self.assertEqual(smart_chart._group_overlaps(notes), 0)
+        self.assertEqual(smart_chart._pitch_order_violations(notes), 0)

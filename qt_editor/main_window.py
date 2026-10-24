@@ -3411,18 +3411,26 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 '沒有轉譜：停在 MIDI 編輯模式。要轉請用 工具 → MIDI 轉譜…', 12000)
 
+        from .smart_chart import ARRANGE_STAGES, ARRANGE_WORK_TOTAL
+
         class _Worker(QThread):
             done = _sig(bool, str)
+            step = _sig(str, int, int)
 
             def run(self) -> None:
                 try:
+                    # 進度從工作執行緒出來，所以走 signal 排進主執行緒的佇列
                     model.load_midi(path, auto_arrange=auto_arrange,
-                                    arrange_options=options)
+                                    arrange_options=options,
+                                    progress=lambda stage, done, total:
+                                        self.step.emit(stage, int(done), int(total)))
                     self.done.emit(True, '')
                 except Exception as exc:            # noqa: BLE001
                     self.done.emit(False, str(exc))
 
-        outcome: Dict[str, Any] = {'finished': False, 'ok': False, 'err': ''}
+        outcome: Dict[str, Any] = {'finished': False, 'ok': False, 'err': '',
+                                   'stage': '', 'done': 0,
+                                   'total': ARRANGE_WORK_TOTAL}
 
         def _finished(ok: bool, err: str) -> None:
             outcome['finished'] = True
@@ -3431,10 +3439,14 @@ class MainWindow(QMainWindow):
 
         worker = _Worker(self)
         worker.done.connect(_finished)
+        worker.step.connect(
+            lambda stage, done, total: outcome.update(stage=stage, done=done,
+                                                      total=total or 1)
+        )
 
         dlg = QProgressDialog(
             t('dlg_midi_converting', os.path.basename(path)),
-            t('dlg_cancel'), 0, 0, self,
+            t('dlg_cancel'), 0, ARRANGE_WORK_TOTAL, self,
         )
         dlg.setWindowTitle(t('dlg_midi_converting_title'))
         dlg.setWindowModality(Qt.WindowModal)
@@ -3447,13 +3459,22 @@ class MainWindow(QMainWindow):
         started = time.monotonic()
         base_label = dlg.labelText()
         worker.start()
+        stage_no = {stage: i + 1 for i, (stage, _w) in enumerate(ARRANGE_STAGES)}
         while worker.isRunning():
             QApplication.processEvents()
             if not cancelled:
+                # 「3/8 推算目標鍵道」——排譜在密譜上要五十幾秒，光看轉圈和
+                # 秒數不知道還剩幾步。進度條本身照實測耗時加權（見 ARRANGE_STAGES）。
+                stage = outcome['stage']
+                step = stage_no.get(stage)
+                head = ('%d/%d ' % (step, len(ARRANGE_STAGES))) if step else ''
                 dlg.setLabelText(
-                    '%s  |  %s' % (base_label,
-                              t('dlg_elapsed', int(time.monotonic() - started)))
+                    '%s  |  %s\n%s%s' % (base_label,
+                              t('dlg_elapsed', int(time.monotonic() - started)),
+                              head, stage)
                 )
+                dlg.setMaximum(outcome['total'])
+                dlg.setValue(min(outcome['done'], outcome['total']))
             if not cancelled and dlg.wasCanceled():
                 # 排譜無法中斷，只能等它跑完再丟棄結果
                 cancelled = True
@@ -5202,8 +5223,11 @@ class MainWindow(QMainWindow):
         # 誤觸的代價太高。
         model.push_history()
 
+        from .smart_chart import ARRANGE_STAGES, ARRANGE_WORK_TOTAL
+
         class _Worker(QThread):
             done = _sig(bool, str)
+            step = _sig(str, int, int)
 
             def run(self) -> None:
                 try:
@@ -5211,32 +5235,62 @@ class MainWindow(QMainWindow):
                     # （那些長度是踏板造成的，不是真的按著），但對一份已經
                     # 排好、長押調過的譜再裁一次就是把人家的工作毀掉。
                     if trim_holds:
+                        self.step.emit('裁掉踏板殘響', 0, ARRANGE_WORK_TOTAL)
                         model.trim_pedal_sustained_holds()
-                    model.arrange_with_options(options)
+                    # 進度從工作執行緒發出來，所以走 signal 讓它排進主執行緒的
+                    # 佇列——直接碰 QProgressDialog 會從別的執行緒畫 widget。
+                    model.arrange_with_options(
+                        options,
+                        progress=lambda stage, done, total:
+                            self.step.emit(stage, int(done), int(total)),
+                    )
                     self.done.emit(True, '')
                 except Exception as exc:            # noqa: BLE001
                     self.done.emit(False, str(exc))
 
-        state = {'finished': False, 'ok': False, 'err': ''}
+        state = {'finished': False, 'ok': False, 'err': '',
+                 'stage': '', 'done': 0, 'total': ARRANGE_WORK_TOTAL}
         worker = _Worker(self)
         worker.done.connect(
             lambda ok, err: state.update(finished=True, ok=ok, err=err)
         )
+        worker.step.connect(
+            lambda stage, done, total: state.update(stage=stage, done=done,
+                                                    total=total or 1)
+        )
+        name = os.path.basename(model.current_file or '')
         dlg = QProgressDialog(
-            t('dlg_midi_converting', os.path.basename(model.current_file or '')),
-            t('dlg_cancel'), 0, 0, self,
+            t('dlg_midi_converting', name), t('dlg_cancel'),
+            0, ARRANGE_WORK_TOTAL, self,
         )
         dlg.setWindowTitle(t('dlg_midi_converting_title'))
         dlg.setWindowModality(Qt.WindowModal)
         dlg.setMinimumDuration(0)
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
+        dlg.setValue(0)
         dlg.show()
         worker.start()
+        count = len(ARRANGE_STAGES)
+        order = {stage: index + 1 for index, (stage, _w) in enumerate(ARRANGE_STAGES)}
+        shown = None
         while not state['finished']:
             QApplication.processEvents()
             if dlg.wasCanceled():
                 break
+            now = (state['stage'], state['done'])
+            if now != shown:
+                shown = now
+                stage = state['stage']
+                if stage:
+                    # 「3/8 推算目標鍵道」：階段序號讓使用者知道還剩幾步，
+                    # 進度條本身是照實測耗時加權的，不是每段等寬。
+                    step = order.get(stage)
+                    head = ('%d/%d ' % (step, count)) if step else ''
+                    dlg.setLabelText('%s\n%s%s' % (
+                        t('dlg_midi_converting', name), head, stage))
+                dlg.setMaximum(state['total'])
+                dlg.setValue(min(state['done'], state['total']))
             worker.wait(30)
         dlg.close()
         worker.wait()

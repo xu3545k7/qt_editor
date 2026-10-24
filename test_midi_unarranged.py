@@ -97,7 +97,10 @@ class ArrangeIsUndoableTests(unittest.TestCase):
         self._trim = NoteModel.trim_pedal_sustained_holds
         self._arrange = NoteModel.arrange_with_options
 
-        def fake_arrange(model, options=None):
+        # `**kwargs` 不是偷懶：`_arrange_now` 會多傳 `progress=`（進度回報），
+        # 而簽章對不上時 worker 會捕捉 TypeError、跑到 QMessageBox.warning，
+        # 那是模態視窗、測試裡沒人按，整個套件就卡死（實測從 130 秒變成 2 小時）。
+        def fake_arrange(model, options=None, **kwargs):
             for n in model.notes_tree:
                 n.min_key, n.max_key = 20, 22
             model.midi_unarranged = False
