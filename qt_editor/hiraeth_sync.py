@@ -185,6 +185,7 @@ def pull_into_library(library, hiraeth_root: str, songs: List[Dict[str, Any]],
 def sync(library_root: str, hiraeth_root: str, force: bool = False,
          progress: Progress = None, renderer=H.render_piano,
          hold_gap_ms: int = H.DEFAULT_HOLD_GAP_MS, mix_piano: bool = True,
+         keysound: bool = False,
          lead_in_bars: int = H.DEFAULT_LEAD_IN_BARS,
          library=None, pull: bool = True, category: str = 'Other') -> Dict[str, Any]:
     """兩邊互補：nos-clone 缺的從 Hiraeth 挖回來，Hiraeth 缺的（或改過的）輸出過去。
@@ -226,7 +227,8 @@ def sync(library_root: str, hiraeth_root: str, force: bool = False,
             # 本來就是從 Hiraeth 搬回來的：沿用它那邊的 package_id，改動才是「更新」
             mapped, _mark = _mark_for(plan, state, by_folder)
             plan.package_id = mapped
-            plan.mix_piano = mix_piano
+            plan.keysound = keysound
+            plan.mix_piano = mix_piano and not keysound
             plan.lead_in_bars = lead_in_bars
             result = H.build_package(plan, work, version=version, renderer=renderer,
                                      hold_gap_ms=hold_gap_ms)

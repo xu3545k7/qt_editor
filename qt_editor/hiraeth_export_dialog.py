@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from PyQt5.QtCore import QThread, QUrl, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
                              QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -67,6 +67,14 @@ class HiraethExportDialog(QDialog):
         form.addWidget(self.rb_library)
         form.addWidget(_path_row(self.library_edit, self._pick_library))
         form.addWidget(self.rb_chart)
+        # 「多難度譜面怎麼匯出」看不懂的根因：對話框完全沒顯示哪個難度會對到
+        # Hiraeth 的哪一格，而規則不直觀（名字對得上的先占位，剩下的最難那個
+        # 補 real、再補 expert，音訊不同的難度會另外成一包）。這裡直接畫出來。
+        self.layout_label = QLabel()
+        self.layout_label.setWordWrap(True)
+        self.layout_label.setTextFormat(Qt.PlainText)
+        self.layout_label.setStyleSheet('color: #555; font-size: 11px;')
+        form.addWidget(self.layout_label)
 
         self.chart_box = QWidget()
         chart_form = QFormLayout(self.chart_box)
@@ -125,6 +133,26 @@ class HiraethExportDialog(QDialog):
             '樂曲資料夾／曲庫：有 pianoAudioResourcePath 的曲子把那份鋼琴音軌疊上去。\n'
             '目前譜面：用內建音源把譜面算成鋼琴音軌再疊上去。'))
         options.addRow(tr('音樂'), self.mix_check)
+        self.keysound_check = QCheckBox(tr('保留按鍵音（velocity 不歸零）'))
+        self.keysound_check.setChecked(bool(settings.get('hiraeth_keysound', False)))
+        self.keysound_check.setToolTip(tr(
+            '讓鋼琴音由玩家敲出來，而不是從音樂檔自動播出（本家本來就是這樣）。'
+            + chr(10) + chr(10) +
+            'Hiraeth 原版的 importer 不收：它硬擋 sub_note 的 velocity 不是 0'
+            + chr(10) +
+            '（This package format requires background-only charts）。'
+            + chr(10) +
+            '要用這個模式，Hiraeth 的 tools/import_tools/importer.py 得改過'
+            + chr(10) +
+            '——和當初為了顫音改它一樣。'
+            + chr(10) + chr(10) +
+            '打開之後不會把鋼琴軌混進 music.wav（否則同一個音會聽到兩次）；'
+            + chr(10) +
+            '沒有背景音樂的曲子 music.wav 直接是靜音。'))
+        self.keysound_check.toggled.connect(
+            lambda on: self.mix_check.setEnabled(not on))
+        self.mix_check.setEnabled(not self.keysound_check.isChecked())
+        options.addRow('', self.keysound_check)
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(H.MIN_HOLD_GAP_MS, 1000)
         self.gap_spin.setSuffix(' ms')
@@ -169,6 +197,9 @@ class HiraethExportDialog(QDialog):
         layout.addWidget(buttons)
 
         self.song_edit.textChanged.connect(lambda _t: self._load_slogan())
+        # 換資料夾就重算難度分配的說明（_sync 只在切模式時跑）
+        self.song_edit.textChanged.connect(lambda _t: self._update_layout_label())
+        self.library_edit.textChanged.connect(lambda _t: self._update_layout_label())
         self.slot_combo.currentIndexChanged.connect(lambda _i: self._sync())
         self._group.buttonToggled.connect(lambda *_a: self._sync())
         if model is None:
@@ -255,6 +286,59 @@ class HiraethExportDialog(QDialog):
         self._slogan_loaded_from = song_dir
         self.slogan_edit.setText(H.read_slogan(song_dir))
 
+    def _update_layout_label(self) -> None:
+        '''把「這次會輸出成幾包、哪個難度對到哪一格」寫出來。
+
+        Hiraeth 一包只有 normal／hard／expert／real 四格，而且同一包只能有
+        **一份** music.wav。所以 `plan_song_folder` 先照 `audioResourcePath`
+        分組（音訊不同的難度一定分屬不同的包），組內再照難度名字對位，名字
+        對不上的照等級由高到低補 real → expert，還放不下的各自成一包。
+        '''
+        mode = self.mode()
+        if mode == MODE_CHART:
+            self.layout_label.setText(tr(
+                '目前開著的這一份譜 → 一包，放進上面選的那一格。'))
+            return
+        if mode == MODE_LIBRARY:
+            root = self.library_edit.text().strip()
+            if not os.path.isdir(root):
+                self.layout_label.setText(tr('選一個曲庫資料夾。'))
+                return
+            try:
+                plans, skipped = H.plan_library(root)
+            except Exception as exc:                       # noqa: BLE001
+                self.layout_label.setText(str(exc))
+                return
+            self.layout_label.setText(
+                tr('整個曲庫 → %d 包（略過 %d 項）。每首歌的難度分配規則和單首一樣。')
+                % (len(plans), len(skipped)))
+            return
+        song_dir = self.song_edit.text().strip()
+        if not os.path.exists(os.path.join(song_dir, 'register.json')):
+            self.layout_label.setText(tr('選一個有 register.json 的樂曲資料夾。'))
+            return
+        try:
+            plans, skipped = H.plan_song_folder(song_dir)
+        except Exception as exc:                           # noqa: BLE001
+            self.layout_label.setText(str(exc))
+            return
+        lines = [tr('會輸出 %d 包：') % len(plans)]
+        for plan in plans:
+            lines.append('• %s' % (plan.label or plan.title))
+            by_slot = {c.slot: c for c in plan.charts}
+            for slot in H.SLOTS:
+                chart = by_slot.get(slot)
+                if chart is None:
+                    lines.append('    %-6s ← %s' % (slot, tr('（沒有）')))
+                else:
+                    lines.append('    %-6s ← %s（Lv%s）' % (slot, chart.name, chart.level))
+        for why in skipped:
+            lines.append('• %s' % why)
+        if len(plans) > 1:
+            lines.append(tr('（分成好幾包是因為這些難度用不同的音訊檔——'
+                            '一包只能有一份 music.wav。）'))
+        self.layout_label.setText(chr(10).join(lines))
+
     def _sync(self) -> None:
         mode = self.mode()
         # 曲庫模式每首用自己 register.json 裡的評論，這一格用不到
@@ -265,6 +349,7 @@ class HiraethExportDialog(QDialog):
         self.song_edit.parentWidget().setEnabled(mode == MODE_SONG)
         self.library_edit.parentWidget().setEnabled(mode == MODE_LIBRARY)
         self.chart_box.setEnabled(mode == MODE_CHART)
+        self._update_layout_label()
         real = self.slot_combo.currentText() == 'real'
         if real == getattr(self, '_level_is_real', None):
             return
@@ -353,7 +438,8 @@ class HiraethExportDialog(QDialog):
     def _apply_options(self, plans):
         slogan = H.clean_slogan(self.slogan_edit.text())
         for plan in plans:
-            plan.mix_piano = self.mix_check.isChecked()
+            plan.keysound = self.keysound_check.isChecked()
+            plan.mix_piano = self.mix_check.isChecked() and not plan.keysound
             plan.lead_in_bars = self.lead_in_bars()
             if self.mode() != MODE_LIBRARY:
                 plan.slogan = slogan
@@ -376,6 +462,7 @@ class HiraethExportDialog(QDialog):
             return
         settings.set('hiraeth_export_dir', self.out_edit.text().strip())
         settings.set('hiraeth_mix_piano', self.mix_check.isChecked())
+        settings.set('hiraeth_keysound', self.keysound_check.isChecked())
         settings.set('hiraeth_process_hold_tails', self.tail_check.isChecked())
         settings.set('hiraeth_hold_gap_ms', int(self.gap_spin.value()))
         settings.set('hiraeth_lead_in_bars', self.lead_in_bars())

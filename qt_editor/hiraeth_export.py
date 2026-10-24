@@ -328,8 +328,14 @@ def _trim_beats(root: Any, duration_ms: int, log: Dict[str, int]) -> None:
 
 
 def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
-                      hold_gap_ms: int = DEFAULT_HOLD_GAP_MS) -> bytes:
-    """PAN 相容 XML 再收緊到 Hiraeth 的規則。`model` 會被改，請傳副本。"""
+                      hold_gap_ms: int = DEFAULT_HOLD_GAP_MS,
+                      keysound: bool = False) -> bytes:
+    """PAN 相容 XML 再收緊到 Hiraeth 的規則。`model` 會被改，請傳副本。
+
+    `keysound=True` ＝ 保留 sub_note 的 velocity，讓遊戲在玩家敲下去的時候
+    發出鋼琴音（本家本來就是這樣運作的）。預設 False ＝ velocity 全歸零、
+    聲音全部來自 music.wav，那是 Hiraeth **原版** importer 唯一收的形式。
+    """
     before = len(model.notes_tree)
     model.notes_tree = [n for n in model.notes_tree
                         if getattr(n, 'hidden', False) or int(n.hand) in (0, 1)]
@@ -364,7 +370,21 @@ def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
             note.find('param1').text = '0'
             note.find('param2').text = '0'
         for sub in note.iter('sub_note'):
-            sub.find('velocity').text = '0'
+            if keysound:
+                # 真按鍵音：velocity 留著，遊戲才會在玩家敲下去那一刻發聲。
+                # Hiraeth 的 importer 第 74 行原本硬擋 velocity≠0
+                # （'This package format requires background-only charts'），
+                # 所以這個模式要搭配改過的 importer——和當初為了顫音改它一樣。
+                raw = sub.findtext('velocity')
+                try:
+                    vel = int(float(raw)) if raw not in (None, '') else 0
+                except (TypeError, ValueError):
+                    vel = 0
+                if vel <= 0:
+                    vel = 100
+                sub.find('velocity').text = str(max(1, min(127, vel)))
+            else:
+                sub.find('velocity').text = '0'
             sub.find('track_index').text = first_track
             start = max(0, min(int(sub.findtext('start_timing_msec')), limit))
             end = max(start, min(int(sub.findtext('end_timing_msec')), limit))
@@ -467,6 +487,10 @@ class PackagePlan:
     piano_path: Optional[str] = None
     no_background: bool = False
     cover_path: Optional[str] = None
+    #: 真按鍵音：保留 sub_note 的 velocity，讓遊戲在玩家敲下去的時候發出鋼琴音
+    #: （本家本來就是這樣）。打開之後**不會**把鋼琴軌混進 music.wav，否則同一個
+    #: 音會聽到兩次。要搭配改過的 Hiraeth importer（它第 74 行硬擋 velocity≠0）。
+    keysound: bool = False
     mix_piano: bool = True            # 有背景音樂時疊上鋼琴音軌
     render_piano_layer: bool = False  # 沒有鋼琴音軌檔時用內建音源算一份來疊（目前譜面模式）
     lead_in_bars: int = DEFAULT_LEAD_IN_BARS   # 譜面開頭要空幾小節（0 = 照原樣）
@@ -731,7 +755,18 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
             return b'\0' * (int(round(lead_ms / 1000.0 * rate_hz)) * 4) + data
 
         if plan.no_background or not plan.audio_path:
-            if plan.piano_path:
+            if plan.keysound:
+                # 無聲音軌的曲子在按鍵音模式下，music.wav 就該是靜音——聲音
+                # 全部由玩家敲出來。放鋼琴軌進去等於同一個音聽兩次。長度照
+                # 最後一顆音符 +2 秒，importer 只要求音檔和譜面差 2 秒內。
+                rate = 44100
+                last = max((int(n.end) for _c, mo in charts
+                            for n in mo.notes_tree), default=0)
+                frames = int(round((last + 2000) / 1000.0 * rate))
+                pcm = b'\0' * (max(1, frames) * 4)
+                result.notes.append(tr('按鍵音模式且沒有背景音樂：music.wav 是靜音，'
+                                       '聲音全部由按鍵發出'))
+            elif plan.piano_path:
                 pcm, rate = read_wav(plan.piano_path)
                 pcm = lead_pad(pcm, rate)
                 result.notes.append(tr('沒有背景音樂：用鋼琴音軌 %s') % os.path.basename(plan.piano_path))
@@ -743,11 +778,22 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
             pcm, rate = read_wav(plan.audio_path)
             pcm = lead_pad(pcm, rate)
             layer = None
-            if plan.mix_piano and plan.piano_path:
+            if plan.keysound:
+                # 鋼琴音由按鍵發，再混進 music.wav 就會聽到兩次。
+                result.notes.append(tr('按鍵音模式：鋼琴軌不混進音樂檔，由按鍵發聲'))
+                if not plan.piano_path:
+                    # 有獨立鋼琴軌的曲子，主音訊就是「沒有鋼琴的伴奏」，拿掉
+                    # 鋼琴軌剛好。**沒有**獨立鋼琴軌的曲子，鋼琴本來就烘在主
+                    # 音訊裡——按鍵再發一次就是同一個音聽兩次。擋不住（音訊
+                    # 裡有沒有鋼琴沒辦法判斷），只能講出來。
+                    result.notes.append(tr(
+                        '這首沒有獨立的鋼琴音軌，主音訊裡可能已經有鋼琴了——'
+                        '按鍵音會和它疊在一起（同一個音聽兩次）。'))
+            elif plan.mix_piano and plan.piano_path:
                 layer = read_wav(plan.piano_path)
                 layer = (lead_pad(layer[0], layer[1]), layer[1])
                 result.notes.append(tr('疊上鋼琴音軌 %s') % os.path.basename(plan.piano_path))
-            elif plan.mix_piano and plan.render_piano_layer:
+            elif plan.mix_piano and plan.render_piano_layer and not plan.keysound:
                 hardest = max(charts, key=lambda item: len(item[1].notes_tree))[1]
                 layer = renderer(hardest)
                 result.notes.append(tr('疊上內建音源算的鋼琴音軌'))
@@ -798,7 +844,8 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
         trills = dropped = 0
         for chart, model in charts:
             log: Dict[str, int] = {}
-            data = hiraeth_chart_xml(model, duration_ms, log, hold_gap_ms)
+            data = hiraeth_chart_xml(model, duration_ms, log, hold_gap_ms,
+                                     keysound=plan.keysound)
             with open(os.path.join(work, chart.slot + '.xml'), 'wb') as fh:
                 fh.write(data)
             trills += log['trills_kept']
@@ -836,7 +883,7 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
         with open(os.path.join(work, 'song.json'), 'w', encoding='utf-8') as fh:
             json.dump(spec, fh, ensure_ascii=False, indent=2)
 
-        problems = validate_package(work)
+        problems = validate_package(work, plan.keysound)
         if problems:
             raise ValueError(tr('沒通過 Hiraeth 的檢查：') + '；'.join(problems))
 
@@ -858,7 +905,7 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
 
 # ── 驗證（照 Hiraeth importer 逐條實作）───────────────────────────────
 
-def validate_package(folder: str) -> List[str]:
+def validate_package(folder: str, keysound: bool = False) -> List[str]:
     problems: List[str] = []
     names = set(os.listdir(folder))
     extra = {n for n in names if n.lower() not in PACKAGE_FILES}
@@ -919,11 +966,12 @@ def validate_package(folder: str) -> List[str]:
     for slot in levels:
         path = os.path.join(folder, slot + '.xml')
         if os.path.exists(path):
-            problems += ['%s.xml：%s' % (slot, p) for p in validate_chart(path, seconds)]
+            problems += ['%s.xml：%s' % (slot, p)
+                         for p in validate_chart(path, seconds, keysound)]
     return problems
 
 
-def validate_chart(path: str, seconds: float) -> List[str]:
+def validate_chart(path: str, seconds: float, keysound: bool = False) -> List[str]:
     if os.path.getsize(path) > 16 * 1024 * 1024:
         return [tr('譜面超過 16MB')]
     root = ET.parse(path).getroot()
@@ -966,7 +1014,7 @@ def validate_chart(path: str, seconds: float) -> List[str]:
     elif sorted(ids) != list(range(len(notes))):
         problems.append(tr('音符 index 沒有從 0 連號'))
     for sub in root.iter('sub_note'):
-        if sub.findtext('velocity') != '0':
+        if not keysound and sub.findtext('velocity') != '0':
             problems.append(tr('sub_note 力度不是 0'))
             break
         if not 1 <= int(sub.findtext('scale_piano', '0')) <= 88 or \

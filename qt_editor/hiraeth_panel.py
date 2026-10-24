@@ -270,11 +270,13 @@ class HiraethPanel(QDialog):
         from .hiraeth_export import hold_gap_setting
         gap = hold_gap_setting(settings)
         mix = bool(settings.get('hiraeth_mix_piano', True))
+        keysound = bool(settings.get('hiraeth_keysound', False))
         lead = int(settings.get('hiraeth_lead_in_bars', 1))
 
         def work(progress):
             return S.sync(root, hiraeth_root, force=force, progress=progress,
-                          hold_gap_ms=gap, mix_piano=mix, lead_in_bars=lead,
+                          hold_gap_ms=gap, mix_piano=mix, keysound=keysound,
+                          lead_in_bars=lead,
                           library=library)
 
         def finished(summary):
@@ -333,6 +335,7 @@ class HiraethPanel(QDialog):
         from .hiraeth_export import hold_gap_setting
         options = dict(hold_gap_ms=hold_gap_setting(settings),
                        mix_piano=bool(settings.get('hiraeth_mix_piano', True)),
+                       keysound=bool(settings.get('hiraeth_keysound', False)),
                        lead_in_bars=int(settings.get('hiraeth_lead_in_bars', 1)))
 
         def work(progress):

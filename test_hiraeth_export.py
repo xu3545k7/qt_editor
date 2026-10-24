@@ -917,3 +917,186 @@ class PackageTailTests(unittest.TestCase):
         self.assertLess(audio_ms - last, 3000, '打完最後一顆音符不該再等好幾秒')
         self.assertGreaterEqual(audio_ms, last, '音訊不能比譜面短')
         self.assertEqual(H.validate_package(folder), [])
+
+
+class KeysoundExportTests(unittest.TestCase):
+    """保留按鍵音：velocity 不歸零，鋼琴音由玩家敲出來。
+
+    Hiraeth **原版** importer 第 74 行硬擋 sub_note 的 velocity 不是 0
+    （'This package format requires background-only charts'），所以預設還是
+    歸零、聲音全部來自 music.wav。使用者的 Hiraeth 的 importer 已經改過
+    （像當初為了顫音改它那樣），改過之後這個模式才收。
+
+    實測（Abiogenesis，四個難度）：原版 importer 退件、改過的通過；
+    real.xml 的 1951 個 sub_note velocity 全部保住、範圍 64~112。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def velocities(self, zip_path, slot='real'):
+        with zipfile.ZipFile(zip_path) as archive:
+            root = ET.fromstring(archive.read(slot + '.xml'))
+        return [int(s.findtext('velocity')) for s in root.iter('sub_note')]
+
+    def build(self, **kwargs):
+        plans, _ = H.plan_song_folder(make_song(self.root))
+        plan = plans[0]
+        for key, value in kwargs.items():
+            setattr(plan, key, value)
+        result = H.build_package(plan, os.path.join(self.root, 'o'),
+                                 renderer=fake_renderer)
+        self.assertEqual(result.error, '')
+        return result
+
+    def test_the_default_still_zeroes_every_velocity(self):
+        result = self.build()
+        self.assertEqual(set(self.velocities(result.zip_path)), {0})
+
+    def test_keysound_keeps_the_velocities(self):
+        result = self.build(keysound=True)
+        vels = self.velocities(result.zip_path)
+        self.assertTrue(vels, '沒有 sub_note 可以看')
+        self.assertTrue(all(v > 0 for v in vels), '按鍵音模式不該把 velocity 歸零')
+
+    def test_keysound_velocities_stay_in_range(self):
+        vels = self.velocities(self.build(keysound=True).zip_path)
+        self.assertTrue(all(1 <= v <= 127 for v in vels))
+
+    def test_keysound_does_not_mix_the_piano_in(self):
+        """同一個音不能聽兩次：按鍵發聲就不要再把鋼琴軌疊進 music.wav。"""
+        result = self.build(keysound=True)
+        self.assertTrue(any('按鍵音模式' in n for n in result.notes), result.notes)
+        self.assertFalse(any('疊上鋼琴音軌' in n for n in result.notes))
+
+    def test_the_package_still_passes_our_own_validator(self):
+        result = self.build(keysound=True)
+        self.assertEqual(result.error, '', '按鍵音模式的包沒通過驗證')
+
+    def test_our_validator_still_rejects_stray_velocities_in_the_default_mode(self):
+        """預設模式下 velocity 不是 0 就該被我們自己的驗證攔住。"""
+        folder = tempfile.mkdtemp()
+        plans, _ = H.plan_song_folder(make_song(self.root))
+        plan = plans[0]
+        plan.keysound = True
+        result = H.build_package(plan, folder, renderer=fake_renderer)
+        work = os.path.join(folder, 'unz')
+        os.makedirs(work)
+        with zipfile.ZipFile(result.zip_path) as archive:
+            archive.extractall(work)
+        strict = H.validate_package(work, keysound=False)
+        lenient = H.validate_package(work, keysound=True)
+        self.assertTrue(any('力度' in p for p in strict),
+                        '預設模式該抱怨力度：%s' % strict)
+        self.assertFalse(any('力度' in p for p in lenient),
+                         '按鍵音模式不該抱怨力度：%s' % lenient)
+
+    def test_a_song_with_no_background_gets_a_silent_music_wav(self):
+        """無聲音軌的曲子在按鍵音模式下，music.wav 該是靜音。"""
+        plans, _ = H.plan_song_folder(make_song(self.root, no_bgm=True))
+        plan = plans[0]
+        plan.keysound = True
+        result = H.build_package(plan, os.path.join(self.root, 'o2'),
+                                 renderer=fake_renderer)
+        self.assertEqual(result.error, '')
+        self.assertTrue(any('靜音' in n for n in result.notes), result.notes)
+        with zipfile.ZipFile(result.zip_path) as archive:
+            with archive.open('music.wav') as fh:
+                data = fh.read()
+        self.assertEqual(set(data[44:1044]), {0}, 'music.wav 不是靜音')
+
+
+class DifficultyLayoutLabelTests(unittest.TestCase):
+    """對話框要把「哪個難度對到哪一格」畫出來。
+
+    使用者：「多難度譜面怎麼匯出 hiraeth 我沒看懂」。規則確實不直觀——
+    先照 `audioResourcePath` 分組（一包只能有一份 music.wav），組內照難度
+    名字對位，名字對不上的照等級由高到低補 real → expert，還放不下的各自
+    成一包，`test` 難度略過。全部都藏在程式碼裡，畫面上一個字都沒有。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.song = make_song(self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def dialog(self):
+        from qt_editor.hiraeth_export_dialog import HiraethExportDialog
+        model = NoteModel.create_new('t', 120.0, 10.0, 4)
+        return HiraethExportDialog(None, self.song, self.root, model)
+
+    def test_it_names_every_slot(self):
+        text = self.dialog().layout_label.text()
+        for slot in H.SLOTS:
+            self.assertIn(slot, text, '沒提到 %s 這一格' % slot)
+
+    def test_it_shows_which_difficulty_fills_each_slot(self):
+        text = self.dialog().layout_label.text()
+        self.assertIn('Normal', text)
+        self.assertIn('Master', text)
+
+    def test_it_says_how_many_packages(self):
+        plans, _skipped = H.plan_song_folder(self.song)
+        text = self.dialog().layout_label.text()
+        self.assertIn('%d 包' % len(plans), text)
+
+    def test_it_explains_why_there_is_more_than_one_package(self):
+        """這首的 Master_piano 用不同的音訊，所以一定會分成兩包。"""
+        plans, _skipped = H.plan_song_folder(self.song)
+        self.assertGreater(len(plans), 1, '這個測試需要會分包的素材')
+        self.assertIn('music.wav', self.dialog().layout_label.text())
+
+    def test_it_lists_what_was_skipped(self):
+        text = self.dialog().layout_label.text()
+        self.assertIn('TEST', text, '略過的難度也要講')
+
+    def test_the_chart_mode_says_it_is_one_package(self):
+        from qt_editor.hiraeth_export_dialog import MODE_CHART
+        dlg = self.dialog()
+        dlg.rb_chart.setChecked(True)
+        dlg._sync()
+        self.assertEqual(dlg.mode(), MODE_CHART)
+        self.assertIn('一包', dlg.layout_label.text())
+
+    def test_a_folder_without_register_json_says_so(self):
+        dlg = self.dialog()
+        dlg.song_edit.setText(self.root)
+        self.assertIn('register.json', dlg.layout_label.text())
+
+
+class KeysoundCheckboxTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.song = make_song(self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def dialog(self):
+        from qt_editor.hiraeth_export_dialog import HiraethExportDialog
+        model = NoteModel.create_new('t', 120.0, 10.0, 4)
+        return HiraethExportDialog(None, self.song, self.root, model)
+
+    def test_it_is_off_by_default(self):
+        """原版 Hiraeth importer 不收，所以預設關著。"""
+        self.assertFalse(self.dialog().keysound_check.isChecked())
+
+    def test_turning_it_on_disables_mixing(self):
+        """鋼琴音由按鍵發，再混進 music.wav 就會聽到兩次。"""
+        dlg = self.dialog()
+        dlg.keysound_check.setChecked(True)
+        self.assertFalse(dlg.mix_check.isEnabled())
+
+    def test_the_plans_carry_the_flag(self):
+        dlg = self.dialog()
+        dlg.keysound_check.setChecked(True)
+        plans, _skipped = dlg.plans()
+        self.assertTrue(plans)
+        for plan in plans:
+            self.assertTrue(plan.keysound)
+            self.assertFalse(plan.mix_piano, '按鍵音模式不該再混鋼琴軌')
