@@ -237,6 +237,7 @@ class ToolbarSet:
         # 播放分頁
         self.pause_act: Optional[QAction] = None
         self.hit_act: Optional[QAction] = None
+        self.barline_drag_act: Optional[QAction] = None
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
@@ -348,6 +349,9 @@ class MainWindow(QMainWindow):
             v = ChartView(self)
             v.pane_role = role
             v.pane_active = (role == 0)
+            # 小節線拖曳的開關是逐格的旗標，但設定是全域的；工具列那顆按鈕
+            # 建立時也會讀同一個設定，所以兩邊一開始就一致。
+            v.barline_drag_enabled = bool(settings.get('barline_drag_enabled', True))
             self._panes.append(v)
             self._splitter.addWidget(v)
         self._panes[0].link_pane(self._panes[1])
@@ -1533,9 +1537,7 @@ class MainWindow(QMainWindow):
                 ('生成難度成獨立檔案…', self.generate_difficulties_dialog),
                 ('掃描曲庫，補齊缺少的難度…', self.fill_library_difficulties),
             ]),
-            ('樂曲總資訊', [
-                ('調整樂曲總資訊（BPM / 總拍號 / 整體位移）…', self.song_info_dialog),
-            ]),
+
             ('以 MIDI 修復', [
                 ('從 MIDI 還原音高與表情（力度／踏板）…',
                  self.restore_from_midi_dialog),
@@ -1546,9 +1548,7 @@ class MainWindow(QMainWindow):
                 ('依和聲生成踏板…', self.generate_pedal_dialog),
                 ('清除踏板', self.clear_pedal),
             ]),
-            ('從別份譜面搬表情', [
-                ('從另一份譜面搬音高／力度／踏板…', self.transfer_from_chart_dialog),
-            ]),
+
         ]
 
     @staticmethod
@@ -1965,6 +1965,15 @@ class MainWindow(QMainWindow):
             '（幽靈音符可在「檢視」分頁關掉。）',
             self._on_hand_filter_changed)
 
+        # 小節線拖曳的開關放在**編輯**分頁：它是「滑鼠在譜面上怎麼動」的模式，
+        # 和放置模式同一類。小節分頁裡全是「對小節做什麼」的動作，性質不同。
+        tbs.barline_drag_act = self._tab_action(
+            tbs, t('tb_barline_drag'), self._on_barline_drag_toggled,
+            tip=t('tb_barline_drag_tip'), checkable=True)
+        tbs.barline_drag_act.blockSignals(True)
+        tbs.barline_drag_act.setChecked(self._barline_drag_enabled())
+        tbs.barline_drag_act.blockSignals(False)
+
         return self._tab_page([
             tbs.pattern_key_label,
             None,
@@ -1978,6 +1987,8 @@ class MainWindow(QMainWindow):
             None,
             tbs.hand_filter_combo,
             self._tab_button(auto_sort),
+            None,
+            self._tab_button(tbs.barline_drag_act),
         ])
 
     # ── 分頁：播放 ────────────────────────────────────────────────────
@@ -2007,8 +2018,9 @@ class MainWindow(QMainWindow):
             self._tab_button(tbs.pause_act),
             self._tab_button(act_stop),
             None,
-            self._tab_button(tbs.hit_act),
-            None,
+            # MIDI 鋼琴不在分頁上放按鈕了：右上角音量區塊的 🔊 已經是同一個
+            # 開關（`_vol_row(action=tbs.hit_act)` 做的鏡像），兩顆重複。
+            # `tbs.hit_act` 仍然要建立，喇叭和 `_sync_*` 都靠它。
             self._tab_button(offset_act),
         ])
 
@@ -2024,7 +2036,34 @@ class MainWindow(QMainWindow):
                 widgets.append(None)
             widgets.append(self._tab_button(
                 self._tab_action(tbs, label, slot, tip=tip)))
+
         return self._tab_page(widgets)
+
+    # ── 小節線拖曳開關 ────────────────────────────────────────────────
+
+    def _barline_drag_enabled(self) -> bool:
+        """目前的設定值（預設開著，維持原本行為）。"""
+        return bool(settings.get('barline_drag_enabled', True))
+
+    def _on_barline_drag_toggled(self, checked: bool) -> None:
+        """套用到每一格並記住。
+
+        每一格各有一個 ChartView，所以要全部設；兩條工具列（分割出獨立視窗
+        時）的勾選狀態也要互相跟上，否則看起來像沒生效。
+        """
+        settings.set('barline_drag_enabled', bool(checked))
+        self._apply_barline_drag(bool(checked))
+
+    def _apply_barline_drag(self, enabled: bool) -> None:
+        for pane in self._panes:
+            pane.barline_drag_enabled = bool(enabled)
+        for tbs in getattr(self, '_toolbars', []) or []:
+            act = getattr(tbs, 'barline_drag_act', None)
+            if act is None or act.isChecked() == bool(enabled):
+                continue
+            act.blockSignals(True)
+            act.setChecked(bool(enabled))
+            act.blockSignals(False)
 
     # ── 分頁：工具 ────────────────────────────────────────────────────
 
@@ -2057,6 +2096,14 @@ class MainWindow(QMainWindow):
         widgets = [self._tab_button(smart), None]
         for title, entries in self._tool_groups():
             widgets.append(self._menu_button(tbs, title, entries))
+        # 只有一個項目的下拉選單是多一次點擊的純損失，直接放成按鈕。
+        widgets.append(None)
+        for label, slot, tip in (
+                ('樂曲總資訊…', self.song_info_dialog,
+                 '整首的 BPM／總拍號／整體位移'),
+                ('搬別份譜面的表情…', self.transfer_from_chart_dialog,
+                 '從另一份譜面搬音高／力度／踏板')):
+            widgets.append(self._tab_button(self._tab_action(tbs, label, slot, tip=tip)))
         return self._tab_page(widgets)
 
     # ── 分頁：檢視 ────────────────────────────────────────────────────

@@ -601,6 +601,10 @@ class ChartView(QWidget):
         # 狀態列輔助文字
         self._drag_status: str = ''
 
+        #: 小節線拖曳要不要啟動。那個拖曳會改前一小節的 BPM，而判定只看
+        #: 游標離小節線 6 像素，所以在小節線附近框選很容易誤觸。預設維持開著
+        #: （不改變原本行為），關掉之後同一個位置就只會框選。
+        self.barline_drag_enabled: bool = True
         # 小節線拖曳（time_uniform 模式下）
         self._barline_dragging: bool = False
         self._barline_drag_measure: Optional[int] = None  # 目標要改變 BPM 的小節 index (0-based)
@@ -5989,7 +5993,7 @@ class ChartView(QWidget):
                     self.update()
                     return
             # 若 time_uniform 模式且靠近小節線，啟動小節線拖曳
-            if self.time_uniform:
+            if self.time_uniform and self.barline_drag_enabled:
                 ws_ms, we_ms = self.mapper.window_ms_range(self.window_start_unit, self.window_size_unit)
                 beats = self.model.get_beat_entries()
                 if beats:

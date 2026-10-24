@@ -159,6 +159,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         'tb_pause':         '⏸ 暫停',
         'tb_resume':        '⏵ 繼續',
         'tb_hit_sound':     '🎹 MIDI 鋼琴',
+        'tb_barline_drag':  '📏 拖曳小節線',
+        'tb_barline_drag_tip':
+            '開著時，在小節線附近按下滑鼠會拖曳那條線、改掉前一小節的 BPM。\n'
+            '判定只看離線 6 像素，所以在小節線附近框選很容易誤觸——\n'
+            '關掉之後同一個位置就只會框選。',
         'tb_hit_sound_tip': '播放時以 SoundFont 鋼琴演奏譜面音符',
         'tb_music_vol':     '音樂音量',
         'tb_music2_vol':    '第二音源音量',
