@@ -378,7 +378,9 @@ def _inside_developer_tools(exe: str) -> bool:
     venv 會連回建立它的直譯器，而這份會隨著 Xcode 更新或搬家而消失，
     整個轉譜環境就跟著壞掉。有別的選擇時不要用它。
     """
-    path = os.path.realpath(exe)
+    # realpath 會用平台的分隔符，但這裡比對的是 mac 的路徑樣式——先統一成正斜線，
+    # 否則在 Windows 上這條規則永遠是 False（連測試都驗不到）。
+    path = os.path.realpath(exe).replace(os.sep, '/')
     return '/Xcode.app/' in path or '/CommandLineTools/' in path
 
 

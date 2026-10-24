@@ -295,6 +295,8 @@ class InstallPythonTests(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(self.root, 'downloads', 'python-embed.zip')))
 
+    @unittest.skipUnless(os.name == 'posix',
+                         'venv 在 Windows 上建的是 Scripts/python.exe，這個要在 mac/Linux 跑')
     def test_mac_builds_a_venv_with_the_host_python(self):
         # 真的建一個 venv（不連網），確認 python_exe 指得到裡面的直譯器
         pip_args = []
@@ -377,26 +379,30 @@ class HostPythonTests(unittest.TestCase):
                              os.path.realpath(sys.executable))
 
     def test_a_newer_python_wins(self):
-        versions = {'/opt/a/python3.9': (3, 9), '/opt/b/python3.12': (3, 12)}
+        # 鍵要照 find_host_python 組路徑的方式組（Windows 上 join 出來是反斜線）
+        old_py = os.path.join('/opt/a', 'python3.9')
+        new_py = os.path.join('/opt/b', 'python3.12')
+        versions = {old_py: (3, 9), new_py: (3, 12)}
         with mock.patch.object(AT.shutil, 'which', lambda _name: None), \
                 mock.patch.object(AT, 'HOST_PYTHON_DIRS', ('/opt/a', '/opt/b')), \
                 mock.patch.object(AT, 'HOST_PYTHON_NAMES', ('python3.9', 'python3.12')), \
                 mock.patch.object(AT.os.path, 'isfile', lambda p: p in versions), \
                 mock.patch.object(AT, '_host_python_version', versions.get), \
                 mock.patch.object(sys, 'frozen', True, create=True):
-            self.assertEqual(AT.find_host_python(), '/opt/b/python3.12')
+            self.assertEqual(AT.find_host_python(), new_py)
 
     def test_xcodes_python_is_the_last_resort(self):
         # venv 會連回建立它的直譯器，Xcode 更新一搬家整個環境就壞了
         xcode = '/Applications/Xcode.app/Contents/Developer/usr/bin/python3.9'
-        versions = {xcode: (3, 9), '/usr/local/bin/python3.9': (3, 9)}
+        local = os.path.join('/usr/local/bin', 'python3.9')
+        versions = {xcode: (3, 9), local: (3, 9)}
         with mock.patch.object(AT.shutil, 'which', lambda _name: xcode), \
                 mock.patch.object(AT, 'HOST_PYTHON_DIRS', ('/usr/local/bin',)), \
                 mock.patch.object(AT, 'HOST_PYTHON_NAMES', ('python3.9',)), \
                 mock.patch.object(AT.os.path, 'isfile', lambda p: p in versions), \
                 mock.patch.object(AT, '_host_python_version', versions.get), \
                 mock.patch.object(sys, 'frozen', True, create=True):
-            self.assertEqual(AT.find_host_python(), '/usr/local/bin/python3.9')
+            self.assertEqual(AT.find_host_python(), local)
 
 
 class TorchSourceTests(unittest.TestCase):
