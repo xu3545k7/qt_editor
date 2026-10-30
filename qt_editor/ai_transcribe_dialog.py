@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
 from . import ai_transcribe as AT
 from . import piano_separate as SEP
 from . import platform_support as PS
+from .settings import settings
 from .ui_text import tr
 
 _STAGE_TEXT = {
@@ -343,7 +344,9 @@ def run_transcribe(parent, audio_path: str, output_path: str,
                      lambda cancel, log, progress: AT.transcribe(
                          audio_path, output_path, cancel, log, progress,
                          want_wav=want_wav, separate=bool(separate),
-                         separate_model=separate or ''))
+                         separate_model=separate or '',
+                         model=str(settings.get('ai_transcribe_model',
+                                                AT.DEFAULT_MODEL))))
     dlg.exec_()
     if dlg.result_value is None and dlg.error:
         # 失敗時視窗留著讓使用者看紀錄，關掉後再給一個簡短的錯誤框

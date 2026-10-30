@@ -23,6 +23,11 @@ p.add_argument('--selftest', action='store_true')
 p.add_argument('--input'); p.add_argument('--output'); p.add_argument('--checkpoint')
 p.add_argument('--device', default='auto'); p.add_argument('--batch', type=int, default=0)
 p.add_argument('--wav-out', dest='wav_out')
+p.add_argument('--model', default='transkun')
+p.add_argument('--separate', action='store_true')
+p.add_argument('--separate-model', dest='separate_model')
+p.add_argument('--separate-out', dest='separate_out')
+p.add_argument('--env')
 a = p.parse_args()
 def emit(kind, **kw):
     kw['type'] = kind
@@ -44,10 +49,12 @@ if mode == 'crash':
     sys.exit(3)
 for i in range(3):
     emit('progress', stage='transcribe', done=i + 1, total=3)
+emit('log', message='轉譜模型：%s' % a.model)
 open(a.output, 'wb').write(b'MThd')
 if a.wav_out:
     open(a.wav_out, 'wb').write(b'RIFF')
-emit('done', output=a.output, notes=12, pedals=2, seconds=1.0, device='cpu', elapsed=0.1)
+emit('done', output=a.output, notes=12, pedals=2, seconds=1.0, device='cpu',
+     model=a.model, elapsed=0.1)
 '''
 
 
@@ -564,3 +571,93 @@ class ParseTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ModelChoiceTests(_FakeEnv):
+    """轉譜模型：預設 transkun，裝不起來就退回 ByteDance。
+
+    為什麼預設是 transkun：在**我們自己的曲庫**實測（14 首乾淨鋼琴軌對照
+    raw/*.mid、mir_eval、先扣掉全域偏移），起音 F1 97.3% vs 93.4%、14 首全贏；
+    音長（起音＋結束）56.7% vs 44.8%；速度一樣。
+
+    注意 MAESTRO 上的排名是反的（ByteDance 起音 96.72 贏 95.3）——論文的素材是
+    獨奏古典，我們的是遊戲音樂鋼琴翻彈，不能互推。
+    """
+
+    def _model_log(self):
+        for line in self.logs:
+            if line.startswith('轉譜模型：'):
+                return line.split('：', 1)[1]
+        return ''
+
+    def test_the_default_is_transkun(self):
+        self.assertEqual(AT.DEFAULT_MODEL, 'transkun')
+
+    def test_it_passes_the_chosen_model_through(self):
+        self._mode('ok')
+        out = AT.default_output_path(self.audio)
+        with mock.patch.object(AT, 'transkun_installed', lambda root=None: True):
+            result = AT.transcribe(self.audio, out, threading.Event(),
+                                   self.logs.append, lambda *a: None,
+                                   root=self.root, model='transkun')
+        self.assertEqual(self._model_log(), 'transkun')
+        self.assertEqual(result.get('model'), 'transkun')
+
+    def test_bytedance_can_still_be_chosen(self):
+        self._mode('ok')
+        out = AT.default_output_path(self.audio)
+        AT.transcribe(self.audio, out, threading.Event(), self.logs.append,
+                      lambda *a: None, root=self.root, model='bytedance')
+        self.assertEqual(self._model_log(), 'bytedance')
+
+    def test_it_falls_back_when_transkun_is_missing(self):
+        """轉得出來比轉不出來重要——沒裝就退回去，而且要講。"""
+        self._mode('ok')
+        out = AT.default_output_path(self.audio)
+        with mock.patch.object(AT, 'transkun_installed', lambda root=None: False):
+            AT.transcribe(self.audio, out, threading.Event(), self.logs.append,
+                          lambda *a: None, root=self.root, model='transkun')
+        self.assertEqual(self._model_log(), 'bytedance')
+        self.assertTrue(any('還沒裝' in line for line in self.logs), self.logs)
+
+    def test_no_choice_means_the_default(self):
+        self._mode('ok')
+        out = AT.default_output_path(self.audio)
+        with mock.patch.object(AT, 'transkun_installed', lambda root=None: True):
+            AT.transcribe(self.audio, out, threading.Event(), self.logs.append,
+                          lambda *a: None, root=self.root)
+        self.assertEqual(self._model_log(), AT.DEFAULT_MODEL)
+
+    def test_every_model_in_the_menu_has_measured_numbers(self):
+        keys = [k for k, _label, _note in AT.MODELS]
+        self.assertIn('transkun', keys)
+        self.assertIn('bytedance', keys)
+        self.assertEqual(keys[0], AT.DEFAULT_MODEL, '預設的要排第一個')
+        for _k, label, note in AT.MODELS:
+            self.assertTrue(label and note)
+            self.assertIn('F1', note, '選單上要寫實測數字')
+
+
+class TranskunInstallTests(unittest.TestCase):
+    """transkun 的安裝：一律 --no-deps，torchaudio 版本要跟著 torch。"""
+
+    def test_the_packages_are_pinned_to_what_inference_needs(self):
+        names = ' '.join(AT.TRANSKUN_PACKAGES)
+        for want in ('transkun', 'pretty_midi', 'moduleconf', 'pydub'):
+            self.assertIn(want, names)
+        self.assertNotIn('ncls', names,
+                         'ncls 建不起來（要編譯器），而且推論用不到')
+        self.assertNotIn('tensorboard', names, '那是訓練才要的')
+
+    def test_torchaudio_follows_the_installed_torch(self):
+        """讓 pip 自己解依賴會把 torch 降版，RTX 50 系列就只剩 CPU。"""
+        with mock.patch.object(AT, 'python_exe', lambda root=None: sys.executable), \
+                mock.patch.object(AT.subprocess, 'run') as run:
+            run.return_value = mock.Mock(stdout='2.11.0+cu128')
+            args = AT._torchaudio_args('/nope', 'cu128')
+        self.assertIn('torchaudio==2.11.0+cu128', args)
+
+    def test_it_falls_back_to_plain_torchaudio_when_torch_is_unreadable(self):
+        with mock.patch.object(AT, 'python_exe', lambda root=None: '/nope/python'):
+            args = AT._torchaudio_args('/nope', 'cu128')
+        self.assertIn('torchaudio', args)

@@ -109,7 +109,12 @@ def _default_batch(device):
     return {'cuda': 8, 'mps': 4}.get(device, 1)
 
 
-def load_audio(path, sample_rate):
+def load_audio(path, sample_rate=None):
+    """讀音檔。`sample_rate` 給了才重取樣成單聲道（ByteDance 要 16k 單聲道）。
+
+    transkun 自己照 `model.fs` 重取樣、而且吃多聲道，所以它傳 None——先轉成
+    16k 單聲道再餵它等於白白丟掉一半的資訊。
+    """
     import numpy as np
     import soundfile
 
@@ -117,11 +122,14 @@ def load_audio(path, sample_rate):
         data, rate = soundfile.read(path, dtype='float32', always_2d=True)
     except Exception as exc:                    # noqa: BLE001
         raise RuntimeError('讀不到這個音檔（支援 wav / flac / ogg / mp3）：%s' % exc)
+    seconds = len(data) / float(rate)
+    if sample_rate is None:
+        return None, rate, seconds, data
     audio = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
     if rate != sample_rate:
         import librosa
         audio = librosa.resample(audio, orig_sr=rate, target_sr=sample_rate)
-    return np.ascontiguousarray(audio, dtype=np.float32), rate, len(data) / float(rate), data
+    return np.ascontiguousarray(audio, dtype=np.float32), rate, seconds, data
 
 
 def make_forward(chunk):
@@ -153,9 +161,16 @@ def selftest(args):
     import torch
     import piano_transcription_inference  # noqa: F401  確認整條依賴都 import 得起來
 
+    models = {'bytedance': True}
+    try:
+        import transkun.Data  # noqa: F401
+        import moduleconf     # noqa: F401
+        models['transkun'] = True
+    except Exception:                               # noqa: BLE001
+        models['transkun'] = False
     device, note = pick_device(args.device)
     emit('done', torch=torch.__version__, cuda=torch.version.cuda or '',
-         device=device, device_name=note)
+         device=device, device_name=note, models=models)
 
 
 def run_separation(args, device):
@@ -190,9 +205,69 @@ def run_separation(args, device):
     return out
 
 
+#: 轉譜模型。預設 transkun——實測在我們自己的曲庫上（14 首乾淨鋼琴軌對照
+#: raw/*.mid）起音 F1 97.3% vs 93.4%、**14 首全贏**，音長（起音＋結束）
+#: 56.7% vs 44.8%，而且一樣快。詳見記憶 `ai-transcribe` 的比較表。
+#:
+#: 注意 MAESTRO 上的排名是反的（ByteDance 起音 96.72 贏 95.3）——我們的素材
+#: 是遊戲音樂鋼琴翻彈，不是獨奏古典，別拿論文數字推論這裡。
+MODELS = ('transkun', 'bytedance')
+DEFAULT_MODEL = 'transkun'
+
+
+def _run_transkun(args, source, device, seconds):
+    """transkun V2。把它 `transcribe.py::main` 的那十幾行重做一次。
+
+    不直接呼叫它的 main()：那個會自己 parse argv，而且用 pydub 讀檔——pydub 讀
+    mp3 要 ffmpeg，我們環境裡沒有。這裡改成餵 soundfile 讀好的陣列，順便回報進度。
+    """
+    import numpy as np
+    import torch
+    import moduleconf
+    from transkun.Data import writeMidi
+
+    emit('progress', stage='load_model', done=0, total=1)
+    weight = args.transkun_weight
+    conf = args.transkun_conf
+    if not weight or not conf:
+        import transkun
+        base = os.path.join(os.path.dirname(os.path.abspath(transkun.__file__)),
+                            'pretrained')
+        weight = weight or os.path.join(base, '2.0.pt')
+        conf = conf or os.path.join(base, '2.0.conf')
+    manager = moduleconf.parseFromFile(conf)
+    TransKun = manager['Model'].module.TransKun
+    checkpoint = torch.load(weight, map_location=device, weights_only=False)
+    model = TransKun(conf=manager['Model'].config).to(device)
+    state = checkpoint.get('best_state_dict') or checkpoint['state_dict']
+    model.load_state_dict(state, strict=False)
+    model.eval()
+
+    _unused, rate, _secs, data = load_audio(source, None)
+    audio = data
+    if rate != model.fs:
+        import soxr
+        audio = soxr.resample(audio, rate, model.fs)
+    emit('progress', stage='transcribe', done=0, total=1)
+    torch.set_grad_enabled(False)
+    notes = model.transcribe(torch.from_numpy(np.ascontiguousarray(audio)).to(device),
+                             stepInSecond=args.segment_hop or None,
+                             segmentSizeInSecond=args.segment_size or None,
+                             discardSecondHalf=False)
+    emit('progress', stage='transcribe', done=1, total=1)
+    midi = writeMidi(notes)
+    midi.write(args.output)
+    # `notes` 裡混著踏板：transkun 用**負的 pitch** 編碼 CC，writeMidi 再拆開。
+    # 直接回報 len(notes) 會多算（實測 Evans 2058，扣掉 67 段踏板才是 1991）。
+    real = sum(len(inst.notes) for inst in midi.instruments)
+    pedals = sum(1 for inst in midi.instruments
+                 for cc in inst.control_changes if cc.number == 64 and cc.value >= 64)
+    return real, pedals
+
+
 def transcribe(args):
     import torch
-    from piano_transcription_inference import PianoTranscription, inference, sample_rate
+    from piano_transcription_inference import sample_rate
 
     started = time.time()
     device, note = pick_device(args.device)
@@ -203,8 +278,14 @@ def transcribe(args):
     if args.separate:
         source = run_separation(args, device)
 
+    model_name = (args.model or DEFAULT_MODEL).lower()
+    if model_name not in MODELS:
+        raise RuntimeError('不認得的轉譜模型：%s' % model_name)
+
     emit('progress', stage='load_audio', done=0, total=1)
-    audio, native_rate, seconds, original = load_audio(source, sample_rate)
+    # transkun 自己重取樣，所以不要先轉成 16k 單聲道
+    want = sample_rate if model_name == 'bytedance' else None
+    audio, native_rate, seconds, original = load_audio(source, want)
     emit('log', message='音檔 %.1f 秒（%d Hz）' % (seconds, native_rate))
     if args.wav_out:
         # 製譜器只播得了 WAV：mp3 / ogg / flac 順便解碼一份原音質的 WAV 放旁邊
@@ -212,6 +293,16 @@ def transcribe(args):
         soundfile.write(args.wav_out, original, native_rate, subtype='PCM_16')
         emit('log', message='已轉出 WAV：%s' % args.wav_out)
     del original
+
+    emit('log', message='轉譜模型：%s' % model_name)
+    if model_name == 'transkun':
+        notes, pedals = _run_transkun(args, source, device, seconds)
+        emit('done', output=args.output, notes=notes, pedals=pedals,
+             seconds=round(seconds, 3), device=device, model=model_name,
+             elapsed=round(time.time() - started, 2))
+        return
+
+    from piano_transcription_inference import PianoTranscription, inference
 
     emit('progress', stage='load_model', done=0, total=1)
     # torch 2.6 起 torch.load 預設 weights_only=True，這份舊 checkpoint 裡除了
@@ -239,7 +330,7 @@ def transcribe(args):
     result = transcriptor.transcribe(audio, args.output)
     emit('done', output=args.output, notes=len(result['est_note_events']),
          pedals=len(result['est_pedal_events'] or []), seconds=round(seconds, 3),
-         device=device, elapsed=round(time.time() - started, 2))
+         device=device, model=model_name, elapsed=round(time.time() - started, 2))
 
 
 def main():
@@ -251,6 +342,12 @@ def main():
     parser.add_argument('--device', default='auto', choices=('auto', 'cuda', 'mps', 'cpu'))
     parser.add_argument('--batch', type=int, default=0)
     parser.add_argument('--wav-out', dest='wav_out')
+    parser.add_argument('--model', default=DEFAULT_MODEL, choices=MODELS,
+                        help='轉譜模型（預設 %s）' % DEFAULT_MODEL)
+    parser.add_argument('--transkun-weight', dest='transkun_weight')
+    parser.add_argument('--transkun-conf', dest='transkun_conf')
+    parser.add_argument('--segment-hop', dest='segment_hop', type=float, default=0.0)
+    parser.add_argument('--segment-size', dest='segment_size', type=float, default=0.0)
     parser.add_argument('--separate', action='store_true',
                         help='轉譜前先把鋼琴分離出來（見 piano_separate）')
     parser.add_argument('--separate-model', dest='separate_model', default='bsrofo')

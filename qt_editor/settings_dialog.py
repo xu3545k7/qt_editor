@@ -310,6 +310,25 @@ class SettingsDialog(QDialog):
         arrange.addRow(QLabel(t('pref_chart_style')), self._style_combo)
         hint(arrange, t('pref_chart_style_hint'))
 
+        ai = section(editing, 'AI 轉譜')
+
+        from .ai_transcribe import DEFAULT_MODEL as AI_DEFAULT_MODEL
+        from .ai_transcribe import MODELS as AI_MODELS
+
+        self._ai_model_combo = QComboBox()
+        for key, label, note in AI_MODELS:
+            self._ai_model_combo.addItem(label, key)
+            self._ai_model_combo.setItemData(
+                self._ai_model_combo.count() - 1, note, Qt.ToolTipRole)
+        want = str(settings.get('ai_transcribe_model', AI_DEFAULT_MODEL))
+        for i, (key, _l, _n) in enumerate(AI_MODELS):
+            if key == want:
+                self._ai_model_combo.setCurrentIndex(i)
+                break
+        ai.addRow(QLabel('轉譜模型'), self._ai_model_combo)
+        hint(ai, '；'.join('%s：%s' % (label, note) for _k, label, note in AI_MODELS)
+             + '。數字是在本機曲庫實測的，不是論文值。')
+
         place = section(editing, '放置音符')
 
         self._place_grid_combo = QComboBox()
@@ -563,6 +582,7 @@ class SettingsDialog(QDialog):
         settings.set('language',      lang_code)
         settings.set('scroll_invert', scroll_inv)
         settings.set('chart_style', self._style_combo.currentData())
+        settings.set('ai_transcribe_model', self._ai_model_combo.currentData())
         # Save export audio processing setting
         settings.set('export_auto_process_audio', bool(self._audio_auto_chk.isChecked()))
         settings.set('keyboard_height_px', int(self._kb_spin.value()))

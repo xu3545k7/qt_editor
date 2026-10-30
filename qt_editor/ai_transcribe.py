@@ -72,6 +72,33 @@ PACKAGES = [
     'matplotlib',        # 套件的 models.py 會 import pyplot，沒用到但少了就 import 失敗
 ]
 
+#: transkun V2 的套件。權重包在 wheel 裡（50.8MB），不用另外下載。
+#:
+#: 為什麼它是預設：在**我們自己的曲庫**實測（14 首乾淨鋼琴軌對照 raw/*.mid、
+#: mir_eval、先扣掉全域偏移），起音 F1 97.3% vs ByteDance 93.4%、**14 首全贏**；
+#: 音長（起音＋結束）56.7% vs 44.8%。速度一樣（RTX 5080 上每首約 8.4 秒）。
+#: MAESTRO 上的排名是反的，別拿論文數字推論這裡——我們的素材是遊戲音樂鋼琴
+#: 翻彈，不是獨奏古典。
+#: 轉譜模型的選單：(代號, 顯示名稱, 說明)。說明是實測值，不是論文值。
+MODELS = (
+    ('transkun', 'transkun V2（預設）',
+     '起音 F1 97.3%、音長 56.7%（14 首實測，14 首全贏）'),
+    ('bytedance', 'ByteDance',
+     '起音 F1 93.4%、音長 44.8%（同一批素材）'),
+)
+DEFAULT_MODEL = 'transkun'
+
+TRANSKUN_PACKAGES = [
+    'transkun==2.0.1',
+    'pretty_midi',
+    'importlib_resources',   # pretty_midi 的 fluidsynth 模組 import 得到才算數
+    'moduleconf',            # transkun 用它讀模型設定
+    'pydub',                 # transkun 自己的讀檔路徑；我們繞開它，但 import 要過
+]
+#: transkun 要 torchaudio，而且**版本必須和 torch 完全一致**。讓 pip 自己解會把
+#: torch 降版，RTX 50 系列就只剩 CPU（和 piano_separate 記的是同一個坑）。
+#: `ncls` 在它的 requirements 裡但建不起來（要編譯器），推論用不到，不裝。
+
 CHECKPOINT_NAME = 'CRNN_note_F1=0.9677_pedal_F1=0.9186.pth'
 CHECKPOINT_SHA256 = 'c3fa9730725bf4a762f1c14bc80cd5986eacda01b026f5a4a2525cd607876141'
 CHECKPOINT_SIZE = 171966578
@@ -623,6 +650,7 @@ def install(cancel: threading.Event, log: Log, progress: Progress,
     log('安裝轉譜套件…')
     _pip(root, PACKAGES, cancel, log, progress, 'packages')
     _install_checkpoint(root, cancel, log, progress)
+    _install_transkun(root, cancel, log, progress, variant)
     if separator:
         _install_separator(root, cancel, log, progress)
     deploy_worker(root)
@@ -647,6 +675,61 @@ def install(cancel: threading.Event, log: Log, progress: Progress,
         info['torch'], device_label(info['device']),
         ('（%s）' % info['device_name']) if info['device_name'] else ''))
     return info
+
+
+def _torchaudio_args(root: str, variant: str) -> List[str]:
+    """`torchaudio==<和環境裡的 torch 完全一樣的版本>`，從同一個索引拿。"""
+    version = ''
+    exe = python_exe(root)
+    if os.path.isfile(exe):
+        try:
+            out = subprocess.run([exe, '-c', 'import torch; print(torch.__version__)'],
+                                 capture_output=True, text=True, timeout=120,
+                                 env=_child_env())
+            version = (out.stdout or '').strip()
+        except Exception:                               # noqa: BLE001
+            version = ''
+    spec = ('torchaudio==%s' % version) if version else 'torchaudio'
+    if P.IS_MAC:
+        return [spec]
+    return [spec, '--index-url', TORCH_INDEX.get(variant, TORCH_INDEX['cpu'])]
+
+
+def _install_transkun(root: str, cancel: threading.Event, log: Log,
+                      progress: Progress, variant: str = 'cpu') -> None:
+    """transkun：套件 + torchaudio。已經裝好就跳過。"""
+    if transkun_installed(root):
+        log('transkun 已存在，略過。')
+        return
+    log('安裝 transkun（預設的轉譜模型）…')
+    # 一律 --no-deps：讓 pip 自己解依賴會把 torch 降版，RTX 50 系列需要 cu128
+    _pip(root, ['--no-deps'] + list(TRANSKUN_PACKAGES), cancel, log, progress,
+         'transkun-pkgs')
+    _pip(root, ['--no-deps'] + _torchaudio_args(root, variant), cancel, log,
+         progress, 'transkun-torchaudio')
+    log('transkun 安裝完成。')
+
+
+def transkun_installed(root: Optional[str] = None) -> bool:
+    """transkun 能不能用。問轉譜環境那邊的直譯器，不是製譜器這邊。"""
+    exe = python_exe(root or env_root())
+    if not os.path.isfile(exe):
+        return False
+    try:
+        out = subprocess.run(
+            [exe, '-c', 'import transkun.Data, moduleconf, torchaudio; print("ok")'],
+            capture_output=True, text=True, timeout=180, env=_child_env())
+    except Exception:                                   # noqa: BLE001
+        return False
+    return 'ok' in (out.stdout or '')
+
+
+def install_transkun(cancel: threading.Event, log: Log, progress: Progress,
+                     root: Optional[str] = None) -> None:
+    """只補裝 transkun（轉譜環境已經有的情況）。"""
+    root = root or env_root()
+    info = installed_info(root) or {}
+    _install_transkun(root, cancel, log, progress, info.get('variant') or 'cpu')
 
 
 def _install_separator(root: str, cancel: threading.Event, log: Log,
@@ -754,7 +837,8 @@ def wav_path_for(audio_path: str) -> str:
 def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
                log: Log, progress: Progress, device: str = 'auto',
                root: Optional[str] = None, want_wav: bool = True,
-               separate: bool = False, separate_model: str = '') -> Dict:
+               separate: bool = False, separate_model: str = '',
+               model: str = '') -> Dict:
     """音檔 → MIDI。回傳 worker 的 done 訊息（notes / pedals / device / elapsed…）。
 
     `separate=True` 且分離模型裝好了的話，先把鋼琴分離出來再轉——混音直接轉
@@ -801,6 +885,12 @@ def transcribe(audio_path: str, output_path: str, cancel: threading.Event,
     args = [python_exe(root), worker_path(root), '--input', audio_path,
             '--output', tmp_output, '--checkpoint', checkpoint_path(root),
             '--device', device]
+    # 選了 transkun 但它沒裝好就退回 ByteDance——轉得出來比轉不出來重要。
+    want = (model or DEFAULT_MODEL).lower()
+    if want == 'transkun' and not transkun_installed(root):
+        log('transkun 還沒裝，這次用 ByteDance。')
+        want = 'bytedance'
+    args += ['--model', want]
     if separate and separator_installed(root):
         # 分離出來的鋼琴軌留在音檔旁邊：使用者可以自己聽、也可以當成以後的素材。
         # `--env` 只在這條路上給——舊的 worker 不認識它，多給會讓 argparse 退出。
