@@ -661,3 +661,100 @@ class TranskunInstallTests(unittest.TestCase):
         with mock.patch.object(AT, 'python_exe', lambda root=None: '/nope/python'):
             args = AT._torchaudio_args('/nope', 'cu128')
         self.assertIn('torchaudio', args)
+
+
+class ComponentTopUpTests(unittest.TestCase):
+    """環境已經裝好、後來才多出必要元件時要**補裝**，不是重裝。
+
+    把 `ENV_VERSION` 加一號會讓 `installed_info()` 回 None、整個環境被當成
+    沒裝，於是跳出重裝 5.7GB 的流程——而缺的通常只有幾十 MB。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='ai_components_test_')
+        os.makedirs(os.path.dirname(AT.checkpoint_path(self.root)))
+        open(AT.checkpoint_path(self.root), 'wb').close()
+        with open(os.path.join(self.root, 'installed.json'), 'w', encoding='utf-8') as fh:
+            json.dump({'env_version': AT.ENV_VERSION, 'device': 'cpu',
+                       'variant': 'cpu'}, fh)
+        self._patch = mock.patch.object(AT, 'python_exe',
+                                        lambda root=None: sys.executable)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _status(self, **kw):
+        base = {'transkun': True, 'bsrofo': True, 'demucs': True}
+        base.update(kw)
+        return mock.patch.object(AT, 'component_status', lambda root=None: base)
+
+    def test_nothing_missing_means_nothing_to_do(self):
+        with self._status():
+            self.assertEqual(AT.missing_components(self.root), [])
+
+    def test_a_missing_required_component_is_reported(self):
+        with self._status(transkun=False):
+            self.assertEqual(AT.missing_components(self.root), ['transkun'])
+
+    def test_optional_components_are_not_reported_by_default(self):
+        """分離器是選配（+699MB），不該自己跑去裝。"""
+        with self._status(bsrofo=False, demucs=False):
+            self.assertEqual(AT.missing_components(self.root), [])
+
+    def test_asking_for_everything_includes_the_optional_ones(self):
+        with self._status(bsrofo=False, demucs=False):
+            got = AT.missing_components(self.root, required_only=False)
+        self.assertIn('bsrofo', got)
+        self.assertIn('demucs', got)
+
+    def test_an_uninstalled_environment_reports_nothing(self):
+        """環境本身沒裝就走原本的安裝流程，不要在那邊喊缺元件。"""
+        os.remove(os.path.join(self.root, 'installed.json'))
+        self.assertEqual(AT.missing_components(self.root), [])
+
+    def test_installing_runs_only_what_was_asked_for(self):
+        calls = []
+        with mock.patch.object(AT, '_install_transkun',
+                               lambda *a, **k: calls.append('transkun')),                 mock.patch.object(AT, '_install_separator',
+                                  lambda *a, **k: calls.append('bsrofo')),                 self._status():
+            AT.install_components(['transkun'], threading.Event(),
+                                  lambda m: None, lambda *a: None, self.root)
+        self.assertEqual(calls, ['transkun'])
+
+    def test_it_reports_what_still_does_not_work(self):
+        with mock.patch.object(AT, '_install_transkun', lambda *a, **k: None),                 self._status(transkun=False):
+            left = AT.install_components(['transkun'], threading.Event(),
+                                         lambda m: None, lambda *a: None, self.root)
+        self.assertEqual(left, ['transkun'])
+
+    def test_one_failing_component_does_not_stop_the_others(self):
+        calls = []
+
+        def boom(*a, **k):
+            raise RuntimeError('下載失敗')
+
+        with mock.patch.object(AT, '_install_transkun', boom),                 mock.patch.object(AT, '_install_separator',
+                                  lambda *a, **k: calls.append('bsrofo')),                 self._status():
+            AT.install_components(['transkun', 'bsrofo'], threading.Event(),
+                                  lambda m: None, lambda *a: None, self.root)
+        self.assertEqual(calls, ['bsrofo'])
+
+    def test_cancelling_stops_immediately(self):
+        def cancelled(*a, **k):
+            raise AT.Cancelled()
+
+        with mock.patch.object(AT, '_install_transkun', cancelled), self._status():
+            with self.assertRaises(AT.Cancelled):
+                AT.install_components(['transkun'], threading.Event(),
+                                      lambda m: None, lambda *a: None, self.root)
+
+    def test_every_component_has_a_label_and_a_size(self):
+        for key, label, required, size in AT.COMPONENTS:
+            self.assertTrue(key and label)
+            self.assertIsInstance(required, bool)
+            self.assertGreater(size, 0, '%s 沒寫大概多大' % key)
+        required = [k for k, _l, r, _s in AT.COMPONENTS if r]
+        self.assertEqual(required, ['transkun'],
+                         '只有預設設定跑不起來的才算必要')

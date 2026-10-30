@@ -732,6 +732,67 @@ def install_transkun(cancel: threading.Event, log: Log, progress: Progress,
     _install_transkun(root, cancel, log, progress, info.get('variant') or 'cpu')
 
 
+#: 轉譜環境**裝好之後**才可能補上的元件：
+#: (代號, 顯示名稱, 預設就該有嗎, 大約幾 MB)
+#:
+#: 「預設就該有」＝沒有它的話預設設定跑不起來。transkun 是預設模型，所以算；
+#: 分離器是選配（混音才要，+699MB），不會自動補。
+COMPONENTS = (
+    ('transkun', 'transkun（預設的轉譜模型）', True, 60),
+    ('bsrofo', '鋼琴分離 BS-Rofo（混音用）', False, 699),
+    ('demucs', '鋼琴分離 demucs（快一點、差一點）', False, 90),
+)
+
+
+def component_status(root: Optional[str] = None) -> Dict[str, bool]:
+    """每個元件現在能不能用。環境本身沒裝的話全部 False。"""
+    root = root or env_root()
+    if not os.path.isfile(python_exe(root)):
+        return {key: False for key, _l, _r, _s in COMPONENTS}
+    out = dict(separator_models(root))
+    out['transkun'] = transkun_installed(root)
+    return {key: bool(out.get(key)) for key, _l, _r, _s in COMPONENTS}
+
+
+def missing_components(root: Optional[str] = None,
+                       required_only: bool = True) -> List[str]:
+    """哪些元件該有卻沒有。
+
+    用在「環境是舊版裝的、後來才多出必要元件」——那種情況不該叫人重裝整個
+    5.7GB 的環境（把 `ENV_VERSION` 加一號就會變成那樣），補上缺的那幾十 MB
+    就夠了。
+    """
+    if not is_installed(root):
+        return []
+    status = component_status(root)
+    return [key for key, _l, required, _s in COMPONENTS
+            if (required or not required_only) and not status.get(key)]
+
+
+def install_components(keys: List[str], cancel: threading.Event, log: Log,
+                       progress: Progress, root: Optional[str] = None) -> List[str]:
+    """補裝指定的元件。回傳**裝完之後仍然不能用**的那些。"""
+    root = root or env_root()
+    info = installed_info(root) or {}
+    variant = info.get('variant') or 'cpu'
+    for key in keys:
+        try:
+            if key == 'transkun':
+                _install_transkun(root, cancel, log, progress, variant)
+            elif key == 'bsrofo':
+                _install_separator(root, cancel, log, progress)
+            elif key == 'demucs':
+                install_demucs(cancel, log, progress, root)
+            else:
+                log('不認得的元件：%s' % key)
+        except Cancelled:
+            raise
+        except Exception as exc:                        # noqa: BLE001
+            log('%s 安裝失敗：%s' % (key, exc))
+    status = component_status(root)
+    return [key for key in keys if not status.get(key)]
+
+
 def _install_separator(root: str, cancel: threading.Event, log: Log,
                        progress: Progress) -> None:
     """鋼琴分離模型：套件 + 權重。已經裝好就跳過。"""

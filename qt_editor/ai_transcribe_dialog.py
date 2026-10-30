@@ -299,6 +299,48 @@ class SeparateDialog(QDialog):
         return ''
 
 
+def ensure_components(parent) -> None:
+    """環境已經裝好、但後來多出來的必要元件還沒補上的話，問一次要不要補。
+
+    不把 `ENV_VERSION` 加一號：那會讓整個環境被當成沒裝、跳出重裝 5.7GB 的流程，
+    而這裡缺的通常只有幾十 MB。
+
+    按「否」就記起來，不要每次轉譜都問一次——轉得出來比轉不出來重要，沒補的話
+    會退回舊模型（`AT.transcribe` 裡有那條退路）。
+    """
+    if not AT.is_installed():
+        return                              # 環境本身沒裝，走原本的安裝流程
+    missing = AT.missing_components()
+    if not missing:
+        return
+    key = 'ai_skip_components_' + ','.join(sorted(missing))
+    if settings.get(key, False):
+        return
+    labels = {k: label for k, label, _r, _s in AT.COMPONENTS}
+    sizes = {k: size for k, _l, _r, size in AT.COMPONENTS}
+    nl = chr(10)
+    text = tr('轉譜環境少了這些：%s現在補裝嗎？（約 %d MB）') % (
+        nl + nl + nl.join('・%s' % labels.get(k, k) for k in missing) + nl + nl,
+        sum(sizes.get(k, 0) for k in missing))
+    answer = QMessageBox.question(parent, tr('補裝轉譜元件'), text,
+                                  QMessageBox.Yes | QMessageBox.No,
+                                  QMessageBox.Yes)
+    if answer != QMessageBox.Yes:
+        settings.set(key, True)
+        return
+    task = TaskDialog(parent, tr('補裝轉譜元件'), tr('下載中…'),
+                      lambda cancel, log, progress:
+                      AT.install_components(missing, cancel, log, progress))
+    task.exec_()
+    if task.error:
+        QMessageBox.critical(parent, tr('安裝失敗'), task.error)
+    elif task.result_value:
+        QMessageBox.warning(
+            parent, tr('補裝轉譜元件'),
+            tr('這些還是不能用：%s') % '、'.join(
+                labels.get(k, k) for k in task.result_value))
+
+
 def ask_separate(parent, audio_path: str) -> str:
     """要不要先分離鋼琴、用哪個。回傳分離器的名字；不分離回空字串。
 
@@ -335,6 +377,7 @@ def run_transcribe(parent, audio_path: str, output_path: str,
     `want_wav=False`：非 WAV 的輸入不順便解一份同名 WAV（只要 MIDI 檔的時候用）。
     `separate=None` 會先問使用者要不要分離鋼琴、用哪個分離器；給空字串就不分離。
     """
+    ensure_components(parent)
     if separate is None:
         separate = ask_separate(parent, audio_path)
     hint = '%s\n\n%s' % (os.path.basename(audio_path),
