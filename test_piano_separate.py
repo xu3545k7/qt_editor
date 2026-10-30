@@ -183,9 +183,18 @@ class DialogTests(unittest.TestCase):
         dlg._skip.setChecked(True)
         self.assertEqual(dlg.choice(), '')
 
-    def test_a_piano_stem_is_never_separated_again(self):
-        from qt_editor.ai_transcribe_dialog import ask_separate
-        self.assertEqual(ask_separate(None, r'C:\x\Evans_piano.wav'), '')
+    def test_a_piano_stem_defaults_to_no_separation(self):
+        """檔名看起來已經是鋼琴分軌就預設不分離。
+
+        以前這種檔案**整個對話框都不開**，於是轉譜模型也跟著選不到——使用者：
+        「沒看到轉譜選項，只有分離器」。現在照樣開，只是「不分離」預設勾好。
+        """
+        from qt_editor.ai_transcribe_dialog import SeparateDialog
+        dlg = SeparateDialog(None, {'bsrofo': True, 'demucs': True},
+                             piano_already=True)
+        self.assertTrue(dlg._skip.isChecked())
+        self.assertEqual(dlg.choice(), '')
+        self.assertTrue(dlg._models, '模型那一組還是要在')
 
     def test_an_uninstalled_model_is_still_offered(self):
         """沒裝的也要列出來（標「要先下載」），不然使用者不知道有這個選擇。"""

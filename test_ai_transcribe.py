@@ -758,3 +758,61 @@ class ComponentTopUpTests(unittest.TestCase):
         required = [k for k, _l, r, _s in AT.COMPONENTS if r]
         self.assertEqual(required, ['transkun'],
                          '只有預設設定跑不起來的才算必要')
+
+
+class ModelPickerIsVisibleTests(unittest.TestCase):
+    """轉譜模型要在**轉譜流程裡**看得到，不是只藏在偏好設定。
+
+    使用者：「沒看到轉譜選項，只有分離器」。同一個決定的兩半（用哪個模型、要不要
+    先分離）不該一半在對話框、一半在設定裡。偏好設定那一欄留著當記住的預設值。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def dialog(self, **kw):
+        from qt_editor.ai_transcribe_dialog import SeparateDialog
+        opts = {'available': {'bsrofo': True, 'demucs': True},
+                'models_ready': {'transkun': True, 'bytedance': True},
+                'piano_already': False}
+        opts.update(kw)
+        return SeparateDialog(None, opts['available'], opts['models_ready'],
+                              opts['piano_already'])
+
+    def test_both_choices_are_in_the_same_dialog(self):
+        from PyQt5.QtWidgets import QGroupBox
+        dlg = self.dialog()          # 要留著：不留參考的話 widget 當場就被回收
+        titles = [b.title() for b in dlg.findChildren(QGroupBox)]
+        self.assertTrue(any('轉譜模型' in t for t in titles), titles)
+        self.assertTrue(any('分離器' in t for t in titles), titles)
+
+    def test_every_model_is_offered(self):
+        dlg = self.dialog()
+        self.assertEqual(sorted(dlg._models), sorted(k for k, _l, _n in AT.MODELS))
+
+    def test_the_default_is_preselected(self):
+        self.assertEqual(self.dialog().model(), AT.DEFAULT_MODEL)
+
+    def test_a_model_that_needs_downloading_says_so(self):
+        dlg = self.dialog(models_ready={'transkun': False, 'bytedance': True})
+        self.assertIn('下載', dlg._models['transkun'].text())
+        self.assertNotIn('下載', dlg._models['bytedance'].text())
+
+    def test_the_measured_numbers_are_on_screen(self):
+        """選哪個是有代價的決定，不該只給一個不說理由的選項。"""
+        dlg = self.dialog()
+        for key, btn in dlg._models.items():
+            self.assertIn('F1', btn.text(), key)
+
+    def test_a_piano_stem_still_gets_the_model_picker(self):
+        """以前這種檔案整個對話框都不開，模型就跟著選不到。"""
+        dlg = self.dialog(piano_already=True)
+        self.assertTrue(dlg._models)
+        self.assertTrue(dlg._skip.isChecked(), '已經是分軌就預設不分離')
+
+    def test_picking_one_reports_it(self):
+        dlg = self.dialog()
+        dlg._models['bytedance'].setChecked(True)
+        self.assertEqual(dlg.model(), 'bytedance')

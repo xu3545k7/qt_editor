@@ -325,8 +325,10 @@ class SettingsDialog(QDialog):
             if key == want:
                 self._ai_model_combo.setCurrentIndex(i)
                 break
-        ai.addRow(QLabel('轉譜模型'), self._ai_model_combo)
-        hint(ai, '；'.join('%s：%s' % (label, note) for _k, label, note in AI_MODELS)
+        ai.addRow(QLabel('預設的轉譜模型'), self._ai_model_combo)
+        hint(ai, '每次轉譜的「AI 轉譜」視窗裡也選得到並且可以當場改，這裡設的是'
+                 '預設值。' + '；'.join('%s：%s' % (label, note)
+                                        for _k, label, note in AI_MODELS)
              + '。數字是在本機曲庫實測的，不是論文值。')
 
         place = section(editing, '放置音符')

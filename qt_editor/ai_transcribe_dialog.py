@@ -249,17 +249,44 @@ def run_install(parent, variant: Optional[str] = None) -> bool:
 
 
 class SeparateDialog(QDialog):
-    """要不要先分離鋼琴、用哪個分離器。
+    """這一次要怎麼轉：用哪個模型、要不要先分離鋼琴。
 
-    兩個分離器都列出來，連實測數字一起——選哪個是有代價的決定（速度 vs 品質），
-    不該只給一個不說理由的勾選框。沒裝的那個標「要下載」，選了會先裝。
+    兩個選擇都列出來，**連實測數字一起**——兩個都是有代價的決定，不該只給一個
+    不說理由的勾選框。沒裝的那個標「要先下載」，選了會先裝。
+
+    轉譜模型原本只放在偏好設定裡，結果使用者在轉譜流程裡找不到（「沒看到轉譜
+    選項，只有分離器」）。同一個決定的兩半不該一半在這裡、一半藏在設定裡。
+    偏好設定那一欄留著當**記住的預設值**，這裡顯示並且可以當場改。
     """
 
-    def __init__(self, parent, available: Dict[str, bool]):
+    def __init__(self, parent, available: Dict[str, bool],
+                 models_ready: Optional[Dict[str, bool]] = None,
+                 piano_already: bool = False):
         super().__init__(parent)
-        self.setWindowTitle(tr('AI 轉譜：先分離鋼琴'))
+        self.setWindowTitle(tr('AI 轉譜'))
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
+
+        models_ready = models_ready or {}
+        model_box = QGroupBox(tr('用哪個轉譜模型'))
+        model_inner = QVBoxLayout(model_box)
+        want_model = str(settings.get('ai_transcribe_model', AT.DEFAULT_MODEL))
+        self._models = {}
+        for key, label, note in AT.MODELS:
+            text = '%s　—　%s' % (label, tr(note))
+            if models_ready.get(key) is False:
+                text += tr('（要先下載）')
+            btn = QRadioButton(text)
+            btn.setChecked(key == want_model)
+            self._models[key] = btn
+            model_inner.addWidget(btn)
+        if not any(b.isChecked() for b in self._models.values()):
+            self._models[AT.DEFAULT_MODEL].setChecked(True)
+        model_note = QLabel(tr('數字是在本機曲庫實測的（14 首乾淨鋼琴軌），不是論文值。'))
+        model_note.setStyleSheet('color: #555; font-size: 11px;')
+        model_note.setWordWrap(True)
+        model_inner.addWidget(model_note)
+        layout.addWidget(model_box)
 
         intro = QLabel(tr(SEPARATE_HINT))
         intro.setWordWrap(True)
@@ -282,7 +309,15 @@ class SeparateDialog(QDialog):
 
         self._skip = QCheckBox(tr('不要分離，直接轉原始音檔'))
         self._skip.setToolTip(tr('手上已經是鋼琴錄音的話就不用分離。'))
+        # 檔名看起來已經是鋼琴分軌：預設就不分離，再分一次只會多掉東西。
+        # 以前這種檔案**整個對話框都不開**，於是模型也跟著選不到。
+        self._skip.setChecked(piano_already)
         layout.addWidget(self._skip)
+        if piano_already:
+            already = QLabel(tr('這個檔名看起來已經是鋼琴分軌，所以預設不分離。'))
+            already.setStyleSheet('color: #555; font-size: 11px;')
+            already.setWordWrap(True)
+            layout.addWidget(already)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -290,13 +325,20 @@ class SeparateDialog(QDialog):
         layout.addWidget(buttons)
 
     def choice(self) -> str:
-        """選了哪個；不分離就回空字串。"""
+        """選了哪個分離器；不分離就回空字串。"""
         if self._skip.isChecked():
             return ''
         for key, btn in self._buttons.items():
             if btn.isChecked():
                 return key
         return ''
+
+    def model(self) -> str:
+        """選了哪個轉譜模型。"""
+        for key, btn in self._models.items():
+            if btn.isChecked():
+                return key
+        return AT.DEFAULT_MODEL
 
 
 def ensure_components(parent) -> None:
@@ -341,20 +383,34 @@ def ensure_components(parent) -> None:
                 labels.get(k, k) for k in task.result_value))
 
 
-def ask_separate(parent, audio_path: str) -> str:
-    """要不要先分離鋼琴、用哪個。回傳分離器的名字；不分離回空字串。
+def ask_how(parent, audio_path: str):
+    """問「這一次要怎麼轉」：模型 ＋ 要不要分離。回傳 (模型, 分離器)。
 
-    檔名看起來已經是鋼琴分軌就不問——那本來就乾淨，再分一次只會多掉東西。
+    取消回 `(None, None)`。分離器不選就是空字串。
+
+    **已經是鋼琴分軌的檔案也要問。** 以前那種檔案整個對話框都不開（反正不用
+    分離），結果連模型都選不到——使用者：「沒看到轉譜選項，只有分離器」。
+    現在照樣開，只是「不分離」預設勾好。
     """
-    if os.path.basename(audio_path).lower().endswith('_piano.wav'):
-        return ''
+    piano_already = os.path.basename(audio_path).lower().endswith('_piano.wav')
     available = AT.separator_models()
-    dlg = SeparateDialog(parent, available)
+    models_ready = AT.component_status() if AT.is_installed() else {}
+    models_ready.setdefault('bytedance', True)
+    dlg = SeparateDialog(parent, available, models_ready, piano_already)
     if dlg.exec_() != QDialog.Accepted:
-        return ''
+        return None, None
+    model = dlg.model()
+    settings.set('ai_transcribe_model', model)      # 下次的預設
+    if model == 'transkun' and models_ready.get('transkun') is False:
+        task = TaskDialog(parent, tr('安裝 transkun'), tr('下載中…'),
+                          lambda cancel, log, progress:
+                          AT.install_components(['transkun'], cancel, log, progress))
+        task.exec_()
+        if task.error:
+            QMessageBox.critical(parent, tr('安裝失敗'), task.error)
     choice = dlg.choice()
     if not choice or available.get(choice):
-        return choice
+        return model, choice
 
     # 選到還沒裝的那個，先裝
     if choice == 'demucs':
@@ -366,7 +422,7 @@ def ask_separate(parent, audio_path: str) -> str:
     task.exec_()
     if task.error:
         QMessageBox.critical(parent, tr('安裝失敗'), task.error)
-    return choice if AT.separator_models().get(choice) else ''
+    return model, (choice if AT.separator_models().get(choice) else '')
 
 
 def run_transcribe(parent, audio_path: str, output_path: str,
@@ -375,11 +431,15 @@ def run_transcribe(parent, audio_path: str, output_path: str,
     """跑轉譜；成功回傳 worker 的結果（notes / pedals / device / elapsed），否則 None。
 
     `want_wav=False`：非 WAV 的輸入不順便解一份同名 WAV（只要 MIDI 檔的時候用）。
-    `separate=None` 會先問使用者要不要分離鋼琴、用哪個分離器；給空字串就不分離。
+    `separate=None` 會先開「AI 轉譜」對話框問模型與分離器；給空字串就不分離、
+    模型用偏好設定記住的那個。
     """
     ensure_components(parent)
+    model = str(settings.get('ai_transcribe_model', AT.DEFAULT_MODEL))
     if separate is None:
-        separate = ask_separate(parent, audio_path)
+        model, separate = ask_how(parent, audio_path)
+        if model is None:
+            return None                     # 使用者取消
     hint = '%s\n\n%s' % (os.path.basename(audio_path),
                          (tr('先用 %s 分離鋼琴。') % SEP.MODELS[separate]['label'])
                          if separate else SOLO_PIANO_HINT)
@@ -387,9 +447,7 @@ def run_transcribe(parent, audio_path: str, output_path: str,
                      lambda cancel, log, progress: AT.transcribe(
                          audio_path, output_path, cancel, log, progress,
                          want_wav=want_wav, separate=bool(separate),
-                         separate_model=separate or '',
-                         model=str(settings.get('ai_transcribe_model',
-                                                AT.DEFAULT_MODEL))))
+                         separate_model=separate or '', model=model))
     dlg.exec_()
     if dlg.result_value is None and dlg.error:
         # 失敗時視窗留著讓使用者看紀錄，關掉後再給一個簡短的錯誤框
