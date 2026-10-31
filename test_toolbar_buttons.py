@@ -158,13 +158,29 @@ class BarlineDragToggleTests(unittest.TestCase):
         self.win._on_barline_drag_toggled(True)
         self.assertTrue(all(a.isChecked() for a in self._acts()))
 
-    def test_the_drag_is_gated_on_the_flag(self):
-        """閘門要同時看 time_uniform 和這個旗標。"""
+    def test_the_drag_is_gated_on_the_flag_alone(self):
+        """只看這個旗標。**不再綁「小節均分模式」**。
+
+        使用者：「拖曳小節線不再是時間均分專用」。那個模式管的是小節內拍點
+        怎麼重排，和「能不能拖小節線」是兩件事。
+        """
         import inspect
 
         from qt_editor import chart_view
         source = inspect.getsource(chart_view.ChartView.mousePressEvent)
-        self.assertIn('self.time_uniform and self.barline_drag_enabled', source)
+        self.assertIn('if self.barline_drag_enabled:', source)
+        self.assertNotIn('self.time_uniform and self.barline_drag_enabled', source)
+
+    def test_it_defaults_to_off(self):
+        """使用者：「默認都是關閉」。判定只看離小節線 6 像素，開著很容易誤觸。"""
+        from qt_editor.settings import settings
+        before = settings.get('barline_drag_enabled', None)
+        try:
+            settings.set('barline_drag_enabled', None)
+            self.assertFalse(bool(settings.get('barline_drag_enabled', False)))
+        finally:
+            if before is not None:
+                settings.set('barline_drag_enabled', before)
 
 
 class MidiPianoButtonRemovedTests(unittest.TestCase):
@@ -389,3 +405,98 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
                     if not w.isHidden())
         self.assertLess(total + 244, 2560,
                         '小節分頁 %d px ＋音量 244 放不進 2560' % total)
+
+
+class NotesLockedTests(unittest.TestCase):
+    """「鎖定音符」＝只調整小節線時間的狀態。預設關，放在常用分頁。
+
+    開著的時候拖曳小節線：
+    ・不會動到音符
+    ・自動吸附到最近的**音符終點**（尾拍）
+    ・盡量讓算出來的 BPM 落在整數上——差不到 0.1 才取整。AI 轉譜本身的誤差
+      遠大於 0.1，所以這等於免費（使用者原話：「除非差 0.1bpm 以上，依 AI
+      轉譜可接受誤差來說應該不會」）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from qt_editor.chart_view import ChartView
+        cls.view = ChartView()
+        cls.view.resize(1200, 720)
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        m.ensure_precise_beat_grid()
+        m.notes_tree = [note(1000 + 500 * i, 60, gate=200, idx=i)
+                        for i in range(10)]        # 終點 1200, 1700, 2200…
+        m.rebuild_display_cache()
+        cls.view.load_model(m)
+        cls.view.rebuild_mapper()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.view.model.dirty = False
+        cls.view.close()
+
+    def setUp(self):
+        self.view.notes_locked = False
+        self.view._snap_targets_cache = None
+
+    def test_it_is_off_by_default(self):
+        from qt_editor.chart_view import ChartView
+        self.assertFalse(ChartView().notes_locked)
+
+    def test_there_is_nothing_to_snap_to_when_unlocked(self):
+        """沒鎖住的時候格線是基準，不該被音符拉著走。"""
+        self.assertEqual(self.view._barline_snap_targets(), [])
+        self.assertEqual(self.view._barline_snap(1690.0), (1690.0, None))
+
+    def test_locked_snaps_to_note_ends(self):
+        self.view.notes_locked = True
+        self.assertIn(1700, self.view._barline_snap_targets())
+        got, hit = self.view._barline_snap(1690.0)
+        self.assertEqual((got, hit), (1700.0, 1700))
+
+    def test_it_snaps_to_ends_not_starts(self):
+        """尾拍＝音符終點。起點 1500 不該是吸附目標。"""
+        self.view.notes_locked = True
+        self.assertNotIn(1500, self.view._barline_snap_targets())
+
+    def test_it_does_not_drag_you_across_the_room(self):
+        self.view.notes_locked = True
+        far = 1700 + self.view.BARLINE_SNAP_MS + 10
+        got, hit = self.view._barline_snap(float(far))
+        self.assertIsNone(hit)
+        self.assertEqual(got, float(far))
+
+    def test_a_bpm_close_to_an_integer_becomes_one(self):
+        bpm, rounded = self.view._barline_bpm(0, 1950)   # 123.0769
+        self.assertTrue(rounded)
+        self.assertEqual(bpm, 123.0)
+
+    def test_a_bpm_far_from_an_integer_keeps_its_decimals(self):
+        bpm, rounded = self.view._barline_bpm(0, 1800)   # 133.333
+        self.assertFalse(rounded)
+        self.assertAlmostEqual(bpm, 133.333, places=2)
+
+    def test_the_tolerance_is_a_tenth_of_a_bpm(self):
+        self.assertEqual(self.view.BPM_ROUND_TOLERANCE, 0.1)
+
+    def test_an_exact_bpm_stays_exact(self):
+        bpm, _rounded = self.view._barline_bpm(0, 2000)
+        self.assertEqual(bpm, 120.0)
+
+    def test_the_toggle_is_on_the_common_tab(self):
+        """使用者指定放在常用。它沒有快捷鍵，符合那一頁的規則。"""
+        from PyQt5.QtWidgets import QToolButton
+        from qt_editor.main_window import MainWindow
+        with contextlib.redirect_stdout(io.StringIO()):
+            win = MainWindow()
+        try:
+            page = win._toolbars[0].tabs.widget(0)
+            labels = [b.text() for b in page.findChildren(QToolButton)]
+            self.assertTrue(any('鎖定音符' in x for x in labels), labels)
+            act = win._toolbars[0].notes_locked_act
+            self.assertTrue(act.isCheckable())
+            self.assertFalse(act.isChecked(), '預設該是關的')
+        finally:
+            win.view.model.dirty = False
+            win.close()

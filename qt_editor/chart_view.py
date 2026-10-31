@@ -603,19 +603,27 @@ class ChartView(QWidget):
         self._drag_status: str = ''
 
         #: 小節線拖曳要不要啟動。那個拖曳會改前一小節的 BPM，而判定只看
-        #: 游標離小節線 6 像素，所以在小節線附近框選很容易誤觸。預設維持開著
-        #: （不改變原本行為），關掉之後同一個位置就只會框選。
-        self.barline_drag_enabled: bool = True
+        #: 游標離小節線 6 像素，所以在小節線附近框選很容易誤觸。
+        #:
+        #: **預設關**（使用者：「默認都是關閉」）。以前預設開著還安全，是因為
+        #: 那條路同時要求「小節均分模式」；現在那道閘門拿掉了，開著的話在小節
+        #: 線附近點一下就變成拖曳而不是選取（實測 test_place_mode_select 的
+        #: 邊緣位移整個失效）。
+        self.barline_drag_enabled: bool = False
         # 小節線拖曳（time_uniform 模式下）
         self._barline_dragging: bool = False
         self._barline_drag_measure: Optional[int] = None  # 目標要改變 BPM 的小節 index (0-based)
         self._barline_drag_start_ms: Optional[int] = None
         self._barline_drag_orig_end_ms: Optional[int] = None
         self._barline_drag_py: Optional[int] = None
-        #: 拖曳小節線時音符要不要跟著走。預設**不跟**——和其他改格線的操作
-        #: （每小節 BPM、改拍號的均分）一致。拖的途中按住 Alt 就切成「連音符
-        #: 一起拖」，提示文字即時跟著變。
+        #: 拖曳小節線時音符要不要跟著走。由「鎖定音符」開關決定（鎖住＝不跟），
+        #: 拖的途中按住 Alt 可以臨時反轉，提示文字即時跟著變。
         self._barline_drag_moves_notes: bool = False
+        #: 吸附到的那顆音符終點（拖曳中用來畫提示）；沒吸到就是 None
+        self._barline_snap_ms: Optional[int] = None
+        #: 「鎖定音符」：進入「只調整小節線時間」的狀態。預設關。
+        #: 開著的時候拖小節線不會動到音符，而且會自動吸附到音符終點。
+        self.notes_locked: bool = False
 
         # ── 預覽模式 ──────────────────────────────────────────
         self.preview_mode: bool = False
@@ -3811,15 +3819,18 @@ class ChartView(QWidget):
                 # 嘗試計算暫時 BPM 並顯示在狀態列
                 if self._barline_drag_start_ms is not None:
                     cur_ms = self.mapper.unit_to_ms(self._py_to_unit_abs(self._barline_drag_py))
-                    new_dur = max(1, int(round(cur_ms - float(self._barline_drag_start_ms))))
-                    num = self.model.get_beats_per_bar_at_ms(int(self._barline_drag_start_ms))
-                    den = self.model.time_sig_denominator
-                    new_bpm = num * 4.0 * 60000.0 / (den * float(new_dur))
+                    start_ms = float(self._barline_drag_start_ms)
+                    new_bpm, rounded = self._barline_bpm(start_ms, cur_ms)
                     qp.setPen(TIME_LABEL)
                     mode = ('連音符一起拖' if self._barline_drag_moves_notes
                             else '只動小節線')
-                    qp.drawText(6, int(self._barline_drag_py) - 6,
-                                '%.2f BPM　%s（Alt 切換）' % (new_bpm, mode))
+                    bits = ['%.2f BPM' % new_bpm]
+                    if rounded:
+                        bits.append('整數')
+                    if self._barline_snap_ms is not None:
+                        bits.append('吸到音符尾 %d ms' % self._barline_snap_ms)
+                    bits.append('%s（Alt 切換）' % mode)
+                    qp.drawText(6, int(self._barline_drag_py) - 6, '　'.join(bits))
             except Exception:
                 pass
 
@@ -6036,8 +6047,10 @@ class ChartView(QWidget):
                     self.selection_changed.emit(len(self.selected))
                     self.update()
                     return
-            # 若 time_uniform 模式且靠近小節線，啟動小節線拖曳
-            if self.time_uniform and self.barline_drag_enabled:
+            # 靠近小節線就啟動拖曳。**不再綁「小節均分模式」**——使用者：
+            # 「拖曳小節線不再是時間均分專用」。那個模式管的是小節內拍點怎麼
+            # 重排，和「能不能拖小節線」是兩件事。
+            if self.barline_drag_enabled:
                 ws_ms, we_ms = self.mapper.window_ms_range(self.window_start_unit, self.window_size_unit)
                 beats = self.model.get_beat_entries()
                 if beats:
@@ -6061,8 +6074,11 @@ class ChartView(QWidget):
                             if start_ms is not None and end_ms is not None:
                                 # 開始拖曳：目標為前一小節（改變前一小節 BPM）
                                 self._barline_dragging = True
-                                self._barline_drag_moves_notes = bool(
-                                    event.modifiers() & Qt.AltModifier)
+                                # 鎖定音符 ＝ 不動音符；Alt 臨時反轉
+                                self._barline_drag_moves_notes = (
+                                    self.notes_locked
+                                    == bool(event.modifiers() & Qt.AltModifier))
+                                self._barline_snap_ms = None
                                 self._barline_drag_measure = prev_idx
                                 self._barline_drag_start_ms = start_ms
                                 self._barline_drag_orig_end_ms = end_ms
@@ -6180,7 +6196,18 @@ class ChartView(QWidget):
         # 小節線拖曳 - 更新顯示位置與暫時 BPM
         if getattr(self, '_barline_dragging', False) and (event.buttons() & Qt.LeftButton):
             # 拖的途中隨時可以切換（使用者要的是「拖的時候可以切換」）
-            self._barline_drag_moves_notes = bool(event.modifiers() & Qt.AltModifier)
+            self._barline_drag_moves_notes = (
+                self.notes_locked == bool(event.modifiers() & Qt.AltModifier))
+            # 鎖住音符時吸附到最近的音符終點；吸到的話線就畫在那裡
+            try:
+                raw = self.mapper.unit_to_ms(self._py_to_unit_abs(pos.y()))
+                snapped, hit = self._barline_snap(raw)
+                self._barline_snap_ms = hit
+                if hit is not None:
+                    unit = self.mapper.ms_to_unit(snapped) - self.window_start_unit
+                    pos = QPoint(pos.x(), int(self._unit_to_py(unit)))
+            except Exception:                               # noqa: BLE001
+                self._barline_snap_ms = None
             self._barline_drag_py = pos.y()
             # 計算暫時 BPM 並更新狀態欄
             try:
@@ -6301,11 +6328,10 @@ class ChartView(QWidget):
                     self._emit_status()
                     return
                 start_ms = int(self._barline_drag_start_ms or 0)
-                cur_ms = int(round(self.mapper.unit_to_ms(self._py_to_unit_abs(event.pos().y()))))
-                new_dur = max(1, cur_ms - start_ms)
-                num = self.model.get_beats_per_bar_at_ms(start_ms)
-                den = self.model.time_sig_denominator
-                new_bpm = num * 4.0 * 60000.0 / (den * float(new_dur))
+                raw_ms = self.mapper.unit_to_ms(self._py_to_unit_abs(event.pos().y()))
+                # 吸到音符終點，再盡量讓 BPM 落在整數上（兩件事使用者一起要的）
+                cur_ms, _hit = self._barline_snap(raw_ms)
+                new_bpm, _rounded = self._barline_bpm(start_ms, cur_ms)
                 # 推入歷史並套用
                 self.model.push_history()
                 grid_end_before = self.model.grid_end_ms()
@@ -6323,6 +6349,7 @@ class ChartView(QWidget):
                 self._barline_drag_measure = None
                 self._barline_drag_start_ms = None
                 self._barline_drag_orig_end_ms = None
+                self._barline_snap_ms = None
                 self._drag_status = ''
                 self._emit_status()
                 self.note_edited.emit()
@@ -6352,6 +6379,64 @@ class ChartView(QWidget):
             self._rubber_end_u = None
             self.update()
             self.selection_changed.emit(len(self.selected))
+
+    # ── 小節線拖曳：吸附音符終點 ＋ 盡量讓 BPM 是整數 ────────────────
+
+    #: 吸附音符終點的距離上限（毫秒）。超過就不吸——使用者要的是「順手對上」，
+    #: 不是「被拉去很遠的地方」。
+    BARLINE_SNAP_MS = 60
+
+    #: BPM 和最近的整數差在這個範圍內就取整數。AI 轉譜本身的誤差遠大於 0.1，
+    #: 所以這等於免費——使用者：「除非差 0.1bpm 以上（依 AI 轉譜可接受誤差
+    #: 來說應該不會）」。
+    BPM_ROUND_TOLERANCE = 0.1
+
+    def _barline_snap_targets(self):
+        """可以吸附的位置：**音符的終點**（尾拍）。排序好的 list。
+
+        只在「鎖定音符」開著時用——那時候音符是基準、格線去遷就它們，所以
+        拿音符的邊界當吸附點才有意義。
+        """
+        if not self.notes_locked:
+            return []
+        cache = getattr(self, '_snap_targets_cache', None)
+        sig = (len(self.model.notes_tree), id(self.model))
+        if cache is not None and cache[0] == sig:
+            return cache[1]
+        ends = sorted({int(n.end) for n in self.model.notes_tree})
+        self._snap_targets_cache = (sig, ends)
+        return ends
+
+    def _barline_snap(self, ms: float):
+        """把拖到的時間吸到最近的音符終點。回傳 (時間, 吸到的那一顆或 None)。"""
+        targets = self._barline_snap_targets()
+        if not targets:
+            return float(ms), None
+        i = bisect_left(targets, ms)
+        best, dist = None, None
+        for j in (i - 1, i):
+            if 0 <= j < len(targets):
+                d = abs(targets[j] - ms)
+                if dist is None or d < dist:
+                    best, dist = targets[j], d
+        if best is not None and dist <= self.BARLINE_SNAP_MS:
+            return float(best), int(best)
+        return float(ms), None
+
+    def _barline_bpm(self, start_ms: float, end_ms: float):
+        """小節頭尾 → BPM。差整數不到 `BPM_ROUND_TOLERANCE` 就取整數。
+
+        回傳 (bpm, 有沒有被取整)。取整之後小節線會離吸附點差一點點（150 BPM
+        的 1600ms 小節上，0.1 BPM 大約是 1ms），那是刻意的取捨。
+        """
+        dur = max(1.0, float(end_ms) - float(start_ms))
+        num = self.model.get_beats_per_bar_at_ms(int(start_ms))
+        den = self.model.time_sig_denominator
+        bpm = num * 4.0 * 60000.0 / (den * dur)
+        rounded = round(bpm)
+        if rounded >= 1 and abs(bpm - rounded) <= self.BPM_ROUND_TOLERANCE:
+            return float(rounded), True
+        return bpm, False
 
     def _hit_test(self, pos: QPoint) -> Optional[GNote]:
         pt = QPointF(pos)

@@ -240,6 +240,8 @@ class ToolbarSet:
         self.barline_drag_act: Optional[QAction] = None
         #: 「常用」分頁上的類型選單（選完要歸位）
         self.common_type_combo = None
+        #: 「鎖定音符」開關（常用分頁）
+        self.notes_locked_act: Optional[QAction] = None
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
@@ -353,7 +355,8 @@ class MainWindow(QMainWindow):
             v.pane_active = (role == 0)
             # 小節線拖曳的開關是逐格的旗標，但設定是全域的；工具列那顆按鈕
             # 建立時也會讀同一個設定，所以兩邊一開始就一致。
-            v.barline_drag_enabled = bool(settings.get('barline_drag_enabled', True))
+            v.barline_drag_enabled = bool(settings.get('barline_drag_enabled', False))
+            v.notes_locked = bool(settings.get('notes_locked', False))
             self._panes.append(v)
             self._splitter.addWidget(v)
         self._panes[0].link_pane(self._panes[1])
@@ -1906,7 +1909,22 @@ class MainWindow(QMainWindow):
                                                 forward=True))
         tbs.common_type_combo = type_combo
 
+        # 鎖定音符：使用者指定放在常用。它沒有快捷鍵，符合這一頁的規則。
+        tbs.notes_locked_act = self._tab_action(
+            tbs, '🔒 鎖定音符', self._on_notes_locked_toggled,
+            tip=chr(10).join([
+                '進入「只調整小節線時間」的狀態（預設關）。',
+                '開著時拖曳小節線不會動到音符，而且會自動吸附到最近的音符尾巴，',
+                '並盡量讓算出來的 BPM 落在整數上（差不到 0.1 才取整）。',
+                '拖的途中按住 Alt 可以臨時反轉。']),
+            checkable=True, keys='_on_notes_locked_toggled')
+        tbs.notes_locked_act.blockSignals(True)
+        tbs.notes_locked_act.setChecked(self._notes_locked())
+        tbs.notes_locked_act.blockSignals(False)
+
         return self._tab_page([
+            self._tab_button(tbs.notes_locked_act),
+            None,
             self._tab_button(act_right),
             self._tab_button(act_left),
             type_combo,
@@ -2183,11 +2201,41 @@ class MainWindow(QMainWindow):
 
         return self._tab_page(widgets)
 
+    # ── 鎖定音符 ──────────────────────────────────────────────────────
+
+    def _notes_locked(self) -> bool:
+        """「只調整小節線時間」的狀態。預設關。"""
+        return bool(settings.get('notes_locked', False))
+
+    def _on_notes_locked_toggled(self, on: bool) -> None:
+        """鎖定音符：拖小節線時不動音符，並且自動吸附到音符終點。
+
+        使用者：「鎖定音符等於進入只調整小節線時間的狀態」。開著的時候拖曳
+        小節線會吸到最近的音符尾巴，而且盡量讓算出來的 BPM 落在整數上
+        （差不到 0.1 才取整——AI 轉譜本身的誤差遠大於這個，所以等於免費）。
+        """
+        settings.set('notes_locked', bool(on))
+        self._apply_notes_locked()
+        for tbs in self._toolbars:
+            act = getattr(tbs, 'notes_locked_act', None)
+            if act is not None and act.isChecked() != bool(on):
+                act.blockSignals(True)
+                act.setChecked(bool(on))
+                act.blockSignals(False)
+
+    def _apply_notes_locked(self) -> None:
+        """每一格 ChartView 各有自己的旗標，漏掉一格就會看起來像沒生效。"""
+        locked = self._notes_locked()
+        for pane in self._panes:
+            pane.notes_locked = locked
+
     # ── 小節線拖曳開關 ────────────────────────────────────────────────
 
     def _barline_drag_enabled(self) -> bool:
-        """目前的設定值（預設開著，維持原本行為）。"""
-        return bool(settings.get('barline_drag_enabled', True))
+        """目前的設定值。**預設關**——使用者：「默認都是關閉」。
+
+        判定只看游標離小節線 6 像素，開著的話在小節線附近框選很容易誤觸。"""
+        return bool(settings.get('barline_drag_enabled', False))
 
     def _on_barline_drag_toggled(self, checked: bool) -> None:
         """套用到每一格並記住。
