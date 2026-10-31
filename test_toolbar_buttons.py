@@ -205,25 +205,29 @@ class MidiPianoButtonRemovedTests(unittest.TestCase):
 
 
 class CommonTabTests(unittest.TestCase):
-    """「常用」分頁：內容是照**操作紀錄**排的，不是照直覺。
+    """「常用」分頁：常做 **而且沒有快捷鍵** 的事。
 
-    統計 37 份 logs/oplog-*.jsonl、159 個工作階段、15459 次操作：
+    內容照操作紀錄排（37 份 logs/oplog-*.jsonl、159 個工作階段、15459 次操作），
+    再濾掉已經有鍵的——使用者：「不要把快捷鍵相關的放到常用」。
 
-        shift_selected_keys    11839  76.6%   方向鍵，不需要按鈕
-        set_width_selected       809   5.2%
-        delete_selected          584   3.8%
-        shift_selected_time      548   3.5%
-        set_hand_selected        387   2.5%
-        set_type_selected        309   2.0%
-        _begin_hold_tail_drag    280   1.8%   拖曳
-        shift_selected_pitch     162   1.0%
+        set_width_selected      809   有鍵（E 在 2↔3 切換，正好涵蓋）
+        delete_selected         584   有鍵（Delete）
+        shift_selected_time     548   有鍵（↑／↓）
+        set_hand_selected       387   **沒有**（Q 改的是放置的手）
+        set_type_selected       309   **一半沒有**（T/H/K 有，Soft/Slide/Trill 沒有）
+        shift_selected_pitch    162   有鍵
+        duplicate_selected       36   **沒有**
+        resolve_hold_tails       19   **沒有**
+        _ctx_note_property       13   **沒有**
+        chain_slides_selected    12   **沒有**
 
-    前 8 名＝98.4%，而這些**在工具列上一顆按鈕都沒有**；原本最大的「編輯」
-    分頁整頁在服務放置音符，而 `_place_note_at` 整份紀錄只出現 9 次。
-
-    寬度：這一頁約 1914px ＋ 右上角音量 244px ＝ 2158px，而實機螢幕可用寬度
-    2560px（2560x1440、96 DPI、縮放 1.0）。放得下。
+    存檔／復原／重做／播放／暫停／停止也都有鍵，所以都不放。
+    寬度：這一頁 1057px ＋音量 244px，實機螢幕 2560px。
     """
+
+    #: 這些動作有快捷鍵，所以**不該**出現在常用頁
+    HAS_SHORTCUT = ('存檔', '復原', '重做', '播放', '暫停', '停止', '刪除',
+                    '寬 2', '寬 3')
 
     @classmethod
     def setUpClass(cls):
@@ -232,8 +236,7 @@ class CommonTabTests(unittest.TestCase):
             cls.win = MainWindow()
         cls.win.resize(2560, 1400)
         # **只載一次**。每個測試都 `_load_model_all` 的話，整個測試套件跑完
-        # 之後行程結束不了（2242 個測試全過，然後卡在結束）——那條路會留下
-        # 自動存檔計時器之類的東西。同檔的其他類別也是只載一次。
+        # 之後行程結束不了（2242 個測試全過，然後卡在結束）。
         cls.model = NoteModel.create_new('t', 120.0, 30.0, 4)
         cls.win._load_model_all(cls.model)
 
@@ -262,27 +265,23 @@ class CommonTabTests(unittest.TestCase):
         return {b.text(): b for b in self.page().findChildren(QToolButton)}
 
     def test_it_is_the_first_tab(self):
-        tabs = self.win._toolbars[0].tabs
-        self.assertEqual(tabs.tabText(0), '常用')
+        self.assertEqual(self.win._toolbars[0].tabs.tabText(0), '常用')
 
     def test_it_is_what_opens_by_default(self):
         self.assertEqual(self.win._toolbars[0].tabs.currentIndex(), 0)
 
-    def test_the_top_actions_all_have_a_button(self):
-        """紀錄裡前幾名的操作都要一鍵可達。"""
+    def test_nothing_here_already_has_a_shortcut(self):
+        """有鍵的放按鈕只是佔空間——手會先按鍵，眼睛不會往上看。"""
         labels = ' '.join(self.buttons())
-        for want in ('寬 2', '寬 3', '右手', '左手', '刪除', '複製'):
-            self.assertIn(want, labels, '「%s」沒有按鈕' % want)
-        self.assertIsNotNone(self.win._toolbars[0].common_type_combo,
-                             '改類型沒有控制項')
+        for banned in self.HAS_SHORTCUT:
+            self.assertNotIn(banned, labels,
+                             '「%s」有快捷鍵，不該放在常用頁' % banned)
 
-    def test_width_buttons_apply_to_the_selection(self):
-        self.buttons()['寬 2'].click()
-        self.assertTrue(all(n.max_key - n.min_key + 1 == 2
-                            for n in self.model.notes_tree))
-        self.buttons()['寬 3'].click()
-        self.assertTrue(all(n.max_key - n.min_key + 1 == 3
-                            for n in self.model.notes_tree))
+    def test_the_frequent_keyless_actions_are_here(self):
+        labels = ' '.join(self.buttons())
+        for want in ('右手', '左手', '複製', '滑奏串接', '長條尾端', '音符屬性'):
+            self.assertIn(want, labels, '「%s」沒有按鈕' % want)
+        self.assertIsNotNone(self.win._toolbars[0].common_type_combo)
 
     def test_hand_buttons_apply_to_the_selection(self):
         self.buttons()['● 左手'].click()
@@ -291,10 +290,7 @@ class CommonTabTests(unittest.TestCase):
         self.assertTrue(all(n.hand == 0 for n in self.model.notes_tree))
 
     def test_the_type_picker_applies_and_resets(self):
-        """它是一個**動作**不是狀態，所以選完要跳回提示文字。
-
-        停在上次選的那一項會讓人以為選取的音符現在就是那個類型。
-        """
+        """它是一個**動作**不是狀態，所以選完要跳回提示文字。"""
         combo = self.win._toolbars[0].common_type_combo
         combo.setCurrentIndex(3)                 # Long
         self.win._on_common_type_changed(3)
@@ -302,34 +298,31 @@ class CommonTabTests(unittest.TestCase):
         self.assertEqual(combo.currentIndex(), 0)
         self.assertIn('改類型', combo.currentText())
 
-    def test_the_type_picker_offers_every_type(self):
+    def test_the_type_picker_shows_which_ones_already_have_keys(self):
+        """T/H/K 有鍵、其餘沒有——寫出來才知道哪些可以用鍵代替。"""
         combo = self.win._toolbars[0].common_type_combo
         labels = [combo.itemText(i) for i in range(combo.count())]
-        for want in ('Tap', 'Soft', 'Long', 'Staccato', 'Slide', 'Trill'):
-            self.assertIn(want, labels)
+        self.assertTrue(any('(T)' in x for x in labels))
+        self.assertTrue(any(x == 'Soft' for x in labels), '沒鍵的就不加括號')
 
-    def test_delete_and_duplicate_work(self):
+    def test_duplicate_works(self):
         before = len(self.model.notes_tree)
         self.buttons()['⧉ 複製'].click()
         self.assertGreater(len(self.model.notes_tree), before)
-        self.win.view.select_all()
-        self.buttons()['🗑 刪除'].click()
-        self.assertEqual(len(self.model.notes_tree), 0)
 
-    def test_both_pause_buttons_change_together(self):
-        """「播放」分頁和「常用」分頁各有一顆，漏掉一顆就會看到兩種字。"""
-        self.win._set_pause_text('tb_resume')
-        for tbs in self.win._toolbars:
-            self.assertEqual(tbs.pause_act.text(),
-                             tbs.common_pause_act.text())
-        self.win._set_pause_text('tb_pause')
+    def test_the_note_property_button_needs_a_selection(self):
+        """沒選東西要講一句，不要默默沒反應。"""
+        from unittest import mock
+        self.win.view.deselect_all()
+        with mock.patch('qt_editor.main_window.QMessageBox.information') as box:
+            self.win._common_note_property()
+        self.assertTrue(box.called)
 
     def test_the_page_fits_the_screen(self):
-        """2560px 的螢幕要放得下這一頁加上右上角的音量區塊。"""
-        from PyQt5.QtWidgets import QComboBox, QLabel, QToolButton
+        from PyQt5.QtWidgets import QComboBox, QToolButton
         total = 0
-        for w in self.page().findChildren(object):
-            if isinstance(w, (QToolButton, QComboBox, QLabel)) and not w.isHidden():
+        for w in self.page().findChildren(QToolButton) +                 self.page().findChildren(QComboBox):
+            if not w.isHidden():
                 total += w.sizeHint().width()
         self.assertLess(total + 244, 2560,
                         '常用頁 %d px ＋音量 244 放不進 2560' % total)
