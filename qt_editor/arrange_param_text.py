@@ -31,7 +31,7 @@ GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         'trust_two_track_hands', 'hand_track_bias', 'hand_leap_window_ms',
         'hand_leap_semitones', 'hand_leap_weight', 'hand_memory_ms',
         'hand_boundary_margin', 'hand_boundary_min_distance',
-        'cross_hand_slack_lanes',
+        'cross_hand_slack_lanes', 'cross_hand_max_center_distance',
     )),
     ('和絃與音程間距', (
         'close_chord_interval_semitones', 'chord_pair_close_semitones',
@@ -119,6 +119,7 @@ LABELS: Dict[str, str] = {
     'hand_boundary_margin': '兩手交界額外加寬幾格',
     'hand_boundary_min_distance': '兩手交界最小距離（格）',
     'cross_hand_slack_lanes': '兩手距離可以被擠掉幾格',
+    'cross_hand_max_center_distance': '兩手距離最多撐開幾格（天花板）',
     # 和絃與音程
     'close_chord_interval_semitones': '幾半音以內改用窄寬度',
     'chord_pair_close_semitones': '同手兩音：近音程到幾半音',

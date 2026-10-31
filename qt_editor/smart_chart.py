@@ -227,6 +227,16 @@ class SmartChartSettings:
     min_octave_center_distance: float = 5.0
     # 單一音程最多撐開幾個鍵道（避免超大跳把整組推爆）
     max_interval_center_distance: float = 12.0
+    # **跨手交界**專用的天花板。和上面那個分開，因為上面那個也管同手的和絃
+    # 與局部映射，動它會波及兩個沒問題的地方。
+    #
+    # 使用者：「左右手之間的間距會被默認壓縮」。量他 37 份 Real 定稿的
+    # 16277 組「左手最高音 → 右手最低音」：到 33 半音為止公式幾乎完全命中
+    # （24→10.0、27→11.2，他是 10.0、11.0），再遠就被 12.0 凍住，而他還在
+    # 繼續拉開——36 半音他用 14 格、48 用 18 格、60 用 22.5 格。**雙手同刻
+    # 的組有 27.6% 落在天花板咬住的範圍**，不是邊角案例。
+    # 系統性偏差因此是 **−0.87 格**（公式一律比他窄）。
+    cross_hand_max_center_distance: float = 12.0
     # desired 比音程對應間距寬多少以內就吸回去（鍵道）
     interval_snap_tolerance: int = 2
     global_position_weight: float = 0.65
@@ -2774,15 +2784,7 @@ def _chord_advance(
             interval, settings, widths[index - 1], widths[index]
         )
     else:
-        rate = float(settings.min_octave_center_distance) / 12.0
-        need = min(
-            float(settings.max_interval_center_distance),
-            max(1.0, interval * rate),
-        )
-        need = max(
-            need + float(settings.hand_boundary_margin),
-            float(settings.hand_boundary_min_distance),
-        )
+        need = _cross_hand_target(interval, settings)
     return max(flush, need + (widths[index - 1] - widths[index]) / 2.0)
 
 
@@ -4925,7 +4927,7 @@ def _cross_hand_target(interval: int, settings: SmartChartSettings) -> float:
     """同時發聲、跨手相鄰兩顆該有的中心距（與 `_place_hand` 同一套規則）。"""
     rate = float(settings.min_octave_center_distance) / 12.0
     need = min(
-        float(settings.max_interval_center_distance),
+        float(settings.cross_hand_max_center_distance),
         max(1.0, abs(interval) * rate),
     )
     return max(
