@@ -368,12 +368,51 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
         cls.win.close()
 
     def labels(self, title):
+        """分頁上看得到的文字：按鈕本身 ＋ 下拉裡的每一項。"""
+        from PyQt5.QtWidgets import QToolButton
+        tabs = self.win._toolbars[0].tabs
+        for i in range(tabs.count()):
+            if tabs.tabText(i) != title:
+                continue
+            out = []
+            for b in tabs.widget(i).findChildren(QToolButton):
+                out.append(b.text())
+                if b.menu() is not None:
+                    out += [a.text() for a in b.menu().actions()]
+            return out
+        self.fail('沒有「%s」分頁' % title)
+
+    def visible_controls(self, title):
         from PyQt5.QtWidgets import QToolButton
         tabs = self.win._toolbars[0].tabs
         for i in range(tabs.count()):
             if tabs.tabText(i) == title:
-                return [b.text() for b in tabs.widget(i).findChildren(QToolButton)]
+                return [b for b in tabs.widget(i).findChildren(QToolButton)
+                        if not b.isHidden()]
         self.fail('沒有「%s」分頁' % title)
+
+    def test_the_tab_is_not_a_wall_of_buttons(self):
+        """使用者：「小節的 tab 整理一下，太多了」。原本攤平是 12 顆。
+
+        照操作紀錄，小節類的操作**每一個都很少用**（最多的
+        `set_measure_bpm_at` 14 次、`delete_measure_at` 12 次、
+        `smart_resnap_dialog` 1 次），所以收進下拉不會有「常用卻要多點一下」
+        的問題。留在外面的只有兩顆**模式開關**——它們是狀態，收進下拉就看不出
+        現在開著還是關著。
+        """
+        controls = self.visible_controls('小節')
+        self.assertLessEqual(len(controls), 6, '還是太多顆：%s'
+                             % [b.text() for b in controls])
+        toggles = [b for b in controls if b.defaultAction() is not None
+                   and b.defaultAction().isCheckable()]
+        self.assertTrue(toggles, '模式開關要留在外面看得見')
+
+    def test_the_menu_bar_and_the_tab_share_one_source(self):
+        """兩邊各寫一份一定會走鐘（原本的註解就寫著「兩邊不會少一項」）。"""
+        flat = {label for _g, label, _s, _t in self.win._measure_entries()}
+        grouped = {label for _name, items in self.win._measure_groups()
+                   for label, _slot in items}
+        self.assertEqual(flat, grouped)
 
     def test_the_barline_drag_moved_here(self):
         self.assertTrue(any('拖曳小節線' in x for x in self.labels('小節')))

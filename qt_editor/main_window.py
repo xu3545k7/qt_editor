@@ -1334,7 +1334,11 @@ class MainWindow(QMainWindow):
         # 小節（與工具列「小節」分頁同一份內容）
         measure_m = mb.addMenu(t('menu_measure'))
         measure_m.setToolTipsVisible(True)
-        for label, slot, tip in self._measure_entries():
+        last_group = None
+        for group, label, slot, tip in self._measure_entries():
+            if last_group is not None and group != last_group:
+                measure_m.addSeparator()
+            last_group = group
             act = self._add_action(measure_m, label, slot)
             if tip:
                 act.setToolTip(tip)
@@ -1472,37 +1476,39 @@ class MainWindow(QMainWindow):
         self._act_hit_beat.toggled.connect(lambda ch: self._on_hit_enable_toggle('beat', ch))
         settings_m.addAction(self._act_hit_beat)
 
+    #: 小節操作：(分組, 標籤, slot, tooltip)。**選單列和工具列分頁共用這一份**，
+    #: 不然兩邊一定會走鐘（原本的註解就寫著「兩邊不會少一項」）。
+    #: 分組只有工具列用得到——選單列可以長，分頁不行。
     def _measure_entries(self):
-        """小節操作：(標籤, slot, tooltip)。選單列與工具列「小節」分頁共用。
-
-        這幾個都作用在「譜尾」或「目前視窗中央那一小節」——因為選單/工具列
-        沒有點擊位置可以參考。要針對特定小節，走右鍵選單的「小節」。
+        """小節操作。作用在「譜尾」或「目前視窗中央那一小節」——因為選單／
+        工具列沒有點擊位置可以參考。要針對特定小節，走右鍵選單的「小節」。
         """
         return [
-            (t('tb_add_measure'), self.add_measure_dialog,
+            ('小節', t('tb_add_measure'), self.add_measure_dialog,
              '在譜面末尾接上一個空白小節'),
-            (t('tb_delete_measure'), self.delete_measure_dialog,
+            ('小節', t('tb_delete_measure'), self.delete_measure_dialog,
              '刪除目前視窗中央所在的小節（含其中的音符）'),
-            (t('tb_set_measure_bpm'), self.set_measure_bpm_dialog,
+            ('速度', t('tb_set_measure_bpm'), self.set_measure_bpm_dialog,
              '修改目前視窗中央所在小節的 BPM'),
-            (t('tb_measures_bpm'), self.change_measures_bpm_dialog,
+            ('速度', t('tb_measures_bpm'), self.change_measures_bpm_dialog,
              t('tb_measures_bpm_tip')),
-            ('修補缺漏的拍點…', self.repair_beat_entries,
+            ('拍號與拍點', '修補缺漏的拍點…', self.repair_beat_entries,
              '拍點間距不均勻時補上缺的那些。修的是小節／拍點結構，所以放這裡'),
-            ('每小節 BPM…', self.measure_bpm_table_dialog,
+            ('速度', '每小節 BPM…', self.measure_bpm_table_dialog,
              '一個小節一行，各自填自己的 BPM。只有改過的行會重鋪，音符預設不動。'),
-            ('鎖定音符、重生小節線…', self.regenerate_grid_dialog,
+            ('速度', '鎖定音符、重生小節線…', self.regenerate_grid_dialog,
              chr(10).join([
                  '丟掉現在的小節線，照一個固定 BPM 重鋪一條。音符一顆都不動。',
                  '用在「音符位置是對的、只有格線錯了」的譜；要讓音符跟著新',
                  '格線走的是下面那個「智慧重排吸附」。'])),
-            ('智慧重排吸附…', self.smart_resnap_dialog,
+            ('速度', '智慧重排吸附…', self.smart_resnap_dialog,
              '照「幾個小節 ＋ BPM」的順序重建整條小節線，再把音符吸附上去。\n'
              '用在「AI 把整首判成一個固定 BPM、而實際是變拍」的譜。有自動偵測。'),
-            (self._tool_label('action_set_measure_time_signature', '修改小節拍號…'),
+            ('拍號與拍點',
+             self._tool_label('action_set_measure_time_signature', '修改小節拍號…'),
              self.set_measure_time_sig_dialog,
              '修改目前視窗中央所在小節的拍號。整首的總拍號請用 工具 → 樂曲總資訊'),
-            ('事件（速度／音效）…', self.edit_events_dialog,
+            ('拍號與拍點', '事件（速度／音效）…', self.edit_events_dialog,
              '編輯譜面事件：速度變化（BPM）、殘響／回音／EQ 參數、區段標記。\n'
              'PAN 靠速度事件知道速度；JSON 與 XML 都會存。'),
         ]
@@ -2158,32 +2164,46 @@ class MainWindow(QMainWindow):
 
     # ── 分頁：小節 ────────────────────────────────────────────────────
 
-    def _build_tab_measure(self, tbs: ToolbarSet) -> QWidget:
-        """小節相關的**全部**集中在這裡。
+    #: 小節分頁的分組：(下拉標題, [(項目, slot)…])。
+    #:
+    #: 全部攤平的話是 12 顆按鈕（使用者：「小節的 tab 整理一下，太多了」）。
+    #: 照操作紀錄，小節類的操作**每一個都很少用**（最多的 `set_measure_bpm_at`
+    #: 14 次、`change_measures_bpm_dialog` 8 次、`delete_measure_at` 12 次、
+    #: `smart_resnap_dialog` 1 次），所以收進下拉不會有「常用卻要多點一下」的
+    #: 問題——那正是下拉該用的地方。
+    #:
+    #: 留在外面的只有兩顆**模式開關**：它們是狀態，收進下拉就看不出現在開著
+    #: 還是關著。
+    def _measure_groups(self):
+        """`_measure_entries` 照分組收起來，順序照它出現的順序。"""
+        groups, order = {}, []
+        for group, label, slot, _tip in self._measure_entries():
+            if group not in groups:
+                groups[group] = []
+                order.append(group)
+            groups[group].append((label, slot))
+        return [(name, groups[name]) for name in order]
 
-        使用者：「我需要先在小節相關的功能確切整合，不要散在各處」。原本散在
-        五個地方：這一頁、編輯分頁（拖曳小節線）、檢視分頁（小節均分模式）、
-        右鍵選單、工具→樂曲總資訊。
+    def _build_tab_measure(self, tbs: ToolbarSet) -> QWidget:
+        """小節相關的**全部**集中在這裡，而且收成三個下拉 ＋ 兩顆模式開關。
+
+        使用者：「我需要先在小節相關的功能確切整合，不要散在各處」，接著
+        「小節的 tab 整理一下，太多了」。原本散在五個地方、攤平成 12 顆按鈕。
 
         搬過來的兩顆：
         ・**拖曳小節線**本來放在編輯分頁，理由是「它是滑鼠怎麼動的模式」。
           但它改的是小節線，找的人會先來小節分頁。
         ・**小節均分模式**本來放在檢視分頁。它不只是檢視——`set_measure_bpm`
-          和 `set_measure_time_signature` 都吃它來決定小節內拍點怎麼重排
-          （多小節 BPM 那個對話框自己就寫著「會影響小節內 beat timings 重排」）。
+          和 `set_measure_time_signature` 都吃它來決定小節內拍點怎麼重排。
 
         右鍵選單的「小節」留在原地：那是對**點到的那一小節**做事，有位置資訊，
         和這一頁的「對譜尾／視窗中央那一小節」不是同一回事。
         """
-        entries = self._measure_entries()
         widgets = []
-        for i, (label, slot, tip) in enumerate(entries):
-            if i in (2, 5):
-                widgets.append(None)
-            widgets.append(self._tab_button(
-                self._tab_action(tbs, label, slot, tip=tip)))
+        for title, entries in self._measure_groups():
+            widgets.append(self._menu_button(tbs, title, entries))
 
-        # ── 小節線的編輯模式（從別的分頁搬過來）────────────────────
+        # ── 模式開關：是狀態，所以留在外面看得見 ──────────────────
         widgets.append(None)
         tbs.barline_drag_act = self._tab_action(
             tbs, t('tb_barline_drag'), self._on_barline_drag_toggled,

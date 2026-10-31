@@ -286,7 +286,8 @@ class MenuEntryTests(unittest.TestCase):
         with contextlib.redirect_stdout(_io.StringIO()):
             win = MainWindow()
         try:
-            labels = [label for label, _slot, _tip in win._measure_entries()]
+            # `_measure_entries` 多帶一個「分組」欄位（工具列用它收成下拉）
+            labels = [label for _g, label, _slot, _tip in win._measure_entries()]
             self.assertIn('智慧重排吸附…', labels)
         finally:
             win.view.model.dirty = False
