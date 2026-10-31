@@ -202,3 +202,134 @@ class MidiPianoButtonRemovedTests(unittest.TestCase):
                     labels.append(act.text())
         self.assertNotIn(i18n.t('tb_hit_sound'), labels,
                          '播放分頁還有「MIDI 鋼琴」那顆按鈕')
+
+
+class CommonTabTests(unittest.TestCase):
+    """「常用」分頁：內容是照**操作紀錄**排的，不是照直覺。
+
+    統計 37 份 logs/oplog-*.jsonl、159 個工作階段、15459 次操作：
+
+        shift_selected_keys    11839  76.6%   方向鍵，不需要按鈕
+        set_width_selected       809   5.2%
+        delete_selected          584   3.8%
+        shift_selected_time      548   3.5%
+        set_hand_selected        387   2.5%
+        set_type_selected        309   2.0%
+        _begin_hold_tail_drag    280   1.8%   拖曳
+        shift_selected_pitch     162   1.0%
+
+    前 8 名＝98.4%，而這些**在工具列上一顆按鈕都沒有**；原本最大的「編輯」
+    分頁整頁在服務放置音符，而 `_place_note_at` 整份紀錄只出現 9 次。
+
+    寬度：這一頁約 1914px ＋ 右上角音量 244px ＝ 2158px，而實機螢幕可用寬度
+    2560px（2560x1440、96 DPI、縮放 1.0）。放得下。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from qt_editor.main_window import MainWindow
+        with contextlib.redirect_stdout(io.StringIO()):
+            cls.win = MainWindow()
+        cls.win.resize(2560, 1400)
+        # **只載一次**。每個測試都 `_load_model_all` 的話，整個測試套件跑完
+        # 之後行程結束不了（2242 個測試全過，然後卡在結束）——那條路會留下
+        # 自動存檔計時器之類的東西。同檔的其他類別也是只載一次。
+        cls.model = NoteModel.create_new('t', 120.0, 30.0, 4)
+        cls.win._load_model_all(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.win.view.model.dirty = False
+        cls.win.close()
+
+    def setUp(self):
+        m = self.model
+        m.notes_tree = [note(1000 + 500 * i, 60, idx=i) for i in range(4)]
+        for n in m.notes_tree:
+            n.min_key, n.max_key, n.hand = 4, 6, 0
+        m.rebuild_display_cache()
+        self.win.view.rebuild_mapper()
+        self.win.view.select_all()
+
+    def tearDown(self):
+        self.model.dirty = False
+
+    def page(self):
+        return self.win._toolbars[0].tabs.widget(0)
+
+    def buttons(self):
+        from PyQt5.QtWidgets import QToolButton
+        return {b.text(): b for b in self.page().findChildren(QToolButton)}
+
+    def test_it_is_the_first_tab(self):
+        tabs = self.win._toolbars[0].tabs
+        self.assertEqual(tabs.tabText(0), '常用')
+
+    def test_it_is_what_opens_by_default(self):
+        self.assertEqual(self.win._toolbars[0].tabs.currentIndex(), 0)
+
+    def test_the_top_actions_all_have_a_button(self):
+        """紀錄裡前幾名的操作都要一鍵可達。"""
+        labels = ' '.join(self.buttons())
+        for want in ('寬 2', '寬 3', '右手', '左手', '刪除', '複製'):
+            self.assertIn(want, labels, '「%s」沒有按鈕' % want)
+        self.assertIsNotNone(self.win._toolbars[0].common_type_combo,
+                             '改類型沒有控制項')
+
+    def test_width_buttons_apply_to_the_selection(self):
+        self.buttons()['寬 2'].click()
+        self.assertTrue(all(n.max_key - n.min_key + 1 == 2
+                            for n in self.model.notes_tree))
+        self.buttons()['寬 3'].click()
+        self.assertTrue(all(n.max_key - n.min_key + 1 == 3
+                            for n in self.model.notes_tree))
+
+    def test_hand_buttons_apply_to_the_selection(self):
+        self.buttons()['● 左手'].click()
+        self.assertTrue(all(n.hand == 1 for n in self.model.notes_tree))
+        self.buttons()['● 右手'].click()
+        self.assertTrue(all(n.hand == 0 for n in self.model.notes_tree))
+
+    def test_the_type_picker_applies_and_resets(self):
+        """它是一個**動作**不是狀態，所以選完要跳回提示文字。
+
+        停在上次選的那一項會讓人以為選取的音符現在就是那個類型。
+        """
+        combo = self.win._toolbars[0].common_type_combo
+        combo.setCurrentIndex(3)                 # Long
+        self.win._on_common_type_changed(3)
+        self.assertTrue(all(n.note_type == 2 for n in self.model.notes_tree))
+        self.assertEqual(combo.currentIndex(), 0)
+        self.assertIn('改類型', combo.currentText())
+
+    def test_the_type_picker_offers_every_type(self):
+        combo = self.win._toolbars[0].common_type_combo
+        labels = [combo.itemText(i) for i in range(combo.count())]
+        for want in ('Tap', 'Soft', 'Long', 'Staccato', 'Slide', 'Trill'):
+            self.assertIn(want, labels)
+
+    def test_delete_and_duplicate_work(self):
+        before = len(self.model.notes_tree)
+        self.buttons()['⧉ 複製'].click()
+        self.assertGreater(len(self.model.notes_tree), before)
+        self.win.view.select_all()
+        self.buttons()['🗑 刪除'].click()
+        self.assertEqual(len(self.model.notes_tree), 0)
+
+    def test_both_pause_buttons_change_together(self):
+        """「播放」分頁和「常用」分頁各有一顆，漏掉一顆就會看到兩種字。"""
+        self.win._set_pause_text('tb_resume')
+        for tbs in self.win._toolbars:
+            self.assertEqual(tbs.pause_act.text(),
+                             tbs.common_pause_act.text())
+        self.win._set_pause_text('tb_pause')
+
+    def test_the_page_fits_the_screen(self):
+        """2560px 的螢幕要放得下這一頁加上右上角的音量區塊。"""
+        from PyQt5.QtWidgets import QComboBox, QLabel, QToolButton
+        total = 0
+        for w in self.page().findChildren(object):
+            if isinstance(w, (QToolButton, QComboBox, QLabel)) and not w.isHidden():
+                total += w.sizeHint().width()
+        self.assertLess(total + 244, 2560,
+                        '常用頁 %d px ＋音量 244 放不進 2560' % total)

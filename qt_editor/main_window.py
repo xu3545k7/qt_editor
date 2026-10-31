@@ -238,6 +238,9 @@ class ToolbarSet:
         self.pause_act: Optional[QAction] = None
         self.hit_act: Optional[QAction] = None
         self.barline_drag_act: Optional[QAction] = None
+        #: 「常用」分頁上的元件（暫停鈕要跟著播放狀態換字、類型選單要歸位）
+        self.common_pause_act: Optional[QAction] = None
+        self.common_type_combo = None
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
@@ -1687,6 +1690,7 @@ class MainWindow(QMainWindow):
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         tbs.tabs = tabs
 
+        tabs.addTab(self._build_tab_common(tbs),  '常用')
         tabs.addTab(self._build_tab_edit(tbs),    t('tb_tab_edit'))
         tabs.addTab(self._build_tab_play(tbs),    t('tb_tab_play'))
         tabs.addTab(self._build_tab_measure(tbs), t('tb_tab_measure'))
@@ -1834,6 +1838,115 @@ class MainWindow(QMainWindow):
         else:
             act.triggered.connect(bound)
         return act
+
+    # ── 分頁：常用 ────────────────────────────────────────────────────
+
+    def _build_tab_common(self, tbs: ToolbarSet) -> QWidget:
+        """最常做的事，照**操作紀錄**排出來的，不是照直覺。
+
+        統計 37 份 `logs/oplog-*.jsonl`、159 個工作階段、15459 次操作：
+
+            shift_selected_keys    11839  76.6%   （方向鍵，本來就不需要按鈕）
+            set_width_selected       809   5.2%
+            delete_selected          584   3.8%
+            shift_selected_time      548   3.5%
+            set_hand_selected        387   2.5%
+            set_type_selected        309   2.0%
+            _begin_hold_tail_drag    280   1.8%   （拖曳）
+            shift_selected_pitch     162   1.0%
+
+        前 8 名就是 98.4%。而**這些在工具列上一顆按鈕都沒有**——原本最大的
+        「編輯」分頁（2350px，螢幕才 2560）整頁都在服務放置音符，而
+        `_place_note_at` 整個紀錄裡只出現 9 次。
+
+        所以這一頁放的是「對選取的音符做什麼」＋ 存檔／復原／播放。存檔在
+        紀錄裡是 254 次（`what=save`），復原走 Ctrl+Z 不進紀錄但顯然常用。
+        """
+        act_save = self._tab_action(tbs, '💾 存檔', self.save_file,
+                                    tip='Ctrl+S', keys='save_file')
+        act_undo = self._tab_action(tbs, '↶ 復原', lambda: self.view.undo(),
+                                    tip='Ctrl+Z', keys='undo')
+        act_redo = self._tab_action(tbs, '↷ 重做', lambda: self.view.redo(),
+                                    tip='Ctrl+Y', keys='redo')
+        act_play = self._tab_action(tbs, t('tb_play'), self.play_window)
+        tbs.common_pause_act = self._tab_action(tbs, t('tb_pause'),
+                                                self._toggle_pause_resume)
+        act_stop = self._tab_action(tbs, t('tb_stop'), self.stop_audio)
+
+        act_w2 = self._tab_action(tbs, '寬 2', lambda: self.view.set_width_selected(2),
+                                  tip='把選取的音符設成 2 格寬',
+                                  keys='set_width_selected')
+        act_w3 = self._tab_action(tbs, '寬 3', lambda: self.view.set_width_selected(3),
+                                  tip='把選取的音符設成 3 格寬',
+                                  keys='set_width_selected')
+        act_right = self._tab_action(tbs, '● 右手',
+                                     lambda: self.view.set_hand_selected(0),
+                                     tip='把選取的音符改成右手',
+                                     keys='set_hand_selected')
+        act_left = self._tab_action(tbs, '● 左手',
+                                    lambda: self.view.set_hand_selected(1),
+                                    tip='把選取的音符改成左手',
+                                    keys='set_hand_selected')
+        act_dup = self._tab_action(tbs, '⧉ 複製',
+                                   lambda: self.view.duplicate_selected(),
+                                   keys='duplicate_selected')
+        act_del = self._tab_action(tbs, '🗑 刪除',
+                                   lambda: self.view.delete_selected(),
+                                   tip='Delete', keys='delete_selected')
+
+        # 類型做成下拉：六種各一顆要 900px 以上，這一頁會爆掉（螢幕 2560）
+        type_combo = QComboBox(tbs.root)
+        type_combo.addItem('改類型…', -1)
+        for label, value in (('Tap', 0), ('Soft', 1), ('Long', 2),
+                             ('Staccato', 3), ('Slide', 4), ('Trill', 0x40)):
+            type_combo.addItem(label, value)
+        type_combo.setToolTip('把選取的音符改成這個類型')
+        self._fit_combo(type_combo, 104)
+        type_combo.activated.connect(self._bind(tbs, self._on_common_type_changed,
+                                                forward=True))
+        tbs.common_type_combo = type_combo
+
+        return self._tab_page([
+            self._tab_button(act_save),
+            self._tab_button(act_undo),
+            self._tab_button(act_redo),
+            None,
+            self._tab_button(act_play),
+            self._tab_button(tbs.common_pause_act),
+            self._tab_button(act_stop),
+            None,
+            self._tab_button(act_w2),
+            self._tab_button(act_w3),
+            self._tab_button(act_right),
+            self._tab_button(act_left),
+            type_combo,
+            None,
+            self._tab_button(act_dup),
+            self._tab_button(act_del),
+        ])
+
+    def _on_common_type_changed(self, index: int) -> None:
+        """「改類型…」選單：選了就套用，然後跳回提示文字。
+
+        跳回去是故意的——它不是「目前狀態」，是一個動作。停在上次選的那一項
+        會讓人以為選取的音符現在就是那個類型。
+        """
+        combo = None
+        for tbs in self._toolbars:
+            if getattr(tbs, 'common_type_combo', None) is not None:
+                if tbs.common_type_combo.currentIndex() == index:
+                    combo = tbs.common_type_combo
+                    break
+        if combo is None:
+            return
+        value = combo.itemData(index)
+        if value is not None and int(value) >= 0:
+            self.view.set_type_selected(int(value))
+        for tbs in self._toolbars:
+            if getattr(tbs, 'common_type_combo', None) is not None:
+                tbs.common_type_combo.blockSignals(True)
+                tbs.common_type_combo.setCurrentIndex(0)
+                tbs.common_type_combo.blockSignals(False)
 
     # ── 分頁：編輯 ────────────────────────────────────────────────────
 
@@ -5360,8 +5473,10 @@ class MainWindow(QMainWindow):
     def _set_pause_text(self, key: str) -> None:
         """暫停／繼續按鈕的文字（兩條工具列都要跟著換）。"""
         for tbs in self._toolbars:
-            if tbs.pause_act is not None:
-                self._set_labeled_text(tbs.pause_act, t(key))
+            # 兩顆都要換：「播放」分頁與「常用」分頁各有一顆暫停鈕
+            for act in (tbs.pause_act, getattr(tbs, 'common_pause_act', None)):
+                if act is not None:
+                    self._set_labeled_text(act, t(key))
 
     def _offset_label_text(self) -> str:
         return (t('status_offset_none') if self._playback_offset_ms == 0
