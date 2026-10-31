@@ -20,6 +20,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .difficulty import DIFFICULTIES, TARGETS, level_for, worth_generating
@@ -204,7 +206,28 @@ def plan(chart_path: str, song_dir: Optional[str] = None,
         if label == source_entry.get('difficultyName'):
             skipped.append((key, '這就是來源本身'))
             continue
-        if existing is not None:
+        if existing is None:
+            # **register 沒有這一筆，不代表磁碟上沒有譜面檔。** 曲庫管理的
+            # 「刪除難度」只拿掉 register 那一筆，檔案會留在原地（對話框有
+            # 明講）。不看磁碟的話，下一次「補齊缺少的難度」就直接覆蓋它，
+            # 而歷史只備份 register 和索引——**譜面救不回來**。
+            #
+            # 判準沿用 `is_generated` 的第 2 點：旁邊有沒有 `source/*.xml`。
+            # 有就是我們生的，蓋掉無妨；沒有就當手寫的，不碰。
+            orphan = os.path.join(song_dir, label, stem + '.json')
+            if os.path.exists(orphan):
+                if not os.path.exists(
+                        os.path.join(song_dir, label, 'source', stem + '.xml')):
+                    skipped.append(
+                        (key, '%s 的譜面檔還在（register 裡沒有這一筆），'
+                              '看起來是手寫的，不覆蓋' % label))
+                    continue
+                if not regenerate:
+                    skipped.append(
+                        (key, '%s 的譜面檔還在（之前生的），要重生請勾重新生成'
+                         % label))
+                    continue
+        else:
             made_here = is_generated(song_dir, existing)
             if not made_here:
                 skipped.append((key, '已經有手寫的 %s，不覆蓋' % label))
@@ -337,11 +360,39 @@ def _write_json_atomic(path: str, data: Any) -> None:
     os.replace(temp, path)
 
 
-def write_difficulty(plan_obj: SongPlan, key: str, model: Any,
-                     result: Any) -> Dict[str, Any]:
-    """寫出一個難度的 json + source xml，回傳它的 register 記錄。"""
+def back_up_before_replace(path: str) -> Optional[str]:
+    """要蓋掉既有檔案之前先留一份，回傳備份路徑（本來就沒有檔案就回 None）。
+
+    副檔名刻意**不是** `.json`：曲庫掃描是 glob `**/*.json`，留成 .json 會被
+    當成另一份譜面而出現在遊戲裡。
+
+    這是最後一道保險。正常情況 `plan()` 就該把手寫的譜擋在外面（register 有
+    記錄的看 `is_generated`，register 沒記錄的看磁碟上有沒有 source/xml），
+    但覆蓋是不可逆的，而歷史只備份 register 和索引、救不回譜面。
+    """
+    if not os.path.exists(path):
+        return None
+    dest = '%s.replaced-%s.bak' % (path, time.strftime('%Y%m%d-%H%M%S'))
+    try:
+        shutil.copy2(path, dest)
+    except OSError:
+        return None
+    return dest
+
+
+def write_difficulty(plan_obj: SongPlan, key: str, model: Any, result: Any,
+                     backups: Optional[List[str]] = None) -> Dict[str, Any]:
+    """寫出一個難度的 json + source xml，回傳它的 register 記錄。
+
+    `backups` 給一個 list 的話，被覆蓋掉的檔案備份路徑會 append 進去，呼叫端
+    可以報給使用者看。
+    """
     json_path, xml_path = plan_obj.paths_for(key)
     os.makedirs(os.path.dirname(xml_path), exist_ok=True)
+    for path in (json_path, xml_path):
+        kept = back_up_before_replace(path)
+        if kept and backups is not None:
+            backups.append(kept)
     model.save_json(json_path)
     model.save_xml(xml_path)
 

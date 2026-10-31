@@ -214,5 +214,90 @@ class SongFolderTests(unittest.TestCase):
         self.assertEqual(names.count(TARGETS['normal'].label), 1, names)
 
 
+class OrphanedChartTests(unittest.TestCase):
+    """register 裡沒有、但磁碟上還在的譜面檔，不可以被補難度蓋掉。
+
+    曲庫管理的「刪除難度」只拿掉 register 那一筆，譜面檔會留在原地（對話框
+    有明講）。以前 `plan()` 只看 register，這種檔案就變成「這個難度不存在」
+    而被直接覆寫——**而歷史只備份 register 和索引，譜面救不回來**。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.song = 'TestSong'
+        self.song_dir = os.path.join(self.root, self.song)
+        os.makedirs(os.path.join(self.song_dir, 'Real'))
+        self.stem = 'chart'
+        self.real = os.path.join(self.song_dir, 'Real', self.stem + '.json')
+        chart(dense(groups=80, step=120, chord=3)).save_json(self.real)
+        path = os.path.join(self.song_dir, 'register.json')
+        io.open(path, 'w', encoding='utf-8', newline='').write(
+            json.dumps(register([entry('Real', 14, self.song, self.stem)]),
+                       ensure_ascii=False))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def orphan(self, label, with_source):
+        """在 register 之外放一份 <label>/<stem>.json。"""
+        folder = os.path.join(self.song_dir, label)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, self.stem + '.json')
+        io.open(path, 'w', encoding='utf-8').write('{"notes": []}')
+        if with_source:
+            os.makedirs(os.path.join(folder, 'source'), exist_ok=True)
+            io.open(os.path.join(folder, 'source', self.stem + '.xml'),
+                    'w', encoding='utf-8').write('<a/>')
+        return path
+
+    def test_an_orphan_without_a_source_xml_is_treated_as_handwritten(self):
+        self.orphan('Hard', with_source=False)
+        plan = SF.plan(self.real)
+        self.assertNotIn('hard', plan.wanted)
+        self.assertTrue(any(k == 'hard' and '手寫' in why
+                            for k, why in plan.skipped), plan.skipped)
+
+    def test_the_other_difficulties_still_get_made(self):
+        """只擋住那一個，不要連累其他難度。"""
+        self.orphan('Hard', with_source=False)
+        self.assertEqual(SF.plan(self.real).wanted, ['normal', 'extreme'])
+
+    def test_an_orphan_we_made_is_only_replaced_when_asked(self):
+        self.orphan('Hard', with_source=True)
+        self.assertNotIn('hard', SF.plan(self.real).wanted)
+        self.assertIn('hard', SF.plan(self.real, regenerate=True).wanted)
+
+    def test_nothing_on_disk_means_business_as_usual(self):
+        self.assertEqual(SF.plan(self.real).wanted,
+                         ['normal', 'hard', 'extreme'])
+
+
+class BackUpBeforeReplaceTests(unittest.TestCase):
+    """最後一道保險：真的要蓋掉既有檔案時先留一份。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_it_keeps_a_copy(self):
+        path = os.path.join(self.root, 'a.json')
+        io.open(path, 'w', encoding='utf-8').write('原本的內容')
+        kept = SF.back_up_before_replace(path)
+        self.assertIsNotNone(kept)
+        self.assertEqual(io.open(kept, encoding='utf-8').read(), '原本的內容')
+
+    def test_the_backup_is_not_a_json_file(self):
+        """曲庫掃描是 glob `**/*.json`，留成 .json 會被當成另一份譜面。"""
+        path = os.path.join(self.root, 'a.json')
+        io.open(path, 'w', encoding='utf-8').write('x')
+        self.assertFalse(SF.back_up_before_replace(path).endswith('.json'))
+
+    def test_no_file_means_no_backup(self):
+        self.assertIsNone(
+            SF.back_up_before_replace(os.path.join(self.root, 'nope.json')))
+
+
 if __name__ == '__main__':
     unittest.main()

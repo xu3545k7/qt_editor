@@ -131,6 +131,35 @@ class SongLibraryTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.root, 'Alpha', 'register.json')))
         self.assertTrue(any(e['folderName'] == 'Alpha' for e in self.read('library.json')['songs']))
 
+    def test_undo_fails_loudly_when_the_trash_folder_is_gone(self):
+        """回收區不見了就整筆失敗，不可以回報成功。
+
+        以前是 `if restored and os.path.isdir(trash)`：搬不回來就跳過，卻照樣
+        還原索引、刪掉這筆歷史、回傳成功。結果索引說有這首歌、磁碟上沒有
+        （連 register.json 都沒有），UI 從此看不到它，而歷史已經被刪掉。
+        """
+        trash = self.lib.delete_song('Alpha')
+        shutil.rmtree(trash)                       # 使用者自己清了回收區
+        with self.assertRaises(LibraryError):
+            self.lib.undo_last()
+
+    def test_a_failed_undo_keeps_the_history_so_you_can_try_again(self):
+        trash = self.lib.delete_song('Alpha')
+        shutil.rmtree(trash)
+        with self.assertRaises(LibraryError):
+            self.lib.undo_last()
+        self.assertTrue(self.lib.history(), '歷史不該被刪掉')
+
+    def test_a_failed_undo_does_not_touch_the_index(self):
+        """索引和磁碟必須一起變，不可以只動一邊。"""
+        trash = self.lib.delete_song('Alpha')
+        shutil.rmtree(trash)
+        with self.assertRaises(LibraryError):
+            self.lib.undo_last()
+        names = [e['folderName'] for e in self.read('library.json')['songs']]
+        self.assertNotIn('Alpha', names,
+                         '搬不回來就不該在索引裡復活')
+
     def test_undo_restores_register(self):
         self.lib.update_song('Alpha', '改掉', 'x', ['Deemo'])
         self.lib.undo_last()

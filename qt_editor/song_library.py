@@ -370,11 +370,22 @@ class SongLibrary:
         folder, label = entries[0]
         meta = _read_json(os.path.join(folder, 'meta.json'), {})
         restored = meta.get('restore_folder')
-        if restored and os.path.isdir(restored.get('trash', '')):
+        if restored:
+            # **搬不回來就整筆失敗，不要繼續。** 以前這裡是
+            # `if restored and os.path.isdir(trash)`：回收區資料夾不見時直接
+            # 跳過搬回，卻照樣往下還原索引、`rmtree` 掉這筆歷史、回傳成功。
+            # 結果是索引說有這首歌、磁碟上沒有（連 register.json 都沒有），
+            # UI 從此看不到它，而歷史已經被刪掉、沒有第二次機會。
+            trash = restored.get('trash', '')
+            if not os.path.isdir(trash):
+                raise LibraryError(
+                    tr('「%s」的回收區資料夾不見了（%s），沒有東西可以搬回來。\n'
+                       '這筆歷史保留著，沒有動到曲庫。')
+                    % (restored.get('folder', '?'), trash or '(沒有記錄路徑)'))
             dest = os.path.join(self.root, restored['folder'])
             if os.path.exists(dest):
                 raise LibraryError(tr('曲庫裡已經有「%s」，無法搬回') % restored['folder'])
-            shutil.move(restored['trash'], dest)
+            shutil.move(trash, dest)
         removed = meta.get('remove_folder')
         # 批量匯入／更新曲庫一次加好幾首，記的是一份清單
         for name in ([removed] if isinstance(removed, str) else list(removed or [])):

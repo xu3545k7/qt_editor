@@ -503,6 +503,11 @@ _TABLE = {
          '%s: %d/%d notes have no pitch (silent without BGM)'),
     '曲庫裡已經有「%s」，無法搬回': ('曲库里已经有“%s”，无法搬回',
          '"%s" already exists in the library; cannot restore it'),
+    '「%s」的回收區資料夾不見了（%s），沒有東西可以搬回來。\n這筆歷史保留著，沒有動到曲庫。':
+        ('“%s”的回收区文件夹不见了（%s），没有东西可以搬回来。\n这笔历史保留着，没有动到曲库。',
+         'The recycle folder for "%s" is gone (%s); there is nothing to '
+         'restore.\nThis history entry is kept and the library was not '
+         'touched.'),
     'ZIP 打不開：%s': ('ZIP 打不开：%s',
          'Cannot open the ZIP: %s'),
     '%s：找不到譜面檔': ('%s：找不到谱面文件',
