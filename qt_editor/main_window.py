@@ -239,7 +239,6 @@ class ToolbarSet:
         self.hit_act: Optional[QAction] = None
         self.barline_drag_act: Optional[QAction] = None
         #: 「常用」分頁上的類型選單（選完要歸位）
-        self.common_type_combo = None
         #: 「鎖定音符」開關：家在小節分頁，常用分頁放一顆鏡像，兩顆要同步
         self.notes_locked_act: Optional[QAction] = None
         self.measure_lock_act: Optional[QAction] = None
@@ -1856,77 +1855,33 @@ class MainWindow(QMainWindow):
     # ── 分頁：常用 ────────────────────────────────────────────────────
 
     def _build_tab_common(self, tbs: ToolbarSet) -> QWidget:
-        """**各個分頁最常用的東西，拿出來放在這一頁。**
+        """**各個分頁最常用的東西，拿出來放在這一頁。** 鏡像，不是誰的家。
 
-        使用者：「常用是把各個 tab 最常用的拿出來」。所以這一頁是**鏡像**，
-        不是誰的家——每一項在自己的分頁上都有家：
+        使用者給了三條篩選規則，三條都要過：
 
-            ● 右手／左手／改類型／複製／滑奏串接／音符屬性
-                                      家在 編輯 → 選取音符 ▾
-            🔒 鎖定音符                家在 小節
-            處理長條尾端…              家在 工具 → 音符整理 ▾
+            1. 常做（照 `logs/oplog-*.jsonl` 的使用次數）
+            2. **沒有快捷鍵**——手會先按鍵，眼睛不會往上看
+            3. **右鍵選單裡沒有**——那已經是一次點擊就到了
 
-        挑的標準是「常做 **而且沒有快捷鍵**」。兩個條件都要。
+        第 3 條一加，原本這一頁七項裡有五項要拿掉：
 
-        使用者：「不要把快捷鍵相關的放到常用」——已經有鍵的放按鈕只是佔空間，
-        手會先按鍵，眼睛不會往上看。
+            ● 右手／左手   右鍵「音符屬性 ▸ 左右手」
+            改類型…        右鍵「音符屬性 ▸ 類型」
+            ⧉ 複製         右鍵「就地複製」**而且有 C 鍵**
+            滑奏串接       右鍵「結構 / 連接 ▸ 串聯為滑鍵」
+            音符屬性…      右鍵「編輯屬性…」
 
-        常用程度照操作紀錄排（37 份 `logs/oplog-*.jsonl`、159 個工作階段、
-        15459 次操作）；有沒有鍵是逐項查過的，不是憑印象：
+        剩下的是「真的常跑、但不是一個鍵或一次右鍵就到」的重型操作，照使用
+        次數排：
 
-            set_width_selected      809   有鍵（E 在 2↔3 之間切換，正好涵蓋）
-            delete_selected         584   有鍵（Delete）
-            shift_selected_time     548   有鍵（↑／↓ 一個 32 分音符）
-            set_hand_selected       387   **沒有**（Q 改的是「放置」的手，不是選取的）
-            set_type_selected       309   **一半沒有**（T/H/K 有，Soft/Slide/Trill 沒有）
-            shift_selected_pitch    162   有鍵（音高模式的左右）
-            duplicate_selected       36   **沒有**
-            resolve_hold_tails       19   **沒有**
-            _ctx_note_property       13   **沒有**（本來只在右鍵選單裡）
-            chain_slides_selected    12   **沒有**
+            _fix_ai_transcription      34   PianoTrans 轉譜整理
+            resolve_hold_tails_dialog  19   處理長條尾端
+            align_reference_midi       14   以 MIDI 對齊
+            _arrange_now               10   智慧 MIDI 初步寫譜
+            _show_lead_in_dialog        6   開頭空白
 
-        存檔／復原／重做／播放／暫停／停止也都有鍵，所以都不放。
+        加上 🔒 鎖定音符（新功能，家在小節分頁，這裡是鏡像）。
         """
-        act_right = self._tab_action(tbs, '● 右手',
-                                     lambda: self.view.set_hand_selected(0),
-                                     tip='把選取的音符改成右手（沒有快捷鍵；'
-                                         'Q 改的是放置模式要放哪一手）',
-                                     keys='set_hand_selected')
-        act_left = self._tab_action(tbs, '● 左手',
-                                    lambda: self.view.set_hand_selected(1),
-                                    tip='把選取的音符改成左手',
-                                    keys='set_hand_selected')
-        act_dup = self._tab_action(tbs, '⧉ 複製',
-                                   lambda: self.view.duplicate_selected(),
-                                   tip='把選取的音符複製一份',
-                                   keys='duplicate_selected')
-        act_chain = self._tab_action(tbs, '滑奏串接',
-                                     lambda: self.view.chain_slides_selected(),
-                                     tip='把選取的音符串成一條滑奏',
-                                     keys='chain_slides_selected')
-        act_tails = self._tab_action(tbs, '處理長條尾端…',
-                                     self.resolve_hold_tails_dialog,
-                                     tip='長條尾端和同手下一顆離太近時縮短它',
-                                     keys='resolve_hold_tails_dialog')
-        act_prop = self._tab_action(tbs, '音符屬性…',
-                                    self._common_note_property,
-                                    tip='改選取音符的細項（本來只在右鍵選單裡）',
-                                    keys='_ctx_note_property_dialog')
-
-        # 類型做成下拉：六種各一顆要 900px 以上。T/H/K 三種有鍵，但 Soft／
-        # Slide／Trill 沒有，所以這個控制項整個留著。
-        type_combo = QComboBox(tbs.root)
-        type_combo.addItem('改類型…', -1)
-        for label, value in (('Tap  (T)', 0), ('Soft', 1), ('Long  (H)', 2),
-                             ('Staccato  (K)', 3), ('Slide', 4), ('Trill', 0x40)):
-            type_combo.addItem(label, value)
-        type_combo.setToolTip('把選取的音符改成這個類型。括號裡是已經有的快捷鍵。')
-        self._fit_combo(type_combo, 128)
-        type_combo.activated.connect(self._bind(tbs, self._on_common_type_changed,
-                                                forward=True))
-        tbs.common_type_combo = type_combo
-
-        # 鎖定音符：使用者指定放在常用。它沒有快捷鍵，符合這一頁的規則。
         tbs.notes_locked_act = self._tab_action(
             tbs, '🔒 鎖定音符', self._on_notes_locked_toggled,
             tip=self._notes_locked_tip(),
@@ -1935,18 +1890,29 @@ class MainWindow(QMainWindow):
         tbs.notes_locked_act.setChecked(self._notes_locked())
         tbs.notes_locked_act.blockSignals(False)
 
-        return self._tab_page([
-            self._tab_button(tbs.notes_locked_act),
-            None,
-            self._tab_button(act_right),
-            self._tab_button(act_left),
-            type_combo,
-            self._tab_button(act_dup),
-            None,
-            self._tab_button(act_chain),
-            self._tab_button(act_tails),
-            self._tab_button(act_prop),
-        ])
+        widgets = [self._tab_button(tbs.notes_locked_act), None]
+        for label, slot, tip in self._common_entries():
+            widgets.append(self._tab_button(
+                self._tab_action(tbs, label, slot, tip=tip)))
+        return self._tab_page(widgets)
+
+    def _common_entries(self):
+        """常用分頁上的重型操作：(標籤, slot, 說明)。家都在別的分頁。"""
+        return [
+            (t('action_smart_midi_chart'), self.smart_midi_chart_dialog,
+             '家：工具分頁（用了 10 次）'),
+            ('PianoTrans 轉譜整理…', self.pianotrans_cleanup_dialog,
+             '家：工具 → 音符整理（用了 34 次，這一頁最常跑的）'),
+            (t('action_resolve_hold_tails'), self.resolve_hold_tails_dialog,
+             '家：工具 → 音符整理（用了 19 次）'),
+            # 原本的標籤在下拉裡沒問題，當成按鈕就太長了（「整份改用參考 MIDI
+            # 的時間與音高（鍵道、力度、記號留著）…」，一顆就吃掉 600px）。
+            ('以 MIDI 對齊…', self.align_reference_midi_dialog,
+             chr(10).join([t('action_align_reference_midi'),
+                           '家：工具 → 以 MIDI 修復（用了 14 次）'])),
+            (t('tb_offset'), self._show_lead_in_dialog,
+             '家：播放分頁（用了 6 次）'),
+        ]
 
     def _common_note_property(self) -> None:
         """對選取的第一顆開音符屬性。右鍵選單那個要先點到音符，這裡吃選取。"""
@@ -1956,31 +1922,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '音符屬性', '先選一顆音符。')
             return
         self.view._ctx_note_property_dialog(sorted(notes, key=lambda n: n.start)[0])
-
-    def _on_common_type_changed(self, index: int) -> None:
-        """「改類型…」選單：選了就套用，然後跳回提示文字。
-
-        跳回去是故意的——它不是「目前狀態」，是一個動作。停在上次選的那一項
-        會讓人以為選取的音符現在就是那個類型。
-        """
-        combo = None
-        for tbs in self._toolbars:
-            if getattr(tbs, 'common_type_combo', None) is not None:
-                if tbs.common_type_combo.currentIndex() == index:
-                    combo = tbs.common_type_combo
-                    break
-        if combo is None:
-            return
-        value = combo.itemData(index)
-        if value is not None and int(value) >= 0:
-            self.view.set_type_selected(int(value))
-        for tbs in self._toolbars:
-            if getattr(tbs, 'common_type_combo', None) is not None:
-                tbs.common_type_combo.blockSignals(True)
-                tbs.common_type_combo.setCurrentIndex(0)
-                tbs.common_type_combo.blockSignals(False)
-
-    # ── 分頁：編輯 ────────────────────────────────────────────────────
 
     def _build_tab_edit(self, tbs: ToolbarSet) -> QWidget:
         # 分割搬到「檢視」分頁了——那是版面的事。這個位置改成常駐顯示偵測到的
