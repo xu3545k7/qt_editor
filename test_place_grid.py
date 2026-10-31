@@ -206,5 +206,48 @@ class BothPanesTests(unittest.TestCase):
         self.assertGreater(count(), 0, '收到 peer 旗標之後仍然沒畫格線')
 
 
+class BeatInUnitsTests(unittest.TestCase):
+    """一拍佔幾個 unit。放置格線和吸附都靠它，所以算錯就是「線的位置不對」。
+
+    一拍 = 一小節佔的 unit 數 ÷ 分子。以前回傳 `1/分子`，那只在「1 unit =
+    一整個小節」的 per-bar 譜上成立；一拍一筆的譜 1 unit 就是一拍，於是算出來
+    小四倍——4/4、120BPM 一拍被當成 125ms（實際是 500ms），格線密了四倍。
+    """
+
+    def setUp(self):
+        self.view = ChartView()
+
+    def quarter_grid(self):
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        m.ensure_precise_beat_grid()
+        self.view.model = m
+        return m
+
+    def test_one_beat_is_one_entry_on_a_quarter_grid(self):
+        self.quarter_grid()
+        self.assertAlmostEqual(self.view._beat_in_units_at(2.0), 1.0)
+
+    def test_it_lands_on_the_real_beat_length(self):
+        self.quarter_grid()
+        beat = self.view._beat_in_units_at(2.0)
+        self.assertAlmostEqual(self.view.mapper.unit_to_ms(beat), 500.0, delta=1)
+
+    def test_six_eight_beats_are_eighth_notes(self):
+        """6/8 的一拍是八分音符＝半個 unit，所以格線比 4/4 密一倍。"""
+        m = self.quarter_grid()
+        m.set_measure_time_signature(4, 6, 8, uniform=True)
+        inside = self.view.mapper.ms_to_unit(8500.0)
+        self.assertAlmostEqual(self.view._beat_in_units_at(inside), 0.5)
+        self.assertAlmostEqual(self.view._beat_in_units_at(2.0), 1.0,
+                               msg='4/4 的小節不該跟著變')
+
+    def test_a_per_bar_chart_keeps_its_own_convention(self):
+        """一小節一筆的譜 1 unit 就是一整個小節，一拍是 1/分子——不要改到它。"""
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        self.view.model = m
+        self.assertEqual(m.entries_per_bar, 1)
+        self.assertAlmostEqual(self.view._beat_in_units_at(0.0), 0.25)
+
+
 if __name__ == '__main__':
     unittest.main()

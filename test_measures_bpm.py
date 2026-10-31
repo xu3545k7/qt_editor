@@ -116,14 +116,20 @@ if __name__ == '__main__':
 class BarUnitsDenominatorTests(unittest.TestCase):
     """一小節佔幾個「拍單位」要看分母，不是只看分子。
 
-    beat_data 的單位是四分音符。2/2 的分子是 2，但一小節仍然是 4 個四分音符；
-    6/8 的分子是 6，一小節只有 3 個。拿 numerator 當單位數的話，把一小節改成
-    2/2 會讓它只佔一半——那一小節被切成兩半、後面每一小節都往前擠一格，
-    使用者看到的就是「改一個拍號結果後面全部小節都變了」。
+    單位是**一筆 beat_data**。這裡的譜一筆是一個四分音符，所以 2/2 的分子是 2
+    但一小節仍然是 4 筆；6/8 的分子是 6，一小節只有 3 筆。拿 numerator 當單位數
+    的話，把一小節改成 2/2 會讓它只佔一半——那一小節被切成兩半、後面每一小節
+    都往前擠一格，使用者看到的就是「改一個拍號結果後面全部小節都變了」。
+
+    「一筆不是四分音符」的譜見 `NonQuarterGridUnitsTests`。
     """
 
     def model(self):
         m = NoteModel.create_new('t', 120.0, 40.0, 4)
+        # 一定要先鋪精確格線。`create_new` 給的是**一小節一筆**的格線，那種譜
+        # 一小節就是 1 個單位（而且小節切法走 legacy 那條路，根本不問這個
+        # 函式）。不鋪的話這裡量到的是「一筆 = 一個小節」，答案全部變 1.0。
+        m.ensure_precise_beat_grid()
         return m
 
     def test_common_time_is_four_units(self):

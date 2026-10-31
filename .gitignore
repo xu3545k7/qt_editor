@@ -81,3 +81,6 @@ qt_editor/icon.icns
 
 # 匯出對話框記住的歌曲資訊（使用者資料，不是原始碼）
 qt_editor/song_info.json
+
+# 小節格線稽核的輸出（audit_measure_grid.py）
+audit-*.txt

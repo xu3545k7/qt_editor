@@ -176,8 +176,9 @@ class MeasureBpmDialog(QDialog):
         changed_set = set(changed)
         for r, (num, den, _bpm) in enumerate(self._orig):
             bpm = float(self._spins[r].value())
-            units = self._model._bar_units_for(int(num), int(den))
-            new_ms = units * 60000.0 / max(1e-6, bpm)
+            # 四分音符數，不是拍點筆數：BPM 說的就是四分音符
+            quarters = self._model._bar_quarters_for(int(num), int(den))
+            new_ms = quarters * 60000.0 / max(1e-6, bpm)
             item = self._table.item(r, COL_LEN)
             if item is not None:
                 item.setText('%d ms' % int(round(new_ms)))

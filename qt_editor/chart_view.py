@@ -2890,14 +2890,25 @@ class ChartView(QWidget):
 
     def _beat_in_units_at(self, unit: float) -> float:
         """回傳指定 unit 位置下 1 拍對應的 unit 長度。
-        在小節均分模式下，會依該小節拍號動態變化（例如 15/4 比 4/4 更密）。"""
+        在小節均分模式下，會依該小節拍號動態變化（例如 15/4 比 4/4 更密）。
+
+        一拍 = 一小節佔的 unit 數 ÷ 這一小節有幾拍（＝分子）。以前這裡回傳的是
+        `1/分子`，那只在「1 unit = 一小節」的 per-bar 譜上成立；一拍一筆的譜
+        1 unit 就是一拍，於是算出來小四倍——4/4、120BPM 實測一拍被當成 0.25
+        個 unit ＝ 125ms（一拍其實是 500ms），放置格線和吸附都細了四倍。
+        """
         # 時間均分已正常，沿用現行行為
         if self.time_uniform:
             return self._beat_in_units()
         try:
             ms = float(self.mapper.unit_to_ms(float(unit)))
             bpb = max(1, int(self.model.get_beats_per_bar_at_ms(ms)))
-            return 1.0 / float(bpb)
+            if self.model.entries_per_bar <= 1:
+                return 1.0 / float(bpb)     # per-bar：1 unit = 一整個小節
+            units = float(self.model.bar_units_at_ms(ms))
+            if units <= 0:
+                return self._beat_in_units()
+            return units / float(bpb)
         except Exception:
             return self._beat_in_units()
 
@@ -4226,12 +4237,7 @@ class ChartView(QWidget):
                     if is_bar:
                         # time signature at current bar start
                         ts_num = self.model.get_beats_per_bar_at_ms(float(bms))
-                        ts_den = self.model.time_sig_denominator
-                        for ch_ms, _ch_num, ch_den in self.model.time_sig_changes:
-                            if ch_ms <= int(bms):
-                                ts_den = ch_den
-                            else:
-                                break
+                        ts_den = self.model._denominator_at_ms(float(bms))
                         qp.setPen(QPen(BARLINE_COLOR, 1))
                         qp.drawLine(0, py, w, py)
                         tot_s = bms / 1000.0
@@ -4271,12 +4277,7 @@ class ChartView(QWidget):
 
                     if is_bar:
                         ts_num = self.model.get_beats_per_bar_at_ms(float(bms))
-                        ts_den = self.model.time_sig_denominator
-                        for ch_ms, _ch_num, ch_den in self.model.time_sig_changes:
-                            if ch_ms <= int(bms):
-                                ts_den = ch_den
-                            else:
-                                break
+                        ts_den = self.model._denominator_at_ms(float(bms))
                         qp.setPen(QPen(BARLINE_COLOR, 1))
                         qp.drawLine(0, py, w, py)
                         tot_s = bms / 1000.0

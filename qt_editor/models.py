@@ -7049,6 +7049,32 @@ class NoteModel:
             jm['editor_precise_beat_grid'] = True
         self.json_meta = jm
 
+    #: 精確格線一小節最多鋪幾筆拍點。24/16 這種（多半是 MIDI 的產物）照最細
+    #: 的拍值鋪會讓同一首的 4/4 小節變成 16 筆，格線比能看的密度細太多、檔案
+    #: 也漲四倍。超過就退回原本的解析度。
+    _MAX_GRID_ENTRIES_PER_BAR = 32
+
+    def _grid_entry_span(self) -> float:
+        """鋪精確格線時，**一筆拍點要代表幾個四分音符**。
+
+        取全曲用到的最細拍值（分母最大的那個拍號）：只有 4/4 的譜是四分音符、
+        有 6/8 的譜是八分音符。這樣每一種拍號的「一小節幾筆」都是整數，而
+        `_bar_units_for`（＝幾個四分音符 ÷ 這個值）也剛好等於那個筆數——
+        **單位數和筆數必須相等**，因為 `_detect_beat_index_scale` 是拿 index
+        間距的中位數當一個單位。不等的話，寫出來的格線自己讀回來就對不上：
+        Scherzo（全 6/8、一筆原本是附點二分）實測會每隔幾十小節多出一條拍線。
+        """
+        dens = {int(d) for _ms, _n, d in self.time_sig_changes if int(d) > 0}
+        dens.add(max(1, int(self.time_sig_denominator or 4)))
+        span = 4.0 / float(max(dens))
+        # 密度上限：拿用到的最大分子去估最壞的那一小節
+        nums = [int(n) for _ms, n, _d in self.time_sig_changes if int(n) > 0]
+        nums.append(max(1, int(self.beats_per_bar or 4)))
+        worst = max(n * 4.0 / min(dens) / span for n in nums) if dens else 0
+        if worst > self._MAX_GRID_ENTRIES_PER_BAR:
+            return self._entry_quarter_span()
+        return span
+
     def ensure_precise_beat_grid(self) -> None:
         if self._uses_explicit_beat_units():
             return
@@ -7057,24 +7083,41 @@ class NoteModel:
         total_measures = self._legacy_count_measures()
         if total_measures <= 0:
             return
+        # 先決定一筆代表多少音值，並**寫進 json_meta 釘住**。不釘的話
+        # `_entry_quarter_span()` 會在鋪完之後重新量一次，量到的值和鋪的時候
+        # 用的不一樣時，小節就切在拍點中間。
+        span = max(1e-6, self._grid_entry_span())
         new_beats: List[Tuple[int, int]] = []
-        cursor_unit = 0.0
+        cursor_unit = 0
         last_end_ms = 0
         for measure_idx in range(total_measures):
             start_ms, end_ms = self._legacy_get_measure_time_range(measure_idx)
             if start_ms is None or end_ms is None:
                 continue
-            beats_in_bar = max(1, self.get_beats_per_bar_at_ms(start_ms))
+            num = max(1, self.get_beats_per_bar_at_ms(start_ms))
+            den = self._denominator_at_ms(start_ms)
             measure_dur = end_ms - start_ms
-            for beat_idx in range(beats_in_bar):
-                unit = cursor_unit + float(beat_idx)
-                beat_ms = start_ms + (measure_dur * beat_idx / float(beats_in_bar))
+            # 一小節鋪幾筆＝一小節幾個四分音符 ÷ 一筆幾個四分音符。6/8 配八分
+            # 音符的格線就是 6 筆——以前這裡寫的是**分子**而單位也推分子，於是
+            # 寫了 6 筆、也往前推 6 個單位，但讀回來的 `bar_units_at_ms` 說 3 個
+            # ——每個 6/8 小節被切成兩半、裡面只剩 3 條拍線。
+            count = max(1, int(round(num * 4.0 / den / span)))
+            for beat_idx in range(count):
+                # 一筆一個單位（index 步距剛好是 EDITOR_BEAT_UNIT_SCALE）。
+                # 這是上面 docstring 說的那條：單位數＝筆數，整數、不進位。
+                beat_ms = start_ms + (measure_dur * beat_idx / float(count))
                 new_beats.append(
-                    (int(round(unit * EDITOR_BEAT_UNIT_SCALE)), int(round(beat_ms)))
+                    ((cursor_unit + beat_idx) * EDITOR_BEAT_UNIT_SCALE,
+                     int(round(beat_ms)))
                 )
-            cursor_unit += float(beats_in_bar)
+            cursor_unit += count
             last_end_ms = int(end_ms)
-        new_beats.append((int(round(cursor_unit * EDITOR_BEAT_UNIT_SCALE)), int(round(last_end_ms))))
+        new_beats.append((cursor_unit * EDITOR_BEAT_UNIT_SCALE, int(round(last_end_ms))))
+        jm = self.json_meta if isinstance(self.json_meta, dict) else {}
+        jm[self.BEAT_ENTRY_QUARTERS_KEY] = span
+        self.json_meta = jm
+        self._cache_entry_span = None
+        self._cache_entry_span_sig = None
         self._write_beat_entries(new_beats, mark_precise=True)
 
     def set_note_bpm(self, note_start_ms: int, new_bpm: float) -> None:
@@ -7177,15 +7220,39 @@ class NoteModel:
         「一筆 beat_data = 一個四分音符」這個假設有例外，見 `_bar_units_for`。
         """
         num = max(1, int(self.get_beats_per_bar_at_ms(ms)))
-        den = max(1, int(self.time_sig_denominator))
+        # per-bar 的譜（一小節一筆拍點）本來就用四分音符當單位，小節數走 legacy
+        # 那條路，`_bar_units_for` 會自己判斷不換算。
+        return self._bar_units_for(num, self._denominator_at_ms(ms))
+
+    def _denominator_at_ms(self, ms: float) -> int:
+        """`ms` 這個位置的拍號**分母**。
+
+        `get_beats_per_bar_at_ms` 只回傳分子，分母要自己走 `time_sig_changes`
+        ——這段查找以前在五個地方各抄一份（`bar_units_at_ms`、`get_measure_bpm`、
+        `_bar_ms_at_ms`、`set_measure_time_signature`、`chart_view` 畫拍號標籤），
+        抄漏一處就會出現「標籤寫 6/8、長度卻照 4/4 算」。
+        """
+        den = max(1, int(self.time_sig_denominator or 4))
         for change_ms, _num, change_den in self.time_sig_changes:
             if change_ms <= ms:
                 den = max(1, int(change_den))
             else:
                 break
-        # per-bar 的譜（一小節一筆拍點）本來就用四分音符當單位，小節數走 legacy
-        # 那條路，`_bar_units_for` 會自己判斷不換算。
-        return self._bar_units_for(num, den)
+        return den
+
+    @staticmethod
+    def _bar_quarters_for(num: int, den: int) -> float:
+        """給定拍號，一個小節佔幾個**四分音符**：分子×4÷分母。
+
+        要把小節長度換成毫秒的地方用這個（一個四分音符是 `60000/BPM` 毫秒，
+        BPM 的定義就是四分音符）。2/2 是 4 個、6/8 是 3 個、7/8 是 3.5 個。
+
+        **不要拿它當「幾筆拍點」。** 那是 `_bar_units_for`，兩者差一個
+        `_entry_quarter_span()`。混用的症狀分別是：拿筆數算毫秒 → 小節長度
+        在非四分音符格線的譜上差 1/span；拿四分音符數當筆數 → 小節被切在
+        拍點中間（就是「6/8 只有三個拍」）。
+        """
+        return float(max(1, int(num))) * 4.0 / max(1, int(den))
 
     def _bar_units_for(self, num: int, den: int) -> float:
         """給定拍號，一個小節佔幾個「拍單位」＝幾筆 beat_data。
@@ -7200,13 +7267,15 @@ class NoteModel:
         新手教學進階08（3/8）是附點四分、felzione（1/8）是八分。照四分音符算，
         這些譜的小節會切在拍點中間，增刪小節一定出事。所以要再除以
         `_entry_quarter_span()`。
+
+        使用者報的症狀就是這個：Suspenseful_Third_Day（6/8、150BPM）一筆拍點是
+        八分音符，一個 6/8 小節＝6 筆＝1200ms。不除的話算成 3 個單位＝3 筆，
+        **每個小節被切成一半**（215 個小節而不是 107 個），小節裡只剩 3 條拍線
+        ——「6/8 只有三個拍」。
+
+        要毫秒的話用 `_bar_quarters_for`，不是這個。
         """
-        # **還沒**除以 `_entry_quarter_span()`，儘管那才是正確的算法。實測（同一套
-        # 全曲庫掃描、四條路）：除下去之後插入的錯誤 12→4、刪除 21→8、新增 11→10，
-        # 但**改拍號 1→20**——`set_measure_time_signature` 還有別的地方假設一筆是
-        # 四分音符，要一起改才能開。量測值仍然會存進 JSON（見 save_json），開啟
-        # 之前不必再重新量。
-        return float(max(1, int(num))) * 4.0 / max(1, int(den))
+        return self._bar_quarters_for(num, den) / max(1e-6, self._entry_quarter_span())
 
     #: 一筆拍點可能的音值（四分音符的幾倍）。量出來的值吸附到這些上面。
     _ENTRY_SPANS = (0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 1.0, 4.0 / 3.0,
@@ -7501,12 +7570,7 @@ class NoteModel:
         """
         b = float(bpm) if bpm is not None else self.bpm
         num = max(1, self.get_beats_per_bar_at_ms(ms))
-        den = max(1, int(self.time_sig_denominator))
-        for tms, _tnum, tden in self.time_sig_changes:
-            if tms <= ms:
-                den = max(1, int(tden))
-            else:
-                break
+        den = self._denominator_at_ms(ms)
         return num * 4.0 * 60000.0 / (den * max(1.0, b))
 
     def get_measure_time_range(self, measure_idx: int) -> Tuple[Optional[int], Optional[int]]:
@@ -7927,7 +7991,9 @@ class NoteModel:
                 delta += 0.0
                 continue
             changed += 1
-            new_dur = (self._bar_units_for(int(row[0]), int(row[1]))
+            # 毫秒要用「幾個四分音符」（BPM 的定義就是四分音符），不是
+            # 「幾筆拍點」——後者在八分音符格線的譜上差一倍。
+            new_dur = (self._bar_quarters_for(int(row[0]), int(row[1]))
                        * 60000.0 / max(1e-6, float(row[2])))
             count = max(1, e - s)
             for k in range(count):
@@ -8253,6 +8319,17 @@ class NoteModel:
 
         bpm_use = float(new_bpm) if new_bpm and new_bpm > 0 else self.bpm
         insert_ms = int(start_ms)
+        # 插進來的空白小節是照**插入點那一小節**的格線複製的
+        # （`_measure_index_shape`），所以它們的拍號也該是那一小節的。
+        #
+        # 剛好落在插入點上的拍號標記會被 `_retime_time_sig_changes` 往後推，
+        # 於是那一段空白落回**前一個**標記的管轄範圍。felzione 第 1 小節是 MIDI
+        # 留下的 232ms 前導、宣告 1/8，在第 2 小節前插 4 個 6/8 小節時那 5584ms
+        # 全部被切成 1/8：小節數 94 → 118，整份譜重新切過一次。
+        sig_at_insert: Optional[Tuple[int, int]] = None
+        if any(int(t) == insert_ms for t, _n, _d in self.time_sig_changes):
+            sig_at_insert = (max(1, int(self.get_beats_per_bar_at_ms(insert_ms))),
+                             self._denominator_at_ms(insert_ms))
         # 長度照插入點那一小節**實際上**有多長，不要照 BPM 推。
         #
         # index 跨度是照當地格線量的（`_measure_index_shape`），時間卻照 BPM 算的
@@ -8312,6 +8389,14 @@ class NoteModel:
         self._write_beat_entries(entries)
         # 插入點之後的拍號標記也要往後推（絕對 ms）
         self._retime_time_sig_changes(insert_ms, insert_ms, 1.0, total_ms)
+        if sig_at_insert is not None:
+            # 把插入點上的拍號補回去，讓新的空白小節跟著它（見上面的說明）
+            self.time_sig_changes = sorted(
+                [(t, n, d) for t, n, d in self.time_sig_changes
+                 if int(t) != insert_ms]
+                + [(insert_ms, int(sig_at_insert[0]), int(sig_at_insert[1]))],
+                key=lambda row: row[0])
+            self._sync_time_sig_changes_out()
 
         # 3. 更新 music_finish_time_msec
         self._set_music_end_ms(float(self.music_end_ms) + total_ms)
@@ -8404,7 +8489,15 @@ class NoteModel:
             else:
                 entries.append((int(bidx) - idx_shift, max(0, int(bms) - dur_ms)))
         self._write_beat_entries(entries)
-        # 被刪掉那一段裡的拍號標記收到小節頭，後面的整段往前補
+        # 被刪掉那一段裡的拍號標記收到小節頭，後面的整段往前補。
+        #
+        # 試過改成「照小節序號重建」（`_rebuild_time_sig_changes`，就是
+        # `set_measure_time_signature` 用的那套）。**實測更糟，已回退**：全曲庫
+        # 135 份譜的刪除錯誤 6 → 15，Suspenseful 的小節數從 108 變 162。原因是
+        # 那個函式從第一筆拍點開始累加拍單位求小節起點，而這些譜的拍點有缺口
+        # （Suspenseful 少了 index 144000、147000），累加的位置和真正的小節邊界
+        # 會愈走愈遠。插入那條路改得動（見 `_insert_measures`），是因為它只補
+        # **一個**標記回原位，不重算全部。
         self._retime_time_sig_changes(int(start_ms), int(end_ms), 0.0, -dur_ms)
 
         # 4. 更新 music_finish_time_msec
@@ -8421,13 +8514,7 @@ class NoteModel:
             if start_ms is None:
                 break
             num = max(1, self.get_beats_per_bar_at_ms(start_ms))
-            den = max(1, int(self.time_sig_denominator))
-            for tms, _tnum, tden in self.time_sig_changes:
-                if tms <= start_ms:
-                    den = max(1, int(tden))
-                else:
-                    break
-            out.append((int(num), int(den)))
+            out.append((int(num), self._denominator_at_ms(start_ms)))
         return out
 
     def _rebuild_time_sig_changes(self, sig_by_measure: List[Tuple[int, int]]) -> None:
@@ -8721,28 +8808,37 @@ class NoteModel:
 
             if explicit:
                 base_idx = int(round(bounds[0] * scale)) if bounds else int(all_beats[entry_s][0])
-                # 單位是四分音符，不是「拍」：2/2 佔 4 個單位、6/8 佔 3 個。
-                # 這裡跟著 `_compute_precise_measure_boundaries` 用同一個算法
-                # （`_bar_units_for`，它也處理「一筆拍點不是四分音符」的譜），
-                # 兩邊不一致的話寫出來的 entry 和小節邊界對不上——實測會寫出
-                # 重複 ms、index 不遞增的清單，小節長度再被比例套第二次。
+                # 小節佔幾個「單位」跟著 `_compute_precise_measure_boundaries`
+                # 用同一個算法（`_bar_units_for`，它也處理「一筆拍點不是四分
+                # 音符」的譜），兩邊不一致的話寫出來的 entry 和小節邊界對不上
+                # ——實測會寫出重複 ms、index 不遞增的清單，小節長度再被比例
+                # 套第二次。
                 new_span_units = self._bar_units_for(num, den)
                 idx_shift = int(round((new_span_units - old_span_units) * scale))
-                new_count = max(1, int(round(new_span_units)) if per_beat else 1)
-                idx_step = int(round(scale * new_span_units / new_count))
+                # **要寫幾筆拍點是分子，不是單位數。** 一個小節有幾拍就是分子
+                # ——6/8 是 6 拍。單位數（＝幾個四分音符）只決定小節的**長度**：
+                # 6/8 佔 3 個四分音符，所以 6 筆拍點擠在 3 個單位裡，一筆是
+                # 八分音符。拿單位數當筆數的話 6/8 只會寫 3 筆，畫面上就是
+                # 「6/8 只有三個拍」（使用者報的症狀）。
+                new_count = max(1, int(num) if per_beat else 1)
+                idx_span = scale * new_span_units
             else:
                 # 舊格式：index 本來就是 0..n-1 的流水號，維持原本的重編行為
                 base_idx = entry_s
                 idx_shift = 0
                 new_count = max(1, entry_e - entry_s)
-                idx_step = 1
+                idx_span = float(new_count)
 
             entries: List[Tuple[int, int]] = [
                 (int(all_beats[i][0]), int(all_beats[i][1])) for i in range(entry_s)
             ]
             for k in range(new_count):
                 bms = start_ms + int(round(new_dur * (k / float(new_count))))
-                entries.append((base_idx + idx_step * k, int(bms)))
+                # index 一筆一筆內插，不是「步距乘 k」：步距取整之後乘 count
+                # 次會和下一小節的起點差上幾個 index（6/8 的步距是 500，24/16
+                # 是 250，取整誤差會累積），接縫那一小節就被拉長或壓短。
+                idx = base_idx + int(round(idx_span * k / new_count))
+                entries.append((idx, int(bms)))
             for i in range(entry_e, len(all_beats)):
                 entries.append((int(all_beats[i][0]) + idx_shift,
                                 int(all_beats[i][1]) + delta))
@@ -8793,12 +8889,7 @@ class NoteModel:
             if 0 <= measure_idx < len(bounds):
                 _su, start_ms, _eu, end_ms = bounds[measure_idx]
                 num_p = max(1, self.get_beats_per_bar_at_ms(start_ms))
-                den_p = max(1, self.time_sig_denominator)
-                for change_ms, _ch_num, ch_den in self.time_sig_changes:
-                    if change_ms <= start_ms:
-                        den_p = max(1, ch_den)
-                    else:
-                        break
+                den_p = self._denominator_at_ms(start_ms)
                 bar_ms = max(1, end_ms - start_ms)
                 return snap_measured_bpm(bar_ms, num_p * 4.0 / den_p)
         beats = self.get_beat_entries()
