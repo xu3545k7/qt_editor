@@ -7844,6 +7844,51 @@ class NoteModel:
             return 1
         return max(1, diffs[len(diffs) // 2])
 
+    def fill_beat_index_gaps(self) -> int:
+        """補回拍點清單裡**跳號**的那幾筆，回傳補了幾筆。
+
+        曲庫裡有幾份譜的 `beat_data` 少了拍點：Suspenseful_Third_Day 的 index
+        從 143000 跳到 145000（144000 不見了），那一小節就只畫得出 2 條拍線而
+        不是 3 條。V 少 10 筆、felzione 少 7 筆、六兆年 少 2 筆。那不是哪個
+        功能算錯，是檔案本身有洞。
+
+        只補**跳號剛好是刻度整數倍**的地方——那種位置唯一確定（index 照刻度
+        遞增、ms 線性內插）。不是整數倍的保持原樣：那是變速或是譜尾的收尾
+        標記，不是洞（每份譜的最後一筆本來就不落在格線上）。
+
+        刻度看不出來的譜（index 只是 0,1,2… 的流水號，`scale < 8`）直接跳過：
+        那種格式沒有「跳號」的概念。
+        """
+        beats = self.get_beat_entries()
+        if len(beats) < 3:
+            return 0
+        scale = self._detect_beat_index_scale()
+        if scale < 8.0:
+            return 0
+        step = self._beat_index_step()
+        if step <= 0:
+            return 0
+        out: List[Tuple[int, int]] = []
+        added = 0
+        for i in range(len(beats) - 1):
+            idx0, ms0 = int(beats[i][0]), int(beats[i][1])
+            idx1, ms1 = int(beats[i + 1][0]), int(beats[i + 1][1])
+            out.append((idx0, ms0))
+            span = idx1 - idx0
+            if span <= step or span % step:
+                continue
+            n = span // step
+            for k in range(1, n):
+                out.append((idx0 + step * k,
+                            int(round(ms0 + (ms1 - ms0) * k / float(n)))))
+                added += 1
+        out.append((int(beats[-1][0]), int(beats[-1][1])))
+        if not added:
+            return 0
+        self._write_beat_entries(out)
+        self.dirty = True
+        return added
+
     def _measure_index_shape(self, measure_idx: int) -> Tuple[List[int], int]:
         """第 measure_idx 小節的格線形狀：(每筆 entry 相對小節頭的 index 偏移, index 跨度)。
 

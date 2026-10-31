@@ -259,5 +259,79 @@ class DenominatorLookupTests(unittest.TestCase):
         self.assertEqual(m._denominator_at_ms(1234), 8)
 
 
+class FillBeatIndexGapsTests(unittest.TestCase):
+    """補回 `beat_data` 裡跳號的那幾筆。
+
+    曲庫實測有 128 份檔案少了拍點：Suspenseful_Third_Day 的 index 從 143000
+    跳到 145000（144000 不見了），那一小節就只有 2 條拍線而不是 3 條。V 少 10
+    筆、felzione 少 7 筆。那不是哪個功能算錯，是檔案本身有洞。
+    """
+
+    def holed(self, drop=(3, 7)):
+        """一筆＝一個四分音符的格線，挖掉幾筆。"""
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        rows = [(i * 1000, i * 500) for i in range(41)]
+        m._write_beat_entries([r for i, r in enumerate(rows) if i not in drop],
+                              mark_precise=True)
+        m.rebuild_display_cache()
+        return m
+
+    def test_it_puts_the_missing_entries_back(self):
+        m = self.holed()
+        self.assertEqual(len(m.get_beat_entries()), 39)
+        self.assertEqual(m.fill_beat_index_gaps(), 2)
+        beats = m.get_beat_entries()
+        self.assertEqual(len(beats), 41)
+        self.assertEqual([i for i, _ms in beats], [i * 1000 for i in range(41)])
+        self.assertEqual([ms for _i, ms in beats], [i * 500 for i in range(41)])
+
+    def test_the_hole_was_costing_a_beat_line(self):
+        m = self.holed(drop=(3,))
+        self.assertEqual(beats_in_bar(m, 0), 3, '第 1 小節少一條拍線')
+        m.fill_beat_index_gaps()
+        m.rebuild_display_cache()
+        self.assertEqual(beats_in_bar(m, 0), 4)
+
+    def test_nothing_else_moves(self):
+        m = self.holed()
+        bars = [m.get_measure_time_range(i) for i in range(m.count_measures())]
+        end = m.music_end_ms
+        m.fill_beat_index_gaps()
+        m.rebuild_display_cache()
+        self.assertEqual([m.get_measure_time_range(i)
+                          for i in range(m.count_measures())], bars)
+        self.assertEqual(m.music_end_ms, end)
+
+    def test_a_clean_grid_is_left_alone(self):
+        m = quarter_grid()
+        before = m.get_beat_entries()
+        self.assertEqual(m.fill_beat_index_gaps(), 0)
+        self.assertEqual(m.get_beat_entries(), before)
+
+    def test_it_is_idempotent(self):
+        m = self.holed()
+        m.fill_beat_index_gaps()
+        self.assertEqual(m.fill_beat_index_gaps(), 0)
+
+    def test_a_jump_that_is_not_a_whole_number_of_steps_is_not_a_hole(self):
+        """變速和譜尾的收尾標記本來就不落在格線上，不要亂補。
+
+        每份譜的最後一筆拍點是收尾標記，落在曲末而不在格線上。
+        """
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        m._write_beat_entries([(0, 0), (1000, 500), (2000, 1000),
+                               (2600, 1300),              # 不是刻度的整數倍
+                               (3600, 1800)], mark_precise=True)
+        m.rebuild_display_cache()
+        self.assertEqual(m.fill_beat_index_gaps(), 0)
+
+    def test_a_serial_numbered_grid_has_no_such_thing_as_a_hole(self):
+        """index 只是 0,1,2… 的流水號時沒有「跳號」的概念，直接跳過。"""
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        m._write_beat_entries([(i, i * 2000) for i in range(12)])
+        m.rebuild_display_cache()
+        self.assertEqual(m.fill_beat_index_gaps(), 0)
+
+
 if __name__ == '__main__':
     unittest.main()
