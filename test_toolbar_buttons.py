@@ -326,3 +326,66 @@ class CommonTabTests(unittest.TestCase):
                 total += w.sizeHint().width()
         self.assertLess(total + 244, 2560,
                         '常用頁 %d px ＋音量 244 放不進 2560' % total)
+
+
+class MeasureTabIsConsolidatedTests(unittest.TestCase):
+    """小節相關的全部集中在「小節」分頁。
+
+    使用者：「我需要先在小節相關的功能確切整合，不要散在各處」。原本散在
+    五個地方——小節分頁、編輯分頁（拖曳小節線）、檢視分頁（小節均分模式）、
+    右鍵選單、工具→樂曲總資訊。
+
+    右鍵的「小節」子選單留在原地：那是對**點到的那一小節**做事，有位置資訊，
+    和分頁上「對譜尾／視窗中央那一小節」不是同一回事。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from qt_editor.main_window import MainWindow
+        with contextlib.redirect_stdout(io.StringIO()):
+            cls.win = MainWindow()
+        cls.win.resize(2560, 1400)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.win.view.model.dirty = False
+        cls.win.close()
+
+    def labels(self, title):
+        from PyQt5.QtWidgets import QToolButton
+        tabs = self.win._toolbars[0].tabs
+        for i in range(tabs.count()):
+            if tabs.tabText(i) == title:
+                return [b.text() for b in tabs.widget(i).findChildren(QToolButton)]
+        self.fail('沒有「%s」分頁' % title)
+
+    def test_the_barline_drag_moved_here(self):
+        self.assertTrue(any('拖曳小節線' in x for x in self.labels('小節')))
+        self.assertFalse(any('拖曳小節線' in x for x in self.labels('編輯')),
+                         '編輯分頁還留著一顆')
+
+    def test_the_measure_view_mode_moved_here(self):
+        """它不只是檢視——改 BPM／拍號時小節內拍點怎麼重排是看它決定的。"""
+        self.assertTrue(any('小節均分' in x for x in self.labels('小節')))
+        self.assertFalse(any('小節均分' in x for x in self.labels('檢視')),
+                         '檢視分頁還留著一顆')
+
+    def test_the_regenerate_entry_is_here(self):
+        self.assertTrue(any('重生小節線' in x for x in self.labels('小節')))
+
+    def test_nothing_measure_ish_is_left_on_other_tabs(self):
+        for other in ('常用', '編輯', '播放', '檢視'):
+            for label in self.labels(other):
+                self.assertNotIn('小節', label,
+                                 '「%s」留在「%s」分頁' % (label, other))
+
+    def test_the_tab_still_fits_the_screen(self):
+        from PyQt5.QtWidgets import QComboBox, QToolButton
+        tabs = self.win._toolbars[0].tabs
+        page = [tabs.widget(i) for i in range(tabs.count())
+                if tabs.tabText(i) == '小節'][0]
+        total = sum(w.sizeHint().width()
+                    for w in page.findChildren(QToolButton) + page.findChildren(QComboBox)
+                    if not w.isHidden())
+        self.assertLess(total + 244, 2560,
+                        '小節分頁 %d px ＋音量 244 放不進 2560' % total)

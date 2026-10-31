@@ -1488,6 +1488,11 @@ class MainWindow(QMainWindow):
              '拍點間距不均勻時補上缺的那些。修的是小節／拍點結構，所以放這裡'),
             ('每小節 BPM…', self.measure_bpm_table_dialog,
              '一個小節一行，各自填自己的 BPM。只有改過的行會重鋪，音符預設不動。'),
+            ('鎖定音符、重生小節線…', self.regenerate_grid_dialog,
+             chr(10).join([
+                 '丟掉現在的小節線，照一個固定 BPM 重鋪一條。音符一顆都不動。',
+                 '用在「音符位置是對的、只有格線錯了」的譜；要讓音符跟著新',
+                 '格線走的是下面那個「智慧重排吸附」。'])),
             ('智慧重排吸附…', self.smart_resnap_dialog,
              '照「幾個小節 ＋ BPM」的順序重建整條小節線，再把音符吸附上去。\n'
              '用在「AI 把整首判成一個固定 BPM、而實際是變拍」的譜。有自動偵測。'),
@@ -2085,15 +2090,6 @@ class MainWindow(QMainWindow):
             '（幽靈音符可在「檢視」分頁關掉。）',
             self._on_hand_filter_changed)
 
-        # 小節線拖曳的開關放在**編輯**分頁：它是「滑鼠在譜面上怎麼動」的模式，
-        # 和放置模式同一類。小節分頁裡全是「對小節做什麼」的動作，性質不同。
-        tbs.barline_drag_act = self._tab_action(
-            tbs, t('tb_barline_drag'), self._on_barline_drag_toggled,
-            tip=t('tb_barline_drag_tip'), checkable=True)
-        tbs.barline_drag_act.blockSignals(True)
-        tbs.barline_drag_act.setChecked(self._barline_drag_enabled())
-        tbs.barline_drag_act.blockSignals(False)
-
         return self._tab_page([
             tbs.pattern_key_label,
             None,
@@ -2107,8 +2103,6 @@ class MainWindow(QMainWindow):
             None,
             tbs.hand_filter_combo,
             self._tab_button(auto_sort),
-            None,
-            self._tab_button(tbs.barline_drag_act),
         ])
 
     # ── 分頁：播放 ────────────────────────────────────────────────────
@@ -2147,8 +2141,22 @@ class MainWindow(QMainWindow):
     # ── 分頁：小節 ────────────────────────────────────────────────────
 
     def _build_tab_measure(self, tbs: ToolbarSet) -> QWidget:
-        # 和選單列的「小節」共用 _measure_entries()，兩邊不會少一項。
-        # 前兩項（新增/刪除）和後三項（BPM/多小節/拍號）之間放分隔線。
+        """小節相關的**全部**集中在這裡。
+
+        使用者：「我需要先在小節相關的功能確切整合，不要散在各處」。原本散在
+        五個地方：這一頁、編輯分頁（拖曳小節線）、檢視分頁（小節均分模式）、
+        右鍵選單、工具→樂曲總資訊。
+
+        搬過來的兩顆：
+        ・**拖曳小節線**本來放在編輯分頁，理由是「它是滑鼠怎麼動的模式」。
+          但它改的是小節線，找的人會先來小節分頁。
+        ・**小節均分模式**本來放在檢視分頁。它不只是檢視——`set_measure_bpm`
+          和 `set_measure_time_signature` 都吃它來決定小節內拍點怎麼重排
+          （多小節 BPM 那個對話框自己就寫著「會影響小節內 beat timings 重排」）。
+
+        右鍵選單的「小節」留在原地：那是對**點到的那一小節**做事，有位置資訊，
+        和這一頁的「對譜尾／視窗中央那一小節」不是同一回事。
+        """
         entries = self._measure_entries()
         widgets = []
         for i, (label, slot, tip) in enumerate(entries):
@@ -2156,6 +2164,22 @@ class MainWindow(QMainWindow):
                 widgets.append(None)
             widgets.append(self._tab_button(
                 self._tab_action(tbs, label, slot, tip=tip)))
+
+        # ── 小節線的編輯模式（從別的分頁搬過來）────────────────────
+        widgets.append(None)
+        tbs.barline_drag_act = self._tab_action(
+            tbs, t('tb_barline_drag'), self._on_barline_drag_toggled,
+            tip=t('tb_barline_drag_tip'), checkable=True)
+        tbs.barline_drag_act.blockSignals(True)
+        tbs.barline_drag_act.setChecked(self._barline_drag_enabled())
+        tbs.barline_drag_act.blockSignals(False)
+        widgets.append(self._tab_button(tbs.barline_drag_act))
+
+        tbs.view_mode_act = self._tab_action(
+            tbs, t('tb_time_uniform_measure'), self._cycle_view_mode,
+            tip=t('tb_time_uniform_tip'))
+        widgets.append(self._tab_button(tbs.view_mode_act))
+        self._refresh_view_mode_action()
 
         return self._tab_page(widgets)
 
@@ -2240,11 +2264,6 @@ class MainWindow(QMainWindow):
             lambda checked: self.view.toggle_preview_mode(checked),
             tip=t('tb_preview_tip'), checkable=True, keys='toggle_preview')
 
-        tbs.view_mode_act = self._tab_action(
-            tbs, t('tb_time_uniform_measure'), self._cycle_view_mode,
-            tip=t('tb_time_uniform_tip'))
-        self._refresh_view_mode_action()
-
         # 斜降：和選單的「遊戲預覽（斜降）」是同一個視窗，這裡是開關。
         tbs.game_preview_act = self._tab_action(
             tbs, t('tb_game_preview'),
@@ -2259,7 +2278,8 @@ class MainWindow(QMainWindow):
             self._tab_button(act_zoom_in),
             None,
             self._tab_button(tbs.preview_act),
-            self._tab_button(tbs.view_mode_act),
+            # 小節均分模式搬到「小節」分頁了——它不只是檢視，改 BPM／拍號時
+            # 小節內的拍點怎麼重排是看它決定的。
             self._tab_button(tbs.game_preview_act),
         ])
 
@@ -3483,6 +3503,51 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '完成', text)
         except Exception as exc:                            # noqa: BLE001
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
+
+    def regenerate_grid_dialog(self) -> None:
+        """鎖定音符、重生小節線。細節見 `regenerate_grid_dialog`。"""
+        from . import smart_resnap as SR
+        from .regenerate_grid_dialog import RegenerateGridDialog
+        m = self.view.model
+        if not m.notes_tree:
+            QMessageBox.information(self, '重生小節線', '這份譜還沒有音符。')
+            return
+        sel = [n for n in m.notes_tree if n.idx in self.view.selected]
+        span = ((min(int(n.start) for n in sel), max(int(n.end) for n in sel))
+                if sel else None)
+        dlg = RegenerateGridDialog(self, m, span)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        item = dlg.plan()
+        if not item.ok:
+            QMessageBox.warning(self, '重生小節線', item.reason or '鋪不出格線')
+            return
+        before = sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+        try:
+            m.push_history()
+            SR.apply(m, item, snap=False)       # snap=False ＝ 音符不動
+            num, den = dlg.signature()
+            m.beats_per_bar, m.time_sig_denominator = num, den
+            m.bpm = dlg.bpm()
+            m.rebuild_display_cache()
+            oplog.params(bpm=dlg.bpm(), numerator=num, denominator=den,
+                         start_ms=int(dlg.start_ms()), bars=item.bars)
+            self.view.rebuild_mapper()
+            self.view._update_unit_bounds()
+            self.view.update()
+            self._rebuild_hit_times()
+            self.view.note_edited.emit()
+        except Exception as exc:                            # noqa: BLE001
+            QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
+            return
+        moved = sum(1 for a, b in zip(
+            sorted((int(n.start), int(n.end)) for n in m.notes_tree), before)
+            if a != b)
+        QMessageBox.information(
+            self, '重生小節線',
+            chr(10).join([
+                '鋪了 %d 個小節（%.2f BPM，%d/%d）。' % (item.bars, dlg.bpm(), num, den),
+                '被動到的音符：%d 顆。' % moved]))
 
     def smart_resnap_dialog(self) -> None:
         """智慧重排吸附：用「幾個小節 ＋ BPM」的序列重建整條小節線。

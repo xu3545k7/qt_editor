@@ -384,6 +384,102 @@ def apply(model: Any, item: Plan, snap: bool = True, division: int = 4) -> Plan:
     return item
 
 
+#: 重生小節線最多鋪幾個小節。曲庫裡最長的譜也只有幾百個小節。
+MAX_REGEN_BARS = 4000
+#: 合理的 BPM 範圍。`normalise` 只擋「一拍短到不合理」（MIN_BEAT_MS），擋不到
+#: **太慢**——BPM 填 0.0001 的話一拍 10 分鐘、整條格線橫跨 27 天，而它只鋪一個
+#: 小節，所以 MAX_REGEN_BARS 也攔不住。兩頭都要有界。
+MIN_REGEN_BPM, MAX_REGEN_BPM = 20.0, 600.0
+
+
+def regenerate(model: Any, bpm: float, numerator: int = 4,
+               denominator: int = 4, start_ms: Optional[float] = None) -> Plan:
+    """丟掉現在的小節線，照一個固定 BPM 重新鋪一條，**音符一顆都不動**。
+
+    使用者要的「鎖定精確位置、重生小節線」。和這個模組原本的用法差在哪：
+
+    ・`apply(..., snap=True)` 是「格線是對的，把音符搬上去」——AI 判錯速度、
+      音符被吸歪的時候用。
+    ・這裡是「音符是對的，格線是垃圾」——重算一條乾淨的格線套上去，音符的
+      毫秒位置原封不動。所以**沒有吸附選項**，有的話就不是這個功能了。
+
+    小節數自己算到蓋過最後一顆音符（`bars_to_cover`）。`start_ms` 不給就沿用
+    原本的第一個拍點（`grid_start_ms`）——開頭那段導入空白是刻意的。
+    """
+    if start_ms is None:
+        start_ms = grid_start_ms(model)
+    # 一定要過 `normalise`：它擋掉「一拍短到不合理」的 BPM。直接自己建 Segment
+    # 的話，BPM 填 0.0001 會鋪出一條一拍 10 分鐘、橫跨 27 天的格線（實測過）。
+    if not MIN_REGEN_BPM <= float(bpm) <= MAX_REGEN_BPM:
+        item = Plan(segments=[], start_ms=float(start_ms))
+        item.reason = ('BPM 要在 %g 到 %g 之間（填了 %g）'
+                       % (MIN_REGEN_BPM, MAX_REGEN_BPM, float(bpm)))
+        return item
+    probe = normalise([Segment(bars=1, bpm=float(bpm), numerator=int(numerator),
+                               denominator=int(denominator))])
+    if not probe:
+        item = Plan(segments=[], start_ms=float(start_ms))
+        item.reason = 'BPM 不合理（一拍至少要 %d ms）' % int(MIN_BEAT_MS)
+        return item
+    seg = probe[0]
+    need = bars_to_cover(model, seg)
+    if need > MAX_REGEN_BARS:
+        item = Plan(segments=[], start_ms=float(start_ms))
+        item.reason = ('這個速度要鋪 %d 個小節（上限 %d）——BPM 可能填太高了'
+                       % (need, MAX_REGEN_BARS))
+        return item
+    whole = Segment(bars=max(1, need), bpm=seg.bpm,
+                    numerator=seg.numerator, denominator=seg.denominator)
+    item = Plan(segments=[whole], start_ms=float(start_ms))
+    item.beats = build_beats([whole], item.start_ms)
+    item.grid_end_ms = item.beats[-1] if item.beats else item.start_ms
+    item.bars = whole.bars
+    item.needed_ms = song_end_ms(model)
+    item.ok = len(item.beats) >= 2
+    if not item.ok:
+        item.reason = 'BPM 太低或譜面太短，鋪不出格線'
+    return item
+
+
+def bpm_from_span(span_ms: float, bars: float, numerator: int = 4,
+                  denominator: int = 4) -> Optional[float]:
+    """「這一段是 N 個小節」→ BPM。編曲軟體的 set tempo from selection。
+
+    Logic 的「Adjust Tempo using…」、Reaper 的「Set project tempo from time
+    selection」、Cubase 的 Time Warp 都是同一招：素材是對的，你知道它是幾小節，
+    速度讓軟體算。對我們來說它正好是「鎖定精確位置」那條路——音符不動，格線
+    去遷就它。
+
+    `bar_ms = numerator × 4 × 60000 ÷ (denominator × bpm)`，反解即可。
+    """
+    span = float(span_ms)
+    count = float(bars)
+    if span <= 0 or count <= 0:
+        return None
+    bar_ms = span / count
+    bpm = int(numerator) * 4.0 * 60000.0 / (max(1, int(denominator)) * bar_ms)
+    if not MIN_REGEN_BPM <= bpm <= MAX_REGEN_BPM:
+        return None
+    return bpm
+
+
+def detect_bpm(model: Any, numerator: int = 4) -> Optional[float]:
+    """從譜面自己的音符起音量一個 BPM 出來。量不到回 None。
+
+    用在「重生小節線」的自動偵測。注意這是拿**譜面上的**音符量的，如果那些
+    音符已經被錯的格線吸附過，量到的就會是那個錯誤（見模組說明裡
+    `detect_segments` 的警告）——所以對話框要講清楚，原始的 .ai.mid 才是乾淨的。
+    """
+    onsets = sorted({float(n.start) for n in model.notes_tree})
+    if len(onsets) < DETECT_MIN_NOTES:
+        return None
+    segs = detect_segments(onsets, numerator=numerator)
+    if not segs:
+        return None
+    # 取涵蓋最多小節的那一段：變速譜上也拿得到主速度
+    return float(max(segs, key=lambda s: s.bars).bpm)
+
+
 def describe(item: Plan) -> str:
     """給使用者看的摘要。"""
     if not item.ok:

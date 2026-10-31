@@ -458,3 +458,157 @@ class FastRunTests(_Base):
         self.model.notes_tree = notes
         SR.apply(self.model, SR.plan(self.model, [SR.Segment(4, 200.0)]))
         self.assertEqual(len(set(int(n.start) for n in notes)), 1, '和弦被拆開了')
+
+
+class RegenerateTests(unittest.TestCase):
+    """「鎖定精確位置、重生小節線」：丟掉格線重鋪，音符一顆都不動。
+
+    和這個模組原本的用法剛好相反：
+
+        apply(..., snap=True)  格線是對的 → 把音符搬上去
+        regenerate(...)        音符是對的 → 重算格線套上去
+
+    所以**沒有吸附選項**。有的話就不是這個功能了。
+    """
+
+    @staticmethod
+    def _note(idx, start):
+        from qt_editor.models import GNote
+        n = GNote(None, idx)
+        n.start, n.end, n.gate = start, start + 200, 200
+        n.pitch, n.hand, n.note_type = 60, 0, 0
+        n.min_key, n.max_key = 4, 4
+        return n
+
+    def chart(self, bpm=120.0, step=250, count=60):
+        m = NoteModel.create_new('t', bpm, 40.0, 4)
+        m.ensure_precise_beat_grid()
+        m.notes_tree = [self._note(i, 1000 + step * i) for i in range(count)]
+        m.rebuild_display_cache()
+        return m
+
+    def notes(self, m):
+        return sorted((int(n.start), int(n.end)) for n in m.notes_tree)
+
+    def test_it_never_moves_a_note(self):
+        m = self.chart()
+        before = self.notes(m)
+        SR.apply(m, SR.regenerate(m, 150.0), snap=False)
+        self.assertEqual(self.notes(m), before)
+
+    def test_the_new_grid_really_has_the_asked_for_bpm(self):
+        m = self.chart()
+        SR.apply(m, SR.regenerate(m, 150.0), snap=False)
+        self.assertAlmostEqual(m.get_measure_bpm(0), 150.0, delta=0.05)
+
+    def test_it_covers_the_last_note(self):
+        m = self.chart()
+        item = SR.regenerate(m, 150.0)
+        self.assertGreaterEqual(item.grid_end_ms, item.needed_ms)
+
+    def test_it_keeps_the_original_start_by_default(self):
+        """開頭那段導入空白是刻意的，不要從 0 重鋪。"""
+        m = self.chart()
+        item = SR.regenerate(m, 150.0)
+        self.assertAlmostEqual(item.start_ms, SR.grid_start_ms(m), delta=0.5)
+
+    def test_a_custom_start_is_honoured(self):
+        m = self.chart()
+        item = SR.regenerate(m, 150.0, start_ms=1712.0)
+        self.assertAlmostEqual(item.start_ms, 1712.0, delta=0.5)
+        self.assertAlmostEqual(item.beats[0], 1712.0, delta=0.5)
+
+    def test_the_time_signature_changes_the_bar_length(self):
+        for num, den, want in ((4, 4, 1.0), (3, 4, 0.75), (6, 8, 0.75)):
+            m = self.chart()
+            item = SR.regenerate(m, 120.0, num, den)
+            self.assertAlmostEqual(item.segments[0].bar_ms / 2000.0, want,
+                                   delta=0.01, msg='%d/%d' % (num, den))
+
+    def test_an_absurdly_slow_bpm_is_refused(self):
+        """BPM 填 0.0001 會鋪出一拍 10 分鐘、橫跨 27 天的格線。
+
+        `normalise` 擋不到這個——它只管「一拍短到不合理」。而且這種 BPM 只鋪
+        **一個**小節，所以 MAX_REGEN_BARS 也攔不住。兩頭都要有界。
+        """
+        item = SR.regenerate(self.chart(), 0.0001)
+        self.assertFalse(item.ok)
+        self.assertIn('BPM', item.reason)
+
+    def test_an_absurdly_fast_bpm_is_refused(self):
+        item = SR.regenerate(self.chart(), 9999.0)
+        self.assertFalse(item.ok)
+        self.assertIn('BPM', item.reason)
+
+    def test_ordinary_bpms_are_all_fine(self):
+        for bpm in (60, 90, 120, 150, 180, 200, 240, 300):
+            self.assertTrue(SR.regenerate(self.chart(), float(bpm)).ok, bpm)
+
+    def test_detect_bpm_reads_the_chart_itself(self):
+        """音符每 250ms 一顆 ＝ 240 BPM 的四分音符。"""
+        self.assertAlmostEqual(SR.detect_bpm(self.chart(step=250)) or 0,
+                               240.0, delta=1.0)
+
+    def test_detect_bpm_gives_up_on_too_few_notes(self):
+        self.assertIsNone(SR.detect_bpm(self.chart(count=5)))
+
+
+class TempoFromSelectionTests(unittest.TestCase):
+    """「這一段是 N 個小節」→ BPM。編曲軟體的 set tempo from selection。
+
+    Logic 的「Adjust Tempo using…」、Reaper 的「Set project tempo from time
+    selection」、Cubase 的 Time Warp 都是同一招：素材是對的，你知道它是幾小節，
+    速度讓軟體算。對我們正好是「鎖定精確位置」那條路——音符不動，格線遷就它。
+    """
+
+    def test_four_bars_of_four_four(self):
+        self.assertAlmostEqual(SR.bpm_from_span(8000, 4, 4, 4), 120.0, places=2)
+
+    def test_twice_as_fast(self):
+        self.assertAlmostEqual(SR.bpm_from_span(4000, 4, 4, 4), 240.0, places=2)
+
+    def test_three_four_has_shorter_bars(self):
+        """3/4 的小節是 4/4 的四分之三，同樣的速度下塞得進更多小節。"""
+        self.assertAlmostEqual(SR.bpm_from_span(6000, 4, 3, 4), 120.0, places=2)
+
+    def test_the_bpm_always_means_the_quarter_note(self):
+        """6/8 的一小節 ＝ 3 個四分音符，所以 2000ms 一小節是 90 不是 180。
+
+        和 `Segment.beat_ms`（`4×60000÷(分母×BPM)`）同一套；整個程式裡的 BPM
+        都是四分音符的速度。
+        """
+        self.assertAlmostEqual(SR.bpm_from_span(4000, 2, 6, 8), 90.0, places=2)
+
+    def test_half_bars_work(self):
+        self.assertAlmostEqual(SR.bpm_from_span(4000, 2.0, 4, 4), 120.0, places=2)
+
+    def test_nonsense_input_gives_nothing(self):
+        self.assertIsNone(SR.bpm_from_span(0, 4))
+        self.assertIsNone(SR.bpm_from_span(8000, 0))
+        self.assertIsNone(SR.bpm_from_span(-100, 4))
+
+    def test_a_result_outside_the_sane_range_is_refused(self):
+        """一段 100ms 說成 100 小節會算出幾萬 BPM。"""
+        self.assertIsNone(SR.bpm_from_span(100, 100))
+        self.assertIsNone(SR.bpm_from_span(600000, 1))
+
+    def test_it_round_trips_with_regenerate(self):
+        """算出來的 BPM 鋪回去，那一段就真的是 N 個小節。"""
+        m = NoteModel.create_new('t', 120.0, 60.0, 4)
+        m.ensure_precise_beat_grid()
+        from qt_editor.models import GNote
+        notes = []
+        for i in range(40):
+            n = GNote(None, i)
+            n.start, n.end, n.gate = 1000 + 500 * i, 1000 + 500 * i + 200, 200
+            n.pitch, n.hand, n.note_type = 60, 0, 0
+            n.min_key, n.max_key = 4, 4
+            notes.append(n)
+        m.notes_tree = notes
+        m.rebuild_display_cache()
+        bpm = SR.bpm_from_span(8000, 4, 4, 4)
+        item = SR.regenerate(m, bpm, 4, 4, start_ms=1000.0)
+        SR.apply(m, item, snap=False)
+        start, _e = m.get_measure_time_range(0)
+        _s, end = m.get_measure_time_range(3)
+        self.assertAlmostEqual(end - start, 8000, delta=5)
