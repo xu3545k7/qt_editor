@@ -240,8 +240,9 @@ class ToolbarSet:
         self.barline_drag_act: Optional[QAction] = None
         #: 「常用」分頁上的類型選單（選完要歸位）
         self.common_type_combo = None
-        #: 「鎖定音符」開關（常用分頁）
+        #: 「鎖定音符」開關：家在小節分頁，常用分頁放一顆鏡像，兩顆要同步
         self.notes_locked_act: Optional[QAction] = None
+        self.measure_lock_act: Optional[QAction] = None
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
@@ -1855,7 +1856,17 @@ class MainWindow(QMainWindow):
     # ── 分頁：常用 ────────────────────────────────────────────────────
 
     def _build_tab_common(self, tbs: ToolbarSet) -> QWidget:
-        """常做 **而且沒有快捷鍵** 的事。兩個條件都要。
+        """**各個分頁最常用的東西，拿出來放在這一頁。**
+
+        使用者：「常用是把各個 tab 最常用的拿出來」。所以這一頁是**鏡像**，
+        不是誰的家——每一項在自己的分頁上都有家：
+
+            ● 右手／左手／改類型／複製／滑奏串接／音符屬性
+                                      家在 編輯 → 選取音符 ▾
+            🔒 鎖定音符                家在 小節
+            處理長條尾端…              家在 工具 → 音符整理 ▾
+
+        挑的標準是「常做 **而且沒有快捷鍵**」。兩個條件都要。
 
         使用者：「不要把快捷鍵相關的放到常用」——已經有鍵的放按鈕只是佔空間，
         手會先按鍵，眼睛不會往上看。
@@ -1918,11 +1929,7 @@ class MainWindow(QMainWindow):
         # 鎖定音符：使用者指定放在常用。它沒有快捷鍵，符合這一頁的規則。
         tbs.notes_locked_act = self._tab_action(
             tbs, '🔒 鎖定音符', self._on_notes_locked_toggled,
-            tip=chr(10).join([
-                '進入「只調整小節線時間」的狀態（預設關）。',
-                '開著時拖曳小節線不會動到音符，而且會自動吸附到最近的音符尾巴，',
-                '並盡量讓算出來的 BPM 落在整數上（差不到 0.1 才取整）。',
-                '拖的途中按住 Alt 可以臨時反轉。']),
+            tip=self._notes_locked_tip(),
             checkable=True, keys='_on_notes_locked_toggled')
         tbs.notes_locked_act.blockSignals(True)
         tbs.notes_locked_act.setChecked(self._notes_locked())
@@ -2102,6 +2109,9 @@ class MainWindow(QMainWindow):
         self._on_pattern_step_changed(self._pat_step_idx)
         self._on_pattern_key_changed(self._pat_key_idx)
 
+        selected_menu = self._menu_button(tbs, '選取音符',
+                                          self._selected_note_entries())
+
         auto_sort = self._tab_action(
             tbs, t('tb_auto_sort'), lambda: self.view.start_alloc_section(),
             keys='start_alloc_section')
@@ -2115,6 +2125,10 @@ class MainWindow(QMainWindow):
             self._on_hand_filter_changed)
 
         return self._tab_page([
+            # 「對選取的音符做什麼」的**家**。常用分頁把其中最常用的幾個拿出來
+            # 放成按鈕，兩邊讀同一份 `_selected_note_entries()`。
+            selected_menu,
+            None,
             tbs.pattern_key_label,
             None,
             self._tab_button(tbs.note_input_act),
@@ -2174,6 +2188,30 @@ class MainWindow(QMainWindow):
     #:
     #: 留在外面的只有兩顆**模式開關**：它們是狀態，收進下拉就看不出現在開著
     #: 還是關著。
+    #: 對**選取的音符**做的事。家在「編輯」分頁（`選取音符 ▾`），「常用」分頁
+    #: 把其中最常用的幾個拿出來放成按鈕——使用者：「常用是把各個 tab 最常用的
+    #: 拿出來」。所以這裡是唯一的來源，兩邊都讀它。
+    #:
+    #: 已經有快捷鍵的不收（Delete、E 切寬度、↑↓ 位移…），那是常用分頁的規則。
+    NOTE_TYPES = (('Tap  (T)', 0), ('Soft', 1), ('Long  (H)', 2),
+                  ('Staccato  (K)', 3), ('Slide', 4), ('Trill', 0x40))
+
+    def _selected_note_entries(self):
+        """(標籤, slot)。類型那幾項攤平成一項一項，下拉才點得到。"""
+        out = [
+            ('● 改成右手', lambda: self.view.set_hand_selected(0)),
+            ('● 改成左手', lambda: self.view.set_hand_selected(1)),
+        ]
+        for label, value in self.NOTE_TYPES:
+            out.append(('改成 %s' % label,
+                        (lambda v=value: self.view.set_type_selected(v))))
+        out += [
+            ('⧉ 複製', lambda: self.view.duplicate_selected()),
+            ('滑奏串接', lambda: self.view.chain_slides_selected()),
+            ('音符屬性…', self._common_note_property),
+        ]
+        return out
+
     def _measure_groups(self):
         """`_measure_entries` 照分組收起來，順序照它出現的順序。"""
         groups, order = {}, []
@@ -2213,6 +2251,18 @@ class MainWindow(QMainWindow):
         tbs.barline_drag_act.blockSignals(False)
         widgets.append(self._tab_button(tbs.barline_drag_act))
 
+        # 鎖定音符的**家**在這裡（它也是小節線的編輯模式）。常用分頁上那顆
+        # 是鏡像，兩邊共用同一個 QAction 的狀態（`_on_notes_locked_toggled`
+        # 會把每一條工具列的那顆同步過去）。
+        tbs.measure_lock_act = self._tab_action(
+            tbs, '🔒 鎖定音符', self._on_notes_locked_toggled,
+            tip=self._notes_locked_tip(), checkable=True,
+            keys='_on_notes_locked_toggled')
+        tbs.measure_lock_act.blockSignals(True)
+        tbs.measure_lock_act.setChecked(self._notes_locked())
+        tbs.measure_lock_act.blockSignals(False)
+        widgets.append(self._tab_button(tbs.measure_lock_act))
+
         tbs.view_mode_act = self._tab_action(
             tbs, t('tb_time_uniform_measure'), self._cycle_view_mode,
             tip=t('tb_time_uniform_tip'))
@@ -2222,6 +2272,14 @@ class MainWindow(QMainWindow):
         return self._tab_page(widgets)
 
     # ── 鎖定音符 ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _notes_locked_tip() -> str:
+        return chr(10).join([
+            '進入「只調整小節線時間」的狀態（預設關）。',
+            '開著時拖曳小節線不會動到音符，而且會自動吸附到最近的音符尾巴，',
+            '並盡量讓算出來的 BPM 落在整數上（差不到 0.1 才取整）。',
+            '拖的途中按住 Alt 可以臨時反轉。'])
 
     def _notes_locked(self) -> bool:
         """「只調整小節線時間」的狀態。預設關。"""
@@ -2237,11 +2295,13 @@ class MainWindow(QMainWindow):
         settings.set('notes_locked', bool(on))
         self._apply_notes_locked()
         for tbs in self._toolbars:
-            act = getattr(tbs, 'notes_locked_act', None)
-            if act is not None and act.isChecked() != bool(on):
-                act.blockSignals(True)
-                act.setChecked(bool(on))
-                act.blockSignals(False)
+            # 兩顆：小節分頁（家）與常用分頁（鏡像）
+            for name in ('notes_locked_act', 'measure_lock_act'):
+                act = getattr(tbs, name, None)
+                if act is not None and act.isChecked() != bool(on):
+                    act.blockSignals(True)
+                    act.setChecked(bool(on))
+                    act.blockSignals(False)
 
     def _apply_notes_locked(self) -> None:
         """每一格 ChartView 各有自己的旗標，漏掉一格就會看起來像沒生效。"""

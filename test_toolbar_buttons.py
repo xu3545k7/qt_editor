@@ -429,10 +429,32 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
         self.assertTrue(any('重生小節線' in x for x in self.labels('小節')))
 
     def test_nothing_measure_ish_is_left_on_other_tabs(self):
-        for other in ('常用', '編輯', '播放', '檢視'):
+        """常用分頁是鏡像，不算「散在各處」——它的每一項在別的分頁都有家。"""
+        for other in ('編輯', '播放', '檢視'):
             for label in self.labels(other):
                 self.assertNotIn('小節', label,
                                  '「%s」留在「%s」分頁' % (label, other))
+
+    def test_every_item_on_common_has_a_home_somewhere_else(self):
+        """使用者：「常用是把各個 tab 最常用的拿出來」——所以它是鏡像。"""
+        from PyQt5.QtWidgets import QComboBox, QToolButton
+        tabs = self.win._toolbars[0].tabs
+        elsewhere = set()
+        for i in range(tabs.count()):
+            if tabs.tabText(i) == '常用':
+                continue
+            for b in tabs.widget(i).findChildren(QToolButton):
+                elsewhere.add(b.text())
+                if b.menu() is not None:
+                    elsewhere.update(a.text() for a in b.menu().actions())
+        page = [tabs.widget(i) for i in range(tabs.count())
+                if tabs.tabText(i) == '常用'][0]
+        for b in page.findChildren(QToolButton):
+            key = b.text().lstrip('●🔒⧉🗑 ').strip()
+            self.assertTrue(
+                any(key and key in other for other in elsewhere),
+                '「%s」在常用分頁，但別的分頁都沒有它的家' % b.text())
+        self.assertTrue(page.findChildren(QComboBox), '改類型那個選單不見了')
 
     def test_the_tab_still_fits_the_screen(self):
         from PyQt5.QtWidgets import QComboBox, QToolButton
@@ -523,19 +545,51 @@ class NotesLockedTests(unittest.TestCase):
         bpm, _rounded = self.view._barline_bpm(0, 2000)
         self.assertEqual(bpm, 120.0)
 
-    def test_the_toggle_is_on_the_common_tab(self):
-        """使用者指定放在常用。它沒有快捷鍵，符合那一頁的規則。"""
+    def test_it_lives_on_the_measure_tab_and_is_mirrored_on_common(self):
+        """家在小節（它是小節線的編輯模式），常用放一顆鏡像。
+
+        使用者：「拖曳小節線和鎖定音符都要在小節的 tab 上／常用是把各個 tab
+        最常用的拿出來」。
+        """
         from PyQt5.QtWidgets import QToolButton
         from qt_editor.main_window import MainWindow
         with contextlib.redirect_stdout(io.StringIO()):
             win = MainWindow()
         try:
-            page = win._toolbars[0].tabs.widget(0)
-            labels = [b.text() for b in page.findChildren(QToolButton)]
-            self.assertTrue(any('鎖定音符' in x for x in labels), labels)
-            act = win._toolbars[0].notes_locked_act
+            tabs = win._toolbars[0].tabs
+            names = {}
+            for i in range(tabs.count()):
+                names[tabs.tabText(i)] = [
+                    b.text() for b in tabs.widget(i).findChildren(QToolButton)]
+            self.assertTrue(any('鎖定音符' in x for x in names['小節']),
+                            '小節分頁沒有：%s' % names['小節'])
+            self.assertTrue(any('鎖定音符' in x for x in names['常用']),
+                            '常用分頁沒有鏡像：%s' % names['常用'])
+            self.assertTrue(any('拖曳小節線' in x for x in names['小節']))
+            act = win._toolbars[0].measure_lock_act
             self.assertTrue(act.isCheckable())
             self.assertFalse(act.isChecked(), '預設該是關的')
         finally:
+            win.view.model.dirty = False
+            win.close()
+
+    def test_both_copies_stay_in_step(self):
+        """兩顆同一個狀態，漏掉一顆就會看到一開一關。"""
+        from qt_editor.main_window import MainWindow
+        from qt_editor.settings import settings
+        before = settings.get('notes_locked', False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            win = MainWindow()
+        try:
+            tbs = win._toolbars[0]
+            win._on_notes_locked_toggled(True)
+            self.assertTrue(tbs.measure_lock_act.isChecked())
+            self.assertTrue(tbs.notes_locked_act.isChecked())
+            self.assertTrue(all(p.notes_locked for p in win._panes))
+            win._on_notes_locked_toggled(False)
+            self.assertFalse(tbs.measure_lock_act.isChecked())
+            self.assertFalse(tbs.notes_locked_act.isChecked())
+        finally:
+            settings.set('notes_locked', before)
             win.view.model.dirty = False
             win.close()
