@@ -221,86 +221,108 @@ class MidiPianoButtonRemovedTests(unittest.TestCase):
 
 
 class CommonTabTests(unittest.TestCase):
-    """「常用」分頁 ＝ 各分頁最常用的鏡像。三條規則都要過。
+    """「常用」分頁：**一開始是空的，照實際按過什麼長出來。**
 
-    使用者給的：
-      1. 常做（照 logs/oplog-*.jsonl）
-      2. **沒有快捷鍵**——手會先按鍵
-      3. **右鍵選單裡沒有**——那已經一次點擊就到
+    使用者：「常用初始就是空白（沒這個選項），以玩家的操作紀錄（有在其他 tab
+    上曾經切過去用的）放到常用」。
 
-    第 3 條一加，原本七項有五項要拿掉：右手／左手（右鍵音符屬性▸左右手）、
-    改類型（▸類型）、複製（就地複製，**而且有 C 鍵**）、滑奏串接（結構/連接
-    ▸串聯為滑鍵）、音符屬性（編輯屬性…）。
+    這也自動解掉了之前那幾條手工規則（不放有快捷鍵的、不放右鍵選單裡有的）：
+    有快捷鍵的你根本不會去按按鈕、右鍵到得了的你也不會切分頁，它們自然不會
+    進來——不用再維護排除清單。
     """
 
-    #: 右鍵選單已經有的，不該出現在這一頁
-    IN_CONTEXT_MENU = ('右手', '左手', '改類型', '複製', '滑奏串接', '音符屬性')
-    #: 有快捷鍵的，不該出現在這一頁
-    HAS_SHORTCUT = ('存檔', '復原', '重做', '播放', '暫停', '停止', '刪除',
-                    '寬 2', '寬 3')
-
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
+        from qt_editor.settings import settings
+        from qt_editor.toolbar_usage import SETTINGS_KEY
+        self.settings = settings
+        self._before = settings.get(SETTINGS_KEY, None)
+        settings.set(SETTINGS_KEY, {})
         from qt_editor.main_window import MainWindow
         with contextlib.redirect_stdout(io.StringIO()):
-            cls.win = MainWindow()
-        cls.win.resize(2560, 1400)
-        cls.model = NoteModel.create_new('t', 120.0, 30.0, 4)
-        cls.win._load_model_all(cls.model)
+            self.win = MainWindow()
+        self.win.resize(2560, 1400)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.win.view.model.dirty = False
-        cls.win.close()
+    def tearDown(self):
+        from qt_editor.toolbar_usage import SETTINGS_KEY
+        self.settings.set(SETTINGS_KEY,
+                          self._before if self._before is not None else {})
+        self.win.view.model.dirty = False
+        self.win.close()
 
     def page(self):
         return self.win._toolbars[0].tabs.widget(0)
 
     def buttons(self):
         from PyQt5.QtWidgets import QToolButton
-        return {b.text(): b for b in self.page().findChildren(QToolButton)}
+        return [b.text() for b in self.page().findChildren(QToolButton)]
+
+    def press(self, label, times=1):
+        for _ in range(times):
+            self.win._count_toolbar_use(label)
+        self.win._refresh_common_tab()
 
     def test_it_is_the_first_tab_and_opens_by_default(self):
         tabs = self.win._toolbars[0].tabs
         self.assertEqual(tabs.tabText(0), '常用')
         self.assertEqual(tabs.currentIndex(), 0)
 
-    def test_nothing_here_already_has_a_shortcut(self):
-        labels = ' '.join(self.buttons())
-        for banned in self.HAS_SHORTCUT:
-            self.assertNotIn(banned, labels,
-                             '「%s」有快捷鍵，不該放在常用頁' % banned)
+    def test_it_starts_empty(self):
+        self.assertEqual(self.buttons(), [])
 
-    def test_nothing_here_is_already_in_the_right_click_menu(self):
-        labels = ' '.join(self.buttons())
-        for banned in self.IN_CONTEXT_MENU:
-            self.assertNotIn(banned, labels,
-                             '「%s」右鍵就到得了，不該佔常用頁的位置' % banned)
+    def test_it_says_how_it_fills_up(self):
+        """空的時候要講清楚，不然看起來像壞掉。"""
+        from PyQt5.QtWidgets import QLabel
+        texts = ' '.join(l.text() for l in self.page().findChildren(QLabel))
+        self.assertIn('空', texts)
+        self.assertIn('其他分頁', texts)
 
-    def test_the_heavy_operations_are_here(self):
-        """真的常跑、但不是一個鍵或一次右鍵就到的那些。"""
-        labels = ' '.join(self.buttons())
-        for want in ('鎖定音符', 'PianoTrans', '長條尾端', 'MIDI'):
-            self.assertIn(want, labels, '「%s」不在常用頁' % want)
+    def test_pressing_something_enough_times_puts_it_here(self):
+        self.press('PianoTrans 轉譜整理…', 3)
+        self.assertIn('PianoTrans 轉譜整理…', self.buttons())
 
-    def test_every_entry_says_where_its_home_is(self):
-        """這一頁是鏡像，所以每一顆都要講得出家在哪。"""
-        for _label, _slot, tip in self.win._common_entries():
-            self.assertIn('家：', tip)
+    def test_one_press_is_not_enough(self):
+        """隨手點一下試試看的東西不該卡在那裡。"""
+        from qt_editor.toolbar_usage import MIN_COUNT
+        self.press('PianoTrans 轉譜整理…', MIN_COUNT - 1)
+        self.assertNotIn('PianoTrans 轉譜整理…', self.buttons())
 
-    def test_it_is_short(self):
-        """鏡像頁太長就失去意義了。"""
-        self.assertLessEqual(len(self.buttons()), 8,
-                             list(self.buttons()))
+    def test_the_most_pressed_comes_first(self):
+        self.press('處理長條尾端…', 2)
+        self.press('PianoTrans 轉譜整理…', 5)
+        got = self.buttons()
+        self.assertLess(got.index('PianoTrans 轉譜整理…'),
+                        got.index('處理長條尾端…'))
 
-    def test_the_page_fits_the_screen(self):
-        from PyQt5.QtWidgets import QComboBox, QToolButton
-        total = sum(w.sizeHint().width()
-                    for w in self.page().findChildren(QToolButton)
-                    + self.page().findChildren(QComboBox)
-                    if not w.isHidden())
-        self.assertLess(total + 244, 2560,
-                        '常用頁 %d px ＋音量 244 放不進 2560' % total)
+    def test_an_item_that_no_longer_exists_is_skipped(self):
+        """改版／改名之後舊的計數還在，不能讓它炸掉整頁。"""
+        self.press('這顆按鈕已經不存在了', 9)
+        self.assertNotIn('這顆按鈕已經不存在了', self.buttons())
+
+    def test_it_never_grows_past_the_limit(self):
+        from qt_editor.toolbar_usage import MAX_COMMON
+        for label in list(self.win._toolbar_registry)[:MAX_COMMON + 4]:
+            self.press(label, 3)
+        self.assertLessEqual(len(self.buttons()), MAX_COMMON)
+
+    def test_every_button_says_how_often_you_pressed_it(self):
+        self.press('PianoTrans 轉譜整理…', 4)
+        from PyQt5.QtWidgets import QToolButton
+        for b in self.page().findChildren(QToolButton):
+            self.assertIn('按過', b.toolTip())
+
+    def test_the_registry_covers_every_tab(self):
+        """所有工具列項目都要經過 `_tab_action`／`_menu_button` 才註冊得到。"""
+        reg = self.win._toolbar_registry
+        self.assertGreater(len(reg), 40)
+        for want in ('PianoTrans 轉譜整理…', '🔒 鎖定音符', '智慧重排吸附…'):
+            self.assertIn(want, reg, '註冊表漏了「%s」' % want)
+
+    def test_counting_a_press_survives_a_restart(self):
+        """計數放在設定裡，所以跨工作階段留得住。"""
+        from qt_editor.toolbar_usage import SETTINGS_KEY
+        self.press('處理長條尾端…', 3)
+        stored = self.settings.get(SETTINGS_KEY, {})
+        self.assertEqual(stored.get('處理長條尾端…'), 3)
 
 
 class MeasureTabIsConsolidatedTests(unittest.TestCase):
@@ -394,32 +416,6 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
                 self.assertNotIn('小節', label,
                                  '「%s」留在「%s」分頁' % (label, other))
 
-    def test_every_item_on_common_has_a_home_somewhere_else(self):
-        """使用者：「常用是把各個 tab 最常用的拿出來」——所以它是鏡像。
-
-        比對的是 **slot（函式）不是標籤文字**：常用頁的標籤會為了寬度縮短
-        （「以 MIDI 對齊…」vs 工具分頁的「整份改用參考 MIDI 的時間與音高
-        （鍵道、力度、記號留著）…」），拿文字比會假性失敗。
-        """
-        homes = set()
-        for _title, entries in self.win._tool_groups():
-            homes.update(slot for _label, slot in entries)
-        for _group, _label, slot, _tip in self.win._measure_entries():
-            homes.add(slot)
-        for _label, slot in self.win._selected_note_entries():
-            homes.add(slot)
-        # 這兩顆在分頁上是獨立按鈕，不屬於任何一組下拉
-        homes.add(self.win.smart_midi_chart_dialog)
-        homes.add(self.win._show_lead_in_dialog)
-        for label, slot, _tip in self.win._common_entries():
-            self.assertIn(slot, homes,
-                          '「%s」在常用分頁，但別的分頁都沒有它的家' % label)
-
-    def test_the_common_tab_declares_where_each_home_is(self):
-        """鏡像頁的每一顆都要講得出家在哪，不然看不出它為什麼在那裡。"""
-        for label, _slot, tip in self.win._common_entries():
-            self.assertIn('家：', tip, label)
-
     def test_the_tab_still_fits_the_screen(self):
         from PyQt5.QtWidgets import QComboBox, QToolButton
         tabs = self.win._toolbars[0].tabs
@@ -509,51 +505,57 @@ class NotesLockedTests(unittest.TestCase):
         bpm, _rounded = self.view._barline_bpm(0, 2000)
         self.assertEqual(bpm, 120.0)
 
-    def test_it_lives_on_the_measure_tab_and_is_mirrored_on_common(self):
-        """家在小節（它是小節線的編輯模式），常用放一顆鏡像。
-
-        使用者：「拖曳小節線和鎖定音符都要在小節的 tab 上／常用是把各個 tab
-        最常用的拿出來」。
-        """
+    def test_its_home_is_the_measure_tab(self):
+        """家在小節（它是小節線的編輯模式）。常用頁要按夠次數才會出現。"""
         from PyQt5.QtWidgets import QToolButton
         from qt_editor.main_window import MainWindow
         with contextlib.redirect_stdout(io.StringIO()):
             win = MainWindow()
         try:
             tabs = win._toolbars[0].tabs
-            names = {}
-            for i in range(tabs.count()):
-                names[tabs.tabText(i)] = [
-                    b.text() for b in tabs.widget(i).findChildren(QToolButton)]
+            names = {tabs.tabText(i): [b.text() for b in
+                                       tabs.widget(i).findChildren(QToolButton)]
+                     for i in range(tabs.count())}
             self.assertTrue(any('鎖定音符' in x for x in names['小節']),
-                            '小節分頁沒有：%s' % names['小節'])
-            self.assertTrue(any('鎖定音符' in x for x in names['常用']),
-                            '常用分頁沒有鏡像：%s' % names['常用'])
+                            names['小節'])
             self.assertTrue(any('拖曳小節線' in x for x in names['小節']))
-            act = win._toolbars[0].measure_lock_act
-            self.assertTrue(act.isCheckable())
-            self.assertFalse(act.isChecked(), '預設該是關的')
+            self.assertTrue(win._toolbars[0].measure_lock_act.isCheckable())
         finally:
             win.view.model.dirty = False
             win.close()
 
-    def test_both_copies_stay_in_step(self):
-        """兩顆同一個狀態，漏掉一顆就會看到一開一關。"""
+    def test_a_mirror_on_common_stays_in_step(self):
+        """按夠次數之後常用頁也會有一顆，兩顆必須同一個狀態。
+
+        常用頁是從使用紀錄長出來的，哪些開關會出現在上面事先不知道——同步是
+        照標籤對的，而且要**保留 checkable**：通用迴圈不知道它是開關的話會建
+        成普通按鈕，按下去會直接把狀態關掉。
+        """
         from qt_editor.main_window import MainWindow
         from qt_editor.settings import settings
-        before = settings.get('notes_locked', False)
+        from qt_editor.toolbar_usage import SETTINGS_KEY
+        before = (settings.get(SETTINGS_KEY, None),
+                  settings.get('notes_locked', False))
+        settings.set(SETTINGS_KEY, {})
         with contextlib.redirect_stdout(io.StringIO()):
             win = MainWindow()
         try:
+            for _ in range(3):
+                win._count_toolbar_use('🔒 鎖定音符')
+            win._refresh_common_tab()
             tbs = win._toolbars[0]
+            mirror = tbs.common_acts.get('🔒 鎖定音符')
+            self.assertIsNotNone(mirror,
+                                 '常用頁沒長出那顆：%s' % list(tbs.common_acts))
+            self.assertTrue(mirror.isCheckable(), '鏡像沒保留 checkable')
             win._on_notes_locked_toggled(True)
             self.assertTrue(tbs.measure_lock_act.isChecked())
-            self.assertTrue(tbs.notes_locked_act.isChecked())
-            self.assertTrue(all(p.notes_locked for p in win._panes))
+            self.assertTrue(mirror.isChecked())
             win._on_notes_locked_toggled(False)
             self.assertFalse(tbs.measure_lock_act.isChecked())
-            self.assertFalse(tbs.notes_locked_act.isChecked())
+            self.assertFalse(mirror.isChecked())
         finally:
-            settings.set('notes_locked', before)
+            settings.set(SETTINGS_KEY, before[0] if before[0] is not None else {})
+            settings.set('notes_locked', before[1])
             win.view.model.dirty = False
             win.close()

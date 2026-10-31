@@ -239,9 +239,10 @@ class ToolbarSet:
         self.hit_act: Optional[QAction] = None
         self.barline_drag_act: Optional[QAction] = None
         #: 「常用」分頁上的類型選單（選完要歸位）
-        #: 「鎖定音符」開關：家在小節分頁，常用分頁放一顆鏡像，兩顆要同步
-        self.notes_locked_act: Optional[QAction] = None
+        #: 「鎖定音符」開關的本尊（家在小節分頁）
         self.measure_lock_act: Optional[QAction] = None
+        #: 常用分頁上的鏡像：標籤 → QAction。開關類的狀態要跟著本尊走。
+        self.common_acts: Dict[str, QAction] = {}
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
@@ -333,6 +334,12 @@ class MainWindow(QMainWindow):
         self._detached_win: Optional[DetachedPaneWindow] = None
         # 工具列：主視窗一條，獨立視窗模式時那個視窗再一條
         self._toolbars: List[ToolbarSet] = []
+        #: 標籤 → (slot, 說明)。所有工具列項目都在裡面，「常用」分頁靠它
+        #: 從使用次數找回要放哪幾顆。
+        self._toolbar_registry: Dict[str, Any] = {}
+        self._rebuilding_common = False
+        from .toolbar_usage import ToolbarUsage
+        self._toolbar_usage = ToolbarUsage(settings)
         self._tb_main: Optional[ToolbarSet] = None
         self._tb_detached: Optional[ToolbarSet] = None
         # 正在跑某條工具列的動作時先不要回填狀態（會把剛按下的按鈕又刷回去）
@@ -1703,12 +1710,17 @@ class MainWindow(QMainWindow):
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         tbs.tabs = tabs
 
-        tabs.addTab(self._build_tab_common(tbs),  '常用')
         tabs.addTab(self._build_tab_edit(tbs),    t('tb_tab_edit'))
         tabs.addTab(self._build_tab_play(tbs),    t('tb_tab_play'))
         tabs.addTab(self._build_tab_measure(tbs), t('tb_tab_measure'))
         tabs.addTab(self._build_tab_tools(tbs),   t('tb_tab_tools'))
         tabs.addTab(self._build_tab_view(tbs),    t('tb_tab_view'))
+        # 「常用」最後才建、插回第 0 格：它要從註冊表裡撈 slot，而註冊表是
+        # 上面那五頁建立的過程中填起來的。
+        tabs.insertTab(0, self._build_tab_common(tbs), '常用')
+        tabs.setCurrentIndex(0)
+        # 接訊號要在 setCurrentIndex 之後：不然建立過程中就會觸發一次重建
+        tabs.currentChanged.connect(self._on_toolbar_tab_changed)
 
         # 分頁與音量包成同一個 widget 再交給工具列。分兩次 addWidget 的話，
         # 工具列會認為自己塞不下而把音量整塊收進 » 溢位選單裡。
@@ -1833,6 +1845,24 @@ class MainWindow(QMainWindow):
         )
         return btn
 
+    def _register_toolbar_item(self, label: str, slot, tip: str = '',
+                               checkable: bool = False) -> None:
+        """把一個工具列項目記進註冊表，「常用」分頁靠它找回 slot。
+
+        所有分頁上的東西都經過 `_tab_action` 或 `_menu_button`，所以註冊表
+        自動是完整的——不用另外維護一份清單（那種清單一定會走鐘）。
+        """
+        if not label:
+            return
+        self._toolbar_registry.setdefault(label, (slot, tip, bool(checkable)))
+
+    def _count_toolbar_use(self, label: str) -> None:
+        """按了一次。常用分頁就是照這個數字長出來的。"""
+        try:
+            self._toolbar_usage.record(label)
+        except Exception:                                   # noqa: BLE001
+            pass            # 計數壞掉不該讓功能按不下去
+
     def _tab_action(self, tbs: ToolbarSet, label: str, slot, tip: str = '',
                     checkable: bool = False, keys=None) -> QAction:
         """建立分頁上的動作。動作掛在這條工具列底下，工具列被刪就一起走。
@@ -1843,6 +1873,9 @@ class MainWindow(QMainWindow):
         act = QAction(label, tbs.root, checkable=checkable)
         if tip:
             act.setToolTip(tip)
+        self._register_toolbar_item(label, slot, tip, checkable)
+        act.triggered.connect(
+            lambda _checked=False, _l=label: self._count_toolbar_use(_l))
         self._label_shortcut(act, label, tip, keys or slot, 'button')
         # checkable 走 toggled（要 checked 旗標）；其餘走 triggered（不收參數）
         bound = self._bind(tbs, slot, forward=checkable)
@@ -1855,64 +1888,83 @@ class MainWindow(QMainWindow):
     # ── 分頁：常用 ────────────────────────────────────────────────────
 
     def _build_tab_common(self, tbs: ToolbarSet) -> QWidget:
-        """**各個分頁最常用的東西，拿出來放在這一頁。** 鏡像，不是誰的家。
+        """**一開始是空的，照你實際按過什麼長出來。**
 
-        使用者給了三條篩選規則，三條都要過：
+        使用者：「常用初始就是空白（沒這個選項），以玩家的操作紀錄（有在其他
+        tab 上曾經切過去用的）放到常用」。
 
-            1. 常做（照 `logs/oplog-*.jsonl` 的使用次數）
-            2. **沒有快捷鍵**——手會先按鍵，眼睛不會往上看
-            3. **右鍵選單裡沒有**——那已經是一次點擊就到了
+        所以這一頁沒有我排的清單——`toolbar_usage` 數每顆按鈕被按過幾次，
+        按過 `MIN_COUNT` 次以上的照次數排進來。你為了某個功能切到別的分頁按了
+        它，它就往上爬；從來沒按過的永遠不會出現。
 
-        第 3 條一加，原本這一頁七項裡有五項要拿掉：
+        這也自動解掉了之前那幾條手工規則：有快捷鍵的你根本不會去按按鈕、右鍵
+        到得了的你也不會切分頁，它們自然不會進來——不用再維護排除清單。
 
-            ● 右手／左手   右鍵「音符屬性 ▸ 左右手」
-            改類型…        右鍵「音符屬性 ▸ 類型」
-            ⧉ 複製         右鍵「就地複製」**而且有 C 鍵**
-            滑奏串接       右鍵「結構 / 連接 ▸ 串聯為滑鍵」
-            音符屬性…      右鍵「編輯屬性…」
-
-        剩下的是「真的常跑、但不是一個鍵或一次右鍵就到」的重型操作，照使用
-        次數排：
-
-            _fix_ai_transcription      34   PianoTrans 轉譜整理
-            resolve_hold_tails_dialog  19   處理長條尾端
-            align_reference_midi       14   以 MIDI 對齊
-            _arrange_now               10   智慧 MIDI 初步寫譜
-            _show_lead_in_dialog        6   開頭空白
-
-        加上 🔒 鎖定音符（新功能，家在小節分頁，這裡是鏡像）。
+        **註冊表要先建好**，所以這一頁最後才建、再插回第 0 格（見
+        `_build_toolbar_set`）。
         """
-        tbs.notes_locked_act = self._tab_action(
-            tbs, '🔒 鎖定音符', self._on_notes_locked_toggled,
-            tip=self._notes_locked_tip(),
-            checkable=True, keys='_on_notes_locked_toggled')
-        tbs.notes_locked_act.blockSignals(True)
-        tbs.notes_locked_act.setChecked(self._notes_locked())
-        tbs.notes_locked_act.blockSignals(False)
+        from .toolbar_usage import MIN_COUNT
 
-        widgets = [self._tab_button(tbs.notes_locked_act), None]
-        for label, slot, tip in self._common_entries():
-            widgets.append(self._tab_button(
-                self._tab_action(tbs, label, slot, tip=tip)))
+        widgets = []
+        tbs.common_acts = {}
+        for label, count in self._toolbar_usage.top():
+            entry = self._toolbar_registry.get(label)
+            if entry is None:
+                continue                # 那顆已經不存在了（改版／改名）
+            slot, tip, checkable = entry
+            note = '按過 %d 次。家在別的分頁，這裡是捷徑。' % count
+            act = self._tab_action(
+                tbs, label, slot, checkable=checkable,
+                tip=(tip + chr(10) + note) if tip else note)
+            # 開關類的要記起來：它是鏡像，狀態得跟著本尊走（不然會一開一關）
+            tbs.common_acts[label] = act
+            widgets.append(self._tab_button(act))
+        self._sync_common_mirrors()
+        if not widgets:
+            hint = QLabel('還是空的。你在其他分頁按過的功能會自動排進來'
+                          '（按過 %d 次以上就會出現）。' % MIN_COUNT, tbs.root)
+            hint.setStyleSheet('color: #555; font-size: 11px; margin: 0 6px;')
+            hint.setWordWrap(True)
+            widgets.append(hint)
         return self._tab_page(widgets)
 
-    def _common_entries(self):
-        """常用分頁上的重型操作：(標籤, slot, 說明)。家都在別的分頁。"""
-        return [
-            (t('action_smart_midi_chart'), self.smart_midi_chart_dialog,
-             '家：工具分頁（用了 10 次）'),
-            ('PianoTrans 轉譜整理…', self.pianotrans_cleanup_dialog,
-             '家：工具 → 音符整理（用了 34 次，這一頁最常跑的）'),
-            (t('action_resolve_hold_tails'), self.resolve_hold_tails_dialog,
-             '家：工具 → 音符整理（用了 19 次）'),
-            # 原本的標籤在下拉裡沒問題，當成按鈕就太長了（「整份改用參考 MIDI
-            # 的時間與音高（鍵道、力度、記號留著）…」，一顆就吃掉 600px）。
-            ('以 MIDI 對齊…', self.align_reference_midi_dialog,
-             chr(10).join([t('action_align_reference_midi'),
-                           '家：工具 → 以 MIDI 修復（用了 14 次）'])),
-            (t('tb_offset'), self._show_lead_in_dialog,
-             '家：播放分頁（用了 6 次）'),
-        ]
+    def _refresh_common_tab(self) -> None:
+        """重建「常用」那一頁。切到它的時候才做——每按一次就重建太重。
+
+        要擋重入：`removeTab`／`insertTab` 自己會發 `currentChanged`，而那個
+        訊號又會叫回這裡——實測直接 RecursionError 把行程打掛。
+        """
+        if getattr(self, '_rebuilding_common', False):
+            return
+        self._rebuilding_common = True
+        try:
+            self._do_refresh_common_tab()
+        finally:
+            self._rebuilding_common = False
+
+    def _do_refresh_common_tab(self) -> None:
+        for tbs in self._toolbars:
+            if tbs.tabs is None:
+                continue
+            index = -1
+            for i in range(tbs.tabs.count()):
+                if tbs.tabs.tabText(i) == '常用':
+                    index = i
+                    break
+            if index < 0:
+                continue
+            was_current = tbs.tabs.currentIndex() == index
+            tbs.tabs.removeTab(index)
+            tbs.tabs.insertTab(index, self._build_tab_common(tbs), '常用')
+            if was_current:
+                tbs.tabs.setCurrentIndex(index)
+
+    def _on_toolbar_tab_changed(self, index: int) -> None:
+        """切到「常用」就重算一次：剛按過的東西馬上看得到。"""
+        for tbs in self._toolbars:
+            if tbs.tabs is not None and 0 <= index < tbs.tabs.count()                     and tbs.tabs.tabText(index) == '常用':
+                self._refresh_common_tab()
+                return
 
     def _common_note_property(self) -> None:
         """對選取的第一顆開音符屬性。右鍵選單那個要先點到音符，這裡吃選取。"""
@@ -2235,14 +2287,25 @@ class MainWindow(QMainWindow):
         """
         settings.set('notes_locked', bool(on))
         self._apply_notes_locked()
+        self._sync_common_mirrors()
+
+    def _sync_common_mirrors(self) -> None:
+        """開關類按鈕的本尊與常用分頁上的鏡像要同一個狀態。
+
+        漏掉一邊就會看到一顆開著、一顆關著。常用分頁是從使用紀錄長出來的，
+        所以哪些開關會出現在上面事先不知道——照標籤對。
+        """
+        states = {'🔒 鎖定音符': self._notes_locked()}
         for tbs in self._toolbars:
-            # 兩顆：小節分頁（家）與常用分頁（鏡像）
-            for name in ('notes_locked_act', 'measure_lock_act'):
-                act = getattr(tbs, name, None)
-                if act is not None and act.isChecked() != bool(on):
-                    act.blockSignals(True)
-                    act.setChecked(bool(on))
-                    act.blockSignals(False)
+            for label, want in states.items():
+                for act in (getattr(tbs, 'measure_lock_act', None),
+                            (getattr(tbs, 'common_acts', None) or {}).get(label)):
+                    if act is None or not act.isCheckable():
+                        continue
+                    if act.isChecked() != bool(want):
+                        act.blockSignals(True)
+                        act.setChecked(bool(want))
+                        act.blockSignals(False)
 
     def _apply_notes_locked(self) -> None:
         """每一格 ChartView 各有自己的旗標，漏掉一格就會看起來像沒生效。"""
@@ -2294,7 +2357,10 @@ class MainWindow(QMainWindow):
         menu = QMenu(btn)
         for item_label, slot in entries:
             act = menu.addAction(item_label)
+            self._register_toolbar_item(item_label, slot)
             act.triggered.connect(self._bind(tbs, slot, forward=False))
+            act.triggered.connect(
+                lambda _checked=False, _l=item_label: self._count_toolbar_use(_l))
             self._register_pan_gated(act, slot)
             self._label_shortcut(act, item_label, '', slot, 'menu')
         btn.setMenu(menu)
