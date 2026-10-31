@@ -19,7 +19,9 @@ _DARK = {
     QPalette.ToolTipBase:     QColor(60, 60, 64),
     QPalette.ToolTipText:     _TEXT,
     QPalette.Text:            _TEXT,
-    QPalette.Button:          QColor(42, 42, 46),
+    # 按鈕底色要和視窗底**看得出差別**。原本是 (42,42,46)、視窗是 (37,37,40)，
+    # 只差 5 階，chip 樣式套下去完全看不出哪裡可以按（實測截圖分不出來）。
+    QPalette.Button:          QColor(55, 55, 61),
     QPalette.ButtonText:      _TEXT,
     QPalette.BrightText:      QColor(255, 110, 110),
     QPalette.Link:            QColor(105, 180, 255),
@@ -28,8 +30,8 @@ _DARK = {
     QPalette.PlaceholderText: QColor(150, 150, 155),
     # 邊框／立體感用的角色。不設的話 `palette(mid)` 會沿用淺色主題的值，
     # 工具列按鈕的框在深色底上會變成刺眼的亮線。
-    QPalette.Light:           QColor(70, 70, 76),
-    QPalette.Midlight:        QColor(56, 56, 61),
+    QPalette.Light:           QColor(86, 86, 94),
+    QPalette.Midlight:        QColor(72, 72, 79),      # 按鈕 hover
     QPalette.Mid:             QColor(96, 96, 102),
     QPalette.Dark:            QColor(26, 26, 29),
     QPalette.Shadow:          QColor(14, 14, 16),
@@ -46,62 +48,157 @@ _DISABLED = {
 # QComboBox / QLineEdit 的下拉區塊，底色是樣式自己畫的淺色。只換調色盤的話
 # 字變白、底還是白，那些地方就整個看不見了。這裡只針對那幾類補最小限度的
 # 樣式，其餘控制項仍然走原生外觀。
-_DARK_QSS = """
+#: 整套介面的樣式。**深色淺色共用這一份**——以前只有深色有 QSS，淺色是裸的
+#: 原生外觀，兩邊長得完全不一樣。顏色全部走 `palette(...)`，所以同一份規則在
+#: 兩種調色盤下都成立。
+#:
+#: 現代化的重點（對照改之前）：
+#:   分頁    每個分頁一個 1px 硬框、選取的整塊填滿高亮（Windows 2000 的樣子）
+#:           → 無框、選取的用 2px 底線 ＋ 強調色文字
+#:   按鈕    3px 圓角 ＋ 永遠看得到的 1px 框
+#:           → 6px 圓角、平常無框、滑過才浮出底色、按下去才有強調色
+#:   輸入框  2px 內距
+#:           → 5px 10px，而且 focus 時框線換成強調色
+#:   間距    各處硬塞
+#:           → 統一的 6/10/14 階
+_QSS = """
+/* ── 分頁：無框 ＋ 底線指示 ─────────────────────────────────────── */
+QTabWidget::pane { border: none; }
 QTabBar::tab {
+    background: transparent;
+    color: palette(window-text);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 7px 14px;
+    margin-right: 2px;
+}
+QTabBar::tab:hover:!selected { background: palette(alternate-base); }
+QTabBar::tab:selected {
+    border-bottom: 2px solid palette(highlight);
+    color: palette(highlight);
+    font-weight: 600;
+}
+
+/* ── 工具列按鈕：有底色的 chip ─────────────────────────────────
+   **平常就要看得出是按鈕。** 原本 `_tab_button` 的註解寫得很清楚：「不用
+   autoRaise：分頁上的按鈕若只在滑鼠移上去才看得到邊框，就看不出哪裡可以按，
+   也看不出 checkable 的按鈕現在是不是開著」。那個判斷是對的。
+   現代化改的是**怎麼**表現，不是拿掉表現：以前是 1px 硬框 ＋ 3px 圓角，
+   現在是填色 chip ＋ 6px 圓角，滑過變亮。                                 */
+QToolButton {
     background: palette(button);
     color: palette(button-text);
-    border: 1px solid palette(mid);
-    padding: 4px 10px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 5px 10px;
 }
-QTabBar::tab:selected   { background: palette(highlight); color: palette(highlighted-text); }
-QTabBar::tab:!selected:hover { background: palette(midlight); }
-QTabWidget::pane        { border: 1px solid palette(mid); }
+QToolButton:hover   { background: palette(midlight);
+                      border-color: palette(mid); }
+QToolButton:pressed { background: palette(dark); }
+QToolButton:checked {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+    border-color: palette(highlight);
+    font-weight: 600;
+}
+QToolButton:disabled { color: palette(mid); background: transparent; }
+QToolButton::menu-indicator { image: none; }
+
+/* ── 輸入類：圓角、呼吸空間、focus 時框線變強調色 ───────────────── */
 QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QAbstractSpinBox {
     background: palette(base);
     color: palette(text);
     border: 1px solid palette(mid);
-    padding: 2px 4px;
+    border-radius: 6px;
+    padding: 5px 10px;
+    selection-background-color: palette(highlight);
 }
+QComboBox:focus, QLineEdit:focus, QSpinBox:focus,
+QDoubleSpinBox:focus, QAbstractSpinBox:focus { border-color: palette(highlight); }
+QComboBox:disabled, QLineEdit:disabled, QAbstractSpinBox:disabled {
+    color: palette(mid);
+}
+/* drop-down 不要整個改寫：把 border 拿掉會連原生的箭頭一起沒了，下拉看起來
+   就是一個普通的框，看不出可以點開（實測截圖分不出來）。只放寬一點。 */
+QComboBox::drop-down { width: 20px; }
 QComboBox QAbstractItemView {
     background: palette(base);
     color: palette(text);
+    border: 1px solid palette(mid);
     selection-background-color: palette(highlight);
+    outline: none;
 }
-QDialog, QMessageBox { background: palette(window); color: palette(window-text); }
-QMessageBox QLabel   { color: palette(window-text); }
-/* 工具列按鈕：程式裡有些地方另外設了 border/padding，那些 inline 樣式會
-   接管原生繪製、只留下預設的淺色底。這裡補上底色與文字色，inline 樣式
-   沒定義的屬性才有得繼承。 */
-QToolButton {
-    background: palette(button);
-    color: palette(button-text);
-}
-QToolButton:hover    { background: palette(midlight); }
-QToolButton:pressed  { background: palette(dark); }
-QToolButton:disabled { color: palette(mid); }
-QToolBar    { background: palette(window); border: none; }
-QStatusBar  { background: palette(window); color: palette(window-text); }
+
+/* ── 一般按鈕 ─────────────────────────────────────────────────── */
 QPushButton {
     background: palette(button);
     color: palette(button-text);
     border: 1px solid palette(mid);
-    border-radius: 3px;
-    padding: 4px 14px;
+    border-radius: 6px;
+    padding: 6px 16px;
 }
 QPushButton:hover    { background: palette(midlight); }
 QPushButton:pressed  { background: palette(dark); }
-QPushButton:default  { border: 1px solid palette(highlight); }
+QPushButton:default  { border-color: palette(highlight); font-weight: 600; }
 QPushButton:disabled { color: palette(mid); border-color: palette(dark); }
-QCheckBox, QRadioButton, QGroupBox, QLabel { color: palette(window-text); }
-QGroupBox::title { color: palette(window-text); }
-QMenu       { background: palette(window); color: palette(window-text); }
-QMenu::item:selected { background: palette(highlight); color: palette(highlighted-text); }
-QMenuBar    { background: palette(window); color: palette(window-text); }
-QMenuBar::item:selected { background: palette(highlight); color: palette(highlighted-text); }
-QHeaderView::section, QTableView, QListWidget, QTreeWidget {
-    background: palette(base); color: palette(text);
+
+/* ── 分組框：標題當小標，框線淡一點 ─────────────────────────────── */
+QGroupBox {
+    border: 1px solid palette(midlight);
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 8px;
 }
-QToolTip { background: palette(base); color: palette(text); border: 1px solid palette(mid); }
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: palette(window-text);
+}
+
+/* ── 選單：圓角、項目有內距 ───────────────────────────────────── */
+QMenu {
+    background: palette(window);
+    color: palette(window-text);
+    border: 1px solid palette(mid);
+    padding: 4px;
+}
+QMenu::item { padding: 5px 20px; border-radius: 4px; }
+QMenu::item:selected { background: palette(highlight);
+                       color: palette(highlighted-text); }
+QMenu::separator { height: 1px; background: palette(midlight); margin: 4px 8px; }
+QMenuBar { background: palette(window); color: palette(window-text); }
+QMenuBar::item { padding: 5px 10px; border-radius: 4px; background: transparent; }
+QMenuBar::item:selected { background: palette(highlight);
+                          color: palette(highlighted-text); }
+
+/* ── 其餘 ─────────────────────────────────────────────────────── */
+QToolBar   { background: palette(window); border: none; spacing: 4px; }
+QStatusBar { background: palette(window); color: palette(window-text); }
+QDialog, QMessageBox { background: palette(window); color: palette(window-text); }
+QCheckBox, QRadioButton, QLabel { color: palette(window-text); }
+QCheckBox::indicator, QRadioButton::indicator { width: 15px; height: 15px; }
+QHeaderView::section {
+    background: palette(window); color: palette(window-text);
+    border: none; border-bottom: 1px solid palette(mid); padding: 5px 8px;
+}
+QTableView, QListWidget, QTreeWidget {
+    background: palette(base); color: palette(text);
+    border: 1px solid palette(mid); border-radius: 6px;
+    selection-background-color: palette(highlight);
+}
+QToolTip {
+    background: palette(base); color: palette(text);
+    border: 1px solid palette(mid); padding: 4px 6px;
+}
+QScrollBar:vertical   { background: transparent; width: 11px; margin: 0; }
+QScrollBar:horizontal { background: transparent; height: 11px; margin: 0; }
+QScrollBar::handle {
+    background: palette(mid); border-radius: 5px; min-height: 28px; min-width: 28px;
+}
+QScrollBar::handle:hover { background: palette(light); }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 """
 
 
@@ -120,10 +217,14 @@ def _repolish(app) -> None:
 
 
 def apply_theme(app, dark: bool) -> None:
-    """套用深色／淺色主題。`dark=False` 會還原成系統預設調色盤與樣式。"""
+    """套用深色／淺色主題。
+
+    **兩種模式套同一份 QSS**，只有調色盤不同。以前淺色是裸的原生外觀、深色才
+    有樣式，兩邊看起來像兩個程式。
+    """
     if not dark:
         app.setPalette(app.style().standardPalette())
-        app.setStyleSheet('')
+        app.setStyleSheet(_QSS)
         _repolish(app)
         return
     pal = QPalette()
@@ -132,5 +233,5 @@ def apply_theme(app, dark: bool) -> None:
     for role, color in _DISABLED.items():
         pal.setColor(QPalette.Disabled, role, color)
     app.setPalette(pal)
-    app.setStyleSheet(_DARK_QSS)
+    app.setStyleSheet(_QSS)
     _repolish(app)

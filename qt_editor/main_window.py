@@ -1834,15 +1834,10 @@ class MainWindow(QMainWindow):
         btn = QToolButton()
         btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         btn.setDefaultAction(action)
-        # 不用 autoRaise：分頁上的按鈕若只在滑鼠移上去才看得到邊框，就看不出
-        # 哪裡可以按，也看不出 checkable 的按鈕現在是不是開著。
-        btn.setStyleSheet(
-            'QToolButton { border: 1px solid palette(mid); border-radius: 3px;'
-            ' padding: 3px 8px; }'
-            'QToolButton:checked { background: palette(highlight);'
-            ' color: palette(highlighted-text); font-weight: bold; }'
-            'QToolButton:disabled { color: gray; }'
-        )
+        # 樣式交給 `theme._QSS`，這裡不要再 inline 設。以前這裡自己設 border 與
+        # padding，結果是：inline 樣式接管原生繪製、主題裡的 hover／checked 規則
+        # 被蓋掉（theme.py 原本的註解就在抱怨這件事），而且淺色模式下整顆變成
+        # 沒有底色的白框。
         return btn
 
     def _register_toolbar_item(self, label: str, slot, tip: str = '',
@@ -1921,10 +1916,12 @@ class MainWindow(QMainWindow):
             widgets.append(self._tab_button(act))
         self._sync_common_mirrors()
         if not widgets:
-            hint = QLabel('還是空的。你在其他分頁按過的功能會自動排進來'
-                          '（按過 %d 次以上就會出現）。' % MIN_COUNT, tbs.root)
-            hint.setStyleSheet('color: #555; font-size: 11px; margin: 0 6px;')
-            hint.setWordWrap(True)
+            # 不要 setWordWrap：`_tab_page` 後面接 addStretch，會換行的標籤
+            # 會被擠成一條 130px 的窄柱、折成四行（實測）。這一行不長，讓它
+            # 佔一整列就好。
+            hint = QLabel('還是空的 — 你在其他分頁按過 %d 次以上的功能，'
+                          '會自動排到這裡。' % MIN_COUNT, tbs.root)
+            hint.setStyleSheet('color: palette(mid); margin: 0 8px;')
             widgets.append(hint)
         return self._tab_page(widgets)
 
@@ -2349,11 +2346,6 @@ class MainWindow(QMainWindow):
         btn.setText(label + ' ▾')
         btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         btn.setPopupMode(QToolButton.InstantPopup)
-        btn.setStyleSheet(
-            'QToolButton { border: 1px solid palette(mid); border-radius: 3px;'
-            ' padding: 3px 8px; }'
-            'QToolButton::menu-indicator { image: none; }'
-        )
         menu = QMenu(btn)
         for item_label, slot in entries:
             act = menu.addAction(item_label)
