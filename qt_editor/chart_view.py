@@ -1250,6 +1250,50 @@ class ChartView(QWidget):
             self.model.dirty = was_dirty
         return changed
 
+    def align_selected_tails_by_start(self, pick: str, push: bool = True) -> int:
+        """同 start 的音符各自一組，尾端對齊到該組的最晚（`'latest'`）或最早。
+
+        使用者最常做的尾端修正就是這個：一個和弦同時按下去，就該同時放開。
+        操作紀錄裡長押尾端被一顆一顆拖了 282 次、775 顆，88% 是往短的方向——
+        那些多半是同一刻的和弦裡有一兩顆尾巴長度和別人不一樣。
+
+        和「一律對齊到最早／最晚」不同，那個是整個選取對到同一個絕對毫秒。
+        """
+        if not self.selected or self.alloc_active:
+            return 0
+        if pick not in ('latest', 'earliest'):
+            return 0
+        sel_notes = [n for n in self.model.notes_tree if n.idx in self.selected]
+        if not sel_notes:
+            return 0
+
+        was_dirty = self.model.dirty
+        if push:
+            self.model.push_history()
+        changed = self.model.align_ends_within_start_groups(sel_notes, pick)
+
+        if changed:
+            self.model.rebuild_display_cache()
+            self.selected = {n.idx for n in sel_notes}
+            self.update()
+            self.note_edited.emit()
+        elif push and self.model.undo_stack:
+            self.model.discard_last_history()
+            self.model.dirty = was_dirty
+        return changed
+
+    def selection_start_groups(self) -> Tuple[int, int]:
+        """選取裡有幾組「同 start 且不只一顆」，以及那些組共幾顆。
+
+        選單標籤用它報數，使用者按之前就知道會動到多少。
+        """
+        groups: Dict[int, int] = {}
+        for n in self.model.notes_tree:
+            if n.idx in self.selected:
+                groups[int(n.start)] = groups.get(int(n.start), 0) + 1
+        multi = [c for c in groups.values() if c > 1]
+        return len(multi), sum(multi)
+
     def nudge_selected_edge_time(self, target: str, delta_ms: int,
                                  push: bool = True) -> int:
         """把選取音符的 start 或 end 各自固定位移 `delta_ms`（正=延後、負=提前）。
@@ -7395,6 +7439,18 @@ class ChartView(QWidget):
         if ok:
             self.align_selected_edge(target, val)
 
+    def _ctx_align_tails_by_start(self, pick: str) -> None:
+        groups, affected = self.selection_start_groups()
+        changed = self.align_selected_tails_by_start(pick)
+        word = '最晚' if pick == 'latest' else '最早'
+        if changed:
+            self.status_changed.emit(
+                '尾端對齊到各組%s：%d 組 / %d 顆裡改了 %d 顆'
+                % (word, groups, affected, changed))
+        else:
+            self.status_changed.emit(
+                '尾端已經一致了（%d 組 / %d 顆），沒有變更' % (groups, affected))
+
     def _ctx_delete_section(self) -> None:
         """刪除段落：拿掉選取的音符，後面的音符整段往前遞補這段空白。
 
@@ -7469,6 +7525,20 @@ class ChartView(QWidget):
         ):
             sub = menu.addMenu(title)
             sub.setEnabled(has_sel)
+            # 同 start 一致放**最上面**：這是最常用的一個（使用者指定）。
+            # 一個和弦同時按下去就該同時放開，而下面那組「一律對齊」是把整個
+            # 選取對到同一個絕對毫秒，框住好幾個和弦時會把它們全拉到同一刻。
+            if target == 'end':
+                groups, affected = self.selection_start_groups() if has_sel else (0, 0)
+                suffix = ('（%d 組 / %d 顆）' % (groups, affected)) if groups else ''
+                for pick, label in (('latest', '同 start 一致：最晚' + suffix),
+                                    ('earliest', '同 start 一致：最早' + suffix)):
+                    a = sub.addAction(label)
+                    a.setEnabled(bool(groups))
+                    a.triggered.connect(
+                        lambda checked=False, _p=pick:
+                        self._ctx_align_tails_by_start(_p))
+                sub.addSeparator()
             a = sub.addAction('自訂…')
             a.triggered.connect(
                 lambda checked=False, _t=target: self._ctx_set_edge_custom(_t))

@@ -2450,6 +2450,43 @@ class NoteModel:
         return changed
 
     @staticmethod
+    def align_ends_within_start_groups(notes: List[GNote], pick: str) -> int:
+        """**同 start 的音符各自一組**，尾端對齊到那一組的最晚／最早。
+
+        `pick='latest'` 取組內最大的 end、`'earliest'` 取最小的。回傳改了幾顆。
+
+        和 `align_notes_edge` 的差別就是「各組自己一組」：那個是把整個選取對到
+        **同一個絕對毫秒**，所以框住連續好幾個和弦時，會把後面所有和弦的尾巴
+        都拉到第一個和弦的那一刻去。一次處理一串和弦要的是這個。
+
+        分組用 `int(n.start)` 完全相等，和譜面其他地方判斷「同刻」的方式一致。
+        MIDI 進來的和弦如果有幾毫秒的參差就不會被分到同一組——那種先用
+        「設定起始時間 → 一律對齊到最早」把頭對齊。
+
+        只有一顆的組沒有東西可以對齊，自然不動。
+        """
+        if pick not in ('latest', 'earliest'):
+            return 0
+        groups: Dict[int, List[GNote]] = {}
+        for n in notes:
+            groups.setdefault(int(n.start), []).append(n)
+        changed = 0
+        for start, group in groups.items():
+            if len(group) < 2:
+                continue
+            ends = [int(n.end) for n in group]
+            value = max(ends) if pick == 'latest' else min(ends)
+            # 下限和 `align_notes_edge` 一樣：尾端至少要在起點之後 1ms
+            value = max(start + 1, value)
+            for n in group:
+                if int(n.end) == value:
+                    continue
+                n.end = value
+                n.gate = value - int(n.start)
+                changed += 1
+        return changed
+
+    @staticmethod
     def nudge_notes_edge(notes: List[GNote], target: str,
                          deltas: Dict[int, int]) -> int:
         """把一組音符的 start 或 end 各自提前／延後，另一端不動。

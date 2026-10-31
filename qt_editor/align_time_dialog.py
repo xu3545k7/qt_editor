@@ -20,10 +20,18 @@ from .i18n import t
 
 
 class AlignTimeDialog(QDialog):
-    """讓使用者選擇對齊目標(start/end)、輸入或自動填入絕對 ms 值。"""
+    """讓使用者選擇對齊目標(start/end)、輸入或自動填入絕對 ms 值。
+
+    另外在**最上面**放兩個「同 start 的尾端一致」按鈕（使用者指定的位置，
+    因為那是最常用的）。它們和下面那一套是不同的操作：下面是把整個選取對到
+    同一個絕對毫秒，這兩顆是**同 start 的各自一組**，各組對到自己的最晚／最早。
+    按下去就直接套用並關閉對話框，不經過下面的 ms 欄位——那個欄位對它們沒有
+    意義。呼叫端先問 `group_pick()`。
+    """
 
     def __init__(self, parent: Optional[QWidget] = None,
-                 stats: Optional[Dict[str, int]] = None) -> None:
+                 stats: Optional[Dict[str, int]] = None,
+                 groups: int = 0, group_notes: int = 0) -> None:
         super().__init__(parent)
         self.setWindowTitle(t('dlg_align_title'))
         self.setMinimumWidth(360)
@@ -31,8 +39,30 @@ class AlignTimeDialog(QDialog):
         self._stats = stats or {
             'min_start': 0, 'max_start': 0, 'min_end': 0, 'max_end': 0,
         }
+        self._group_pick: Optional[str] = None
 
         layout = QVBoxLayout(self)
+
+        # ── 同 start 的尾端一致（最常用，放最上面）────────────────
+        #
+        # 「會動到幾組／幾顆」直接寫在標題上：那是唯一會變的資訊，壓在下面那段
+        # 固定說明的後面就看不到了。
+        count = (t('dlg_align_group_count') % (groups, group_notes) if groups
+                 else t('dlg_align_group_none'))
+        layout.addWidget(QLabel('%s  %s' % (t('dlg_align_group'), count)))
+        group_row = QHBoxLayout()
+        for pick, key in (('latest', 'dlg_align_group_latest'),
+                          ('earliest', 'dlg_align_group_earliest')):
+            btn = QPushButton(t(key))
+            btn.setEnabled(bool(groups))
+            btn.clicked.connect(
+                lambda _checked=False, _p=pick: self._take_group(_p))
+            group_row.addWidget(btn)
+        layout.addLayout(group_row)
+        ghint = QLabel(t('dlg_align_group_hint'))
+        ghint.setStyleSheet('color: gray; font-size: 10px;')
+        ghint.setWordWrap(True)
+        layout.addWidget(ghint)
 
         # ── 對齊目標：start / end ────────────────────────────────
         layout.addWidget(QLabel(t('dlg_align_target')))
@@ -84,7 +114,18 @@ class AlignTimeDialog(QDialog):
         btn.clicked.connect(lambda: self._spin.setValue(int(self._stats[key])))
         grid.addWidget(btn, row, col)
 
+    def _take_group(self, pick: str) -> None:
+        self._group_pick = pick
+        self.accept()
+
     # ── 結果 ─────────────────────────────────────────────────────
+    def group_pick(self) -> Optional[str]:
+        """按的是上面那兩顆嗎：`'latest'` / `'earliest'`，都沒按就是 None。
+
+        呼叫端要**先問這個**：有值的時候 `target()` / `value_ms()` 沒有意義。
+        """
+        return self._group_pick
+
     def target(self) -> str:
         return 'start' if self._rb_start.isChecked() else 'end'
 

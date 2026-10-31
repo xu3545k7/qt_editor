@@ -78,6 +78,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         'action_align_time':    '對齊起始/終止時間…',
 
         # 對齊起始/終止時間對話框
+        'dlg_align_group':          '同 start 的尾端一致（各組自己一組）：',
+        'dlg_align_group_latest':   '對齊到該組最晚的 end',
+        'dlg_align_group_earliest': '對齊到該組最早的 end',
+        'dlg_align_group_count':    '%d 組 / 共 %d 顆',
+        'dlg_align_group_none':     '選取裡沒有同 start 的音符。',
+        'dlg_align_group_hint':     '一個和弦同時按下去就該同時放開。下面那組是把整個選取對到同一個絕對毫秒，框住好幾個和弦時會把它們全拉到同一刻。',
         'dlg_align_title':          '對齊起始/終止時間',
         'dlg_align_target':         '對齊目標：',
         'dlg_align_target_start':   '起始時間 (start)',
@@ -459,6 +465,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         'action_align_time':    '对齐起始/终止时间…',
 
         # 对齐起始/终止时间对话框
+        'dlg_align_group':          '同 start 的尾端一致（各组自己一组）：',
+        'dlg_align_group_latest':   '对齐到该组最晚的 end',
+        'dlg_align_group_earliest': '对齐到该组最早的 end',
+        'dlg_align_group_count':    '%d 组 / 共 %d 颗',
+        'dlg_align_group_none':     '选取里没有同 start 的音符。',
+        'dlg_align_group_hint':     '一个和弦同时按下去就该同时放开。下面那组是把整个选取对到同一个绝对毫秒，框住好几个和弦时会把它们全拉到同一刻。',
         'dlg_align_title':          '对齐起始/终止时间',
         'dlg_align_target':         '对齐目标：',
         'dlg_align_target_start':   '起始时间 (start)',
@@ -817,6 +829,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         'action_align_time':    'Align Start/End Time…',
 
         # Align start/end time dialog
+        'dlg_align_group':          'Match ends within each same-start group:',
+        'dlg_align_group_latest':   "Align to the group's latest end",
+        'dlg_align_group_earliest': "Align to the group's earliest end",
+        'dlg_align_group_count':    '%d groups / %d notes',
+        'dlg_align_group_none':     'No notes share a start time in the selection.',
+        'dlg_align_group_hint':     'A chord pressed together should be released together. The controls below align the whole selection to one absolute millisecond, which pulls every chord in the selection onto the same instant.',
         'dlg_align_title':          'Align Start/End Time',
         'dlg_align_target':         'Align target:',
         'dlg_align_target_start':   'Start time',

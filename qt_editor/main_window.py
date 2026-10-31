@@ -7307,10 +7307,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, t('dlg_no_overlaps_title'), t('dlg_align_no_sel_msg'))
             return
-        dlg = AlignTimeDialog(self, stats=stats)
+        groups, group_notes = self.view.selection_start_groups()
+        dlg = AlignTimeDialog(self, stats=stats,
+                              groups=groups, group_notes=group_notes)
         if dlg.exec_() != QDialog.Accepted:
             return
-        changed = self.view.align_selected_edge(dlg.target(), dlg.value_ms())
+        # 上面那兩顆按鈕是另一個操作（同 start 各組自己一致），ms 欄位對它們
+        # 沒有意義，所以要先問。
+        pick = dlg.group_pick()
+        if pick:
+            changed = self.view.align_selected_tails_by_start(pick)
+        else:
+            changed = self.view.align_selected_edge(dlg.target(), dlg.value_ms())
         if not changed:
             QMessageBox.information(
                 self, t('dlg_no_overlaps_title'), t('dlg_align_no_change_msg'))

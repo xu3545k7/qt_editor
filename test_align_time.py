@@ -128,5 +128,82 @@ class NudgeNotesEdgeTests(unittest.TestCase):
         self.assertEqual((n.start, n.end), (100, 200))
 
 
+class AlignEndsWithinStartGroupsTests(unittest.TestCase):
+    """同 start 的音符各自一組，尾端對齊到該組的最晚／最早。
+
+    使用者最常做的尾端修正就是這個：一個和弦同時按下去就該同時放開。操作紀錄
+    裡長押尾端被一顆一顆拖了 282 次、775 顆，88% 往短的方向。
+
+    和 `align_notes_edge` 的差別是「各組自己一組」——那個是把整個選取對到同一個
+    絕對毫秒，框住連續好幾個和弦時會把它們全拉到第一個和弦那一刻。
+    """
+
+    def chords(self):
+        """兩個和弦：第一個尾巴參差、第二個本來就齊，外加一顆單音。"""
+        return [
+            make_note(1000, 1500, note_type=2, idx=0),
+            make_note(1000, 1800, note_type=2, idx=1),
+            make_note(1000, 1300, note_type=2, idx=2),
+            make_note(2000, 2400, note_type=2, idx=3),
+            make_note(2000, 2400, note_type=2, idx=4),
+            make_note(3000, 3900, note_type=2, idx=5),
+        ]
+
+    def test_latest_pulls_the_group_to_its_longest(self):
+        ns = self.chords()
+        self.assertEqual(
+            NoteModel.align_ends_within_start_groups(ns, 'latest'), 2)
+        self.assertEqual([n.end for n in ns[:3]], [1800, 1800, 1800])
+
+    def test_earliest_pulls_the_group_to_its_shortest(self):
+        ns = self.chords()
+        self.assertEqual(
+            NoteModel.align_ends_within_start_groups(ns, 'earliest'), 2)
+        self.assertEqual([n.end for n in ns[:3]], [1300, 1300, 1300])
+
+    def test_each_group_gets_its_own_value(self):
+        """這是和「一律對齊到同一個絕對值」的關鍵差別。"""
+        ns = self.chords()
+        NoteModel.align_ends_within_start_groups(ns, 'latest')
+        self.assertEqual([n.end for n in ns[3:5]], [2400, 2400],
+                         '第二個和弦不該被第一個的 1800 影響')
+
+    def test_a_lone_note_has_nothing_to_align_to(self):
+        ns = self.chords()
+        NoteModel.align_ends_within_start_groups(ns, 'latest')
+        self.assertEqual(ns[5].end, 3900)
+
+    def test_an_already_even_group_is_left_alone(self):
+        ns = [make_note(1000, 1500, note_type=2, idx=0),
+              make_note(1000, 1500, note_type=2, idx=1)]
+        self.assertEqual(
+            NoteModel.align_ends_within_start_groups(ns, 'latest'), 0)
+
+    def test_gate_follows(self):
+        ns = self.chords()
+        NoteModel.align_ends_within_start_groups(ns, 'latest')
+        for n in ns:
+            self.assertEqual(n.gate, n.end - n.start)
+
+    def test_it_is_idempotent(self):
+        ns = self.chords()
+        NoteModel.align_ends_within_start_groups(ns, 'earliest')
+        self.assertEqual(
+            NoteModel.align_ends_within_start_groups(ns, 'earliest'), 0)
+
+    def test_the_end_still_clears_the_start(self):
+        """組內最早的 end 不可以等於 start——尾端至少要在起點之後 1ms。"""
+        ns = [make_note(1000, 1000, note_type=2, idx=0),
+              make_note(1000, 1800, note_type=2, idx=1)]
+        NoteModel.align_ends_within_start_groups(ns, 'earliest')
+        self.assertEqual([n.end for n in ns], [1001, 1001])
+
+    def test_a_bad_pick_does_nothing(self):
+        ns = self.chords()
+        self.assertEqual(
+            NoteModel.align_ends_within_start_groups(ns, '亂填'), 0)
+        self.assertEqual([n.end for n in ns[:3]], [1500, 1800, 1300])
+
+
 if __name__ == '__main__':
     unittest.main()
