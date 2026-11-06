@@ -21,6 +21,7 @@ GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ('基本', (
         'onset_tolerance_ms', 'edge_margin', 'normal_width', 'dense_width',
         'min_note_width', 'width_anchor', 'dense_hand_threshold',
+        'dense_hand_threshold_is_floor',
         'hand_span_lanes', 'max_hand_chord_notes', 'minimum_pitch_span',
     )),
     ('表情記號', (
@@ -99,6 +100,7 @@ LABELS: Dict[str, str] = {
     'min_note_width': '最小音符寬度',
     'width_anchor': '收窄時哪一邊不動（right＝右緣不動）',
     'dense_hand_threshold': '單手同時幾音就全部收窄',
+    'dense_hand_threshold_is_floor': '上面的門檻是「以上」而不是「剛好」',
     'hand_span_lanes': '單手可用的鍵道寬度',
     'max_hand_chord_notes': '單手和絃最多幾音',
     'minimum_pitch_span': '最小音高跨度（半音）',

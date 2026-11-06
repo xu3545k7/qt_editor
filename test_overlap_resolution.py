@@ -1,5 +1,6 @@
 import unittest
 
+from qt_editor import smart_chart as SC
 from qt_editor.models import GNote, NoteModel
 
 
@@ -375,3 +376,67 @@ class TailGapModeTests(unittest.TestCase):
             self.assertEqual(model.enforce_hold_tail_gap(40, only_conflicts=only), 1)
             self.assertEqual(hold.end, 560)
 
+
+
+class DenseChordNarrowingTests(unittest.TestCase):
+    """k≥4 一律收窄（使用者風格），不是只有剛好 4 音（官方風格）。
+
+    使用者回報「排譜器自己生的，第 10 小節那幾個左手和弦都在亂飄」。追到
+    `_initial_hand_widths` 的 `len(hand_notes) == dense_hand_threshold`——
+    **剛好等於 4** 才收窄，5 顆就掉出去拿寬度 3。5×3＝15 格，貼著鍵盤邊緣
+    放不下，整組只好往旁邊滑：實測同一顆低音在 1.5 秒內從鍵道 20 掉到 12。
+
+    官方 real 的收窄率 k=4 是 88.4%、**k=5 掉回 24.2%**（官方改用重疊擠空間），
+    使用者的 94 份譜則是 k≥5、跨度 12+ 收窄 **99%**。所以這是風格差異，用
+    `dense_hand_threshold_is_floor` 分開，官方那條原樣不動。
+
+    全語料 A/B（8 首、33155 顆）：同音跳≥3格 −25.3%、**≥6格 −48.5%**、
+    貼邊 −14.9%。
+    """
+
+    def notes(self, pitches):
+        out = []
+        for i, pitch in enumerate(pitches):
+            n = GNote(None, i)
+            n.start, n.end, n.gate = 0, 100, 100
+            n.pitch, n.hand, n.note_type = pitch, 0, 0
+            n.min_key, n.max_key = 0, 2
+            out.append(n)
+        return out
+
+    def widths(self, style, pitches):
+        cfg = SC.settings_for_style(style)
+        ns = self.notes(pitches)
+        return SC._initial_hand_widths(
+            ns, cfg, SC._hand_span_wants_narrowing(ns, cfg))
+
+    def test_five_notes_narrow_for_the_user(self):
+        self.assertEqual(self.widths('eather', [74, 76, 80, 83, 86]),
+                         [2, 2, 2, 2, 2])
+
+    def test_five_notes_stay_wide_for_the_official_style(self):
+        """官方 k=5 的收窄率只有 24.2%，那條不能跟著改。"""
+        self.assertEqual(self.widths('official', [74, 76, 80, 83, 86]),
+                         [3, 3, 3, 3, 3])
+
+    def test_four_notes_narrow_in_both_styles(self):
+        for style in ('eather', 'official'):
+            self.assertEqual(self.widths(style, [74, 76, 80, 83]),
+                             [2, 2, 2, 2], style)
+
+    def test_six_notes_also_narrow_for_the_user(self):
+        self.assertEqual(self.widths('eather', [60, 64, 67, 71, 74, 78]),
+                         [2] * 6)
+
+    def test_a_wide_span_no_longer_escapes_the_rule(self):
+        """跨度 ≥12 半音會短路掉後面的收窄，密集和弦必須在那之前就處理掉。"""
+        self.assertEqual(self.widths('eather', [50, 57, 64, 71, 78]),
+                         [2, 2, 2, 2, 2])
+
+    def test_the_flag_is_what_switches_it(self):
+        cfg = SC.settings_for_style('eather', dense_hand_threshold_is_floor=False)
+        ns = self.notes([74, 76, 80, 83, 86])
+        self.assertEqual(
+            SC._initial_hand_widths(ns, cfg,
+                                    SC._hand_span_wants_narrowing(ns, cfg)),
+            [3, 3, 3, 3, 3])

@@ -129,6 +129,17 @@ class SmartChartSettings:
     # 單手同時 4 個音以上就收窄每一顆 —— 那是容量問題（真的塞不下），
     # 和「為了修順序而收窄」不同，後者才是最後手段。
     dense_hand_threshold: int = 4
+    # 上面那個門檻是「剛好等於」還是「大於等於」。
+    #
+    # 官方 real 的收窄率只有**剛好 4 音**才高：k=1/2/3 是 0.0/0.2/4.5%、k=4
+    # 衝到 88.4%、**k=5 又掉回 24.2%**（5 音以上官方改用重疊擠空間）。所以
+    # 預設是「剛好等於」。
+    #
+    # 使用者的 94 份譜相反——k≥5、跨度 12+ 的收窄率是 **99%**（k=4 是 94%），
+    # 他靠收窄擠空間、幾乎不重疊（見記憶 chord-tight-overlap）。對他而言
+    # 5 音和弦維持寬度 3 要 15 格，貼著鍵盤邊緣就放不下，整組只好往旁邊滑
+    # ——那就是「和弦亂飄」：同一顆低音在 1.5 秒內跳掉 8~10 格。
+    dense_hand_threshold_is_floor: bool = False
     # 小度數（含）以內的相鄰音高改用寬度 2 —— 兩顆寬度 3 的音符中心距最少
     # 就是 3，半音到五度會全部擠在同一個距離上、看不出度數差別。收成寬度 2
     # 之後中心距才能降到 2，度數層次才做得出來。
@@ -426,6 +437,10 @@ def settings_for_style(
             # 以及右手位置隨左手最高音浮動（同一個音高在不同和絃裡跳軌）。
             hand_boundary_margin=0.0,
             hand_boundary_min_distance=3.0,
+            # k≥4 一律收窄，不是只有剛好 4 音。他的 94 份譜 k≥5、跨度 12+
+            # 收窄率 99%（官方只有 24.2%，官方改用重疊）。維持寬度 3 的 5 音
+            # 和弦要 15 格，貼著鍵盤邊緣放不下、整組往旁邊滑——「和弦亂飄」。
+            dense_hand_threshold_is_floor=True,
             # 13~21 半音他量出來是空格 3（官方是 2），但那一段只有 265 個樣本
             # （佔 35252 的 0.75%），而且撐開大跨度正是「鍵道不夠用」的來源。
             # 樣本不足以承擔那個代價，所以維持官方的 2，只改樣本充足的
@@ -2877,10 +2892,14 @@ def _initial_hand_widths(
         return []
     # 官方 real 的收窄率是「剛好 4 音」才高：k=1/2/3 是 0.0/0.2/4.5%，
     # k=4 衝到 88.4%，但 k=5 又掉回 24.2%（75.8% 維持寬度 3）。5 音以上
-    # 官方不再靠收窄擠空間，而是讓音符重疊，所以這裡也只在剛好 4 音時收窄，
+    # 官方不再靠收窄擠空間，而是讓音符重疊，所以預設只在剛好 4 音時收窄，
     # 更密的和絃交給容量預算 _shrink_to_capacity 決定。
-    if len(hand_notes) == settings.dense_hand_threshold:
-        return [settings.dense_width] * len(hand_notes)
+    # 使用者風格相反（k≥5 跨度 12+ 收窄 99%），見 `dense_hand_threshold_is_floor`。
+    dense = int(settings.dense_hand_threshold)
+    count = len(hand_notes)
+    if (count >= dense if settings.dense_hand_threshold_is_floor
+            else count == dense):
+        return [settings.dense_width] * count
     widths = [settings.normal_width] * len(hand_notes)
     if not allow_close_narrow:
         return widths
