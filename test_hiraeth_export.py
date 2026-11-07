@@ -1100,3 +1100,44 @@ class KeysoundCheckboxTests(unittest.TestCase):
         for plan in plans:
             self.assertTrue(plan.keysound)
             self.assertFalse(plan.mix_piano, '按鍵音模式不該再混鋼琴軌')
+
+
+class LevelFlatteningTests(unittest.TestCase):
+    """Hiraeth 的刻度比 clone 窄，壓掉的等級要講出來。
+
+    使用者：「h 套件的難度標示還是有誤，它的難度和 clone 不同」，追問「15 以上?」。
+    對——曲庫裡 13 份 Lv16~18 的譜全部壓成 REAL 3.5，和 Lv15 同一個標示。
+
+    Hiraeth 管理器自己的顯示表（`manager_backend.py`）是
+    `{9:1, 10:1, 11:1, 12:2, 13:2.5, 14:3, 15:3.5}`，importer 只收
+    `{1, 1.5, 2, 2.5, 3, 3.5}`，所以原始值不可能超過 15。**上限改不掉，
+    但不可以無聲壓掉。**
+
+    normal/hard/EX 那三格是原封不動帶過去的（實測 82 首、0 筆超出官方區間），
+    只有超過 15 才會被 `min(15, ...)` 夾掉。
+    """
+
+    def test_the_real_scale_tops_out_at_three_and_a_half(self):
+        for level in (15, 16, 17, 18):
+            self.assertEqual(H.real_level(level), 3.5, level)
+
+    def test_it_matches_the_manager_display_table(self):
+        """和 Hiraeth 管理器的對照表逐格一致，不是我們自己訂的。"""
+        manager = {9: 1, 10: 1, 11: 1, 12: 2, 13: 2.5, 14: 3, 15: 3.5}
+        for raw, shown in manager.items():
+            self.assertEqual(H.real_level(raw), shown, raw)
+
+    def test_the_bottom_of_the_scale_is_also_flat(self):
+        """Lv8~11 全部是 REAL 1——那一格 19 首擠在一起。"""
+        self.assertEqual({H.real_level(lv) for lv in (8, 9, 10, 11)}, {1})
+
+    def test_integers_stay_integers(self):
+        """song.json 要寫 `2` 不是 `2.0`，importer 的型別檢查會過但資料難看。"""
+        for level in (10, 12, 15):
+            value = H.real_level(level)
+            if value == int(value):
+                self.assertIsInstance(value, int, level)
+
+    def test_every_real_value_is_one_the_importer_accepts(self):
+        for level in range(1, 20):
+            self.assertIn(H.real_level(level), H.REAL_LEVELS, level)

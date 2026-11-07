@@ -841,6 +841,8 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
         duration_ms = int(round(seconds * 1000))
 
         levels: Dict[str, int] = {}
+        #: (難度名, clone 等級, Hiraeth 會顯示的) —— 被刻度壓掉的那些
+        flattened: List[Tuple[str, int, str]] = []
         trills = dropped = 0
         for chart, model in charts:
             log: Dict[str, int] = {}
@@ -852,10 +854,28 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
             dropped += log['auto_notes_dropped']
             if chart.slot != 'real':
                 levels[chart.slot] = max(1, min(15, int(chart.level)))
+                if int(chart.level) > 15:
+                    # Hiraeth 的 normal/hard/EX 只收 1~15（importer 自己檔的），
+                    # 更高的只能夾掉。以前是**無聲**夾掉，使用者在遊戲裡看到的
+                    # 等級就和製譜器不一樣、卻不知道為什麼。
+                    flattened.append((chart.name, int(chart.level),
+                                      '%s %d' % (chart.slot.upper(), 15)))
             elif chart.real_display is not None:
                 levels[chart.slot] = chart.real_display
             else:
                 levels[chart.slot] = real_level(chart.level)
+                if int(chart.level) >= 15:
+                    # REAL 的刻度到 3.5 為止（原始值 15），所以 Lv15/16/17/18
+                    # 全部壓成同一個標示。這是格式上限、改不掉，但要講出來。
+                    flattened.append((chart.name, int(chart.level), 'REAL 3.5'))
+                elif int(chart.level) <= 11:
+                    # 管理器的顯示表是 {9:1, 10:1, 11:1, ...}，Lv9~11 也併成 REAL 1
+                    flattened.append((chart.name, int(chart.level), 'REAL 1'))
+        if flattened:
+            result.notes.append(tr(
+                '等級被 Hiraeth 的刻度壓掉：%s。'
+                'REAL 只有 1／2／2.5／3／3.5，normal/hard/EX 只收 1~15。')
+                % '、'.join('%s Lv%d→%s' % row for row in flattened))
         if trills:
             result.notes.append(tr('%d 顆顫音照原樣保留') % trills)
         if dropped:

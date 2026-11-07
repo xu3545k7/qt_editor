@@ -508,6 +508,13 @@ _TABLE = {
          'The recycle folder for "%s" is gone (%s); there is nothing to '
          'restore.\nThis history entry is kept and the library was not '
          'touched.'),
+    'Hiraeth 的 REAL 上限，比它高的都一樣': ('Hiraeth 的 REAL 上限，比它高的都一样',
+         "Hiraeth's REAL ceiling; anything higher looks the same"),
+    '超過 15 被夾掉': ('超过 15 被夹掉', 'clamped; above 15 is not allowed'),
+    '等級被 Hiraeth 的刻度壓掉：%s。REAL 只有 1／2／2.5／3／3.5，normal/hard/EX 只收 1~15。':
+        ('等级被 Hiraeth 的刻度压掉：%s。REAL 只有 1／2／2.5／3／3.5，normal/hard/EX 只收 1~15。',
+         "Levels flattened by Hiraeth's scale: %s. REAL has only "
+         '1/2/2.5/3/3.5, and normal/hard/EX accept 1-15 only.'),
     'ZIP 打不開：%s': ('ZIP 打不开：%s',
          'Cannot open the ZIP: %s'),
     '%s：找不到譜面檔': ('%s：找不到谱面文件',

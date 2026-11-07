@@ -330,8 +330,23 @@ class HiraethExportDialog(QDialog):
                 chart = by_slot.get(slot)
                 if chart is None:
                     lines.append('    %-6s ← %s' % (slot, tr('（沒有）')))
+                    continue
+                # 遊戲裡會看到的等級要**現在**就寫出來，不是匯出後才在結果裡講。
+                # Hiraeth 的刻度比 clone 窄：REAL 只有 1/2/2.5/3/3.5（所以
+                # Lv15~18 全是 3.5、Lv8~11 全是 1），normal/hard/EX 只收 1~15。
+                if slot == 'real':
+                    shown = (chart.real_display if chart.real_display is not None
+                             else H.real_level(chart.level))
+                    mark = ('  ← %s' % tr('Hiraeth 的 REAL 上限，比它高的都一樣')
+                            if int(chart.level) > 15 else '')
+                    lines.append('    %-6s ← %s（Lv%s）＝ REAL %s%s'
+                                 % (slot, chart.name, chart.level, shown, mark))
                 else:
-                    lines.append('    %-6s ← %s（Lv%s）' % (slot, chart.name, chart.level))
+                    shown = max(1, min(15, int(chart.level)))
+                    mark = ('  ← %s' % tr('超過 15 被夾掉')
+                            if int(chart.level) > 15 else '')
+                    lines.append('    %-6s ← %s（Lv%s）＝ %s%s'
+                                 % (slot, chart.name, chart.level, shown, mark))
         for why in skipped:
             lines.append('• %s' % why)
         if len(plans) > 1:
