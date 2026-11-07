@@ -535,6 +535,23 @@ _TABLE = {
          '%s contains DOCTYPE/ENTITY, which the importer rejects'),
     '包裡有 %d 個檔案，超過 %d 個': ('包里有 %d 个文件，超过 %d 个',
          'The package has %d files, over the %d limit'),
+    '把按鍵音修補套到這份 Hiraeth': ('把按键音修补套到这份 Hiraeth',
+         'Patch this Hiraeth install to accept key sounds'),
+    '套不上去': ('套不上去', 'Could not patch'),
+    '按鍵音修補': ('按键音修补', 'Key-sound patch'),
+    '讀不到 importer：%s': ('读不到 importer：%s', 'Cannot read the importer: %s'),
+    '這份 importer 已經可以收按鍵音了，沒有改動。':
+        ('这份 importer 已经可以收按键音了，没有改动。',
+         'This importer already accepts key sounds; nothing was changed.'),
+    '在 importer 裡找到 %d 處擋力度的程式碼（預期剛好 1 處），不敢亂改。請自己比對 %s。':
+        ('在 importer 里找到 %d 处挡力度的代码（预期刚好 1 处），不敢乱改。请自己比对 %s。',
+         'Found %d velocity guards in the importer (expected exactly 1), so '
+         'nothing was changed. Compare it against %s yourself.'),
+    '已套用（改的是第 %d 行）%s': ('已套用（改的是第 %d 行）%s',
+         'Patched line %d%s'),
+    '，原版備份到 %s': ('，原版备份到 %s', '; the stock file was backed up to %s'),
+    '，原本就有備份，沒有覆蓋': ('，原本就有备份，没有覆盖',
+         '; an existing backup was kept'),
     'ZIP 打不開：%s': ('ZIP 打不开：%s',
          'Cannot open the ZIP: %s'),
     '%s：找不到譜面檔': ('%s：找不到谱面文件',

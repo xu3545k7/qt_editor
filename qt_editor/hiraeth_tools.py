@@ -30,11 +30,21 @@ GAME_PROCESSES = ('spice64.exe', 'spice.exe')
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
-#: 真按鍵音要靠改過的 importer：原版第 74 行硬擋 `velocity != 0`，
-#: 會把我們保留了力度的包退件（訊息是英文的
+#: 真按鍵音要靠改過的 importer：原版硬擋 `velocity != 0`，會把我們保留了
+#: 力度的包退件（訊息是英文的
 #: `This package format requires background-only charts`）。
 IMPORTER = os.path.join('tools', 'import_tools', 'importer.py')
+KEYSOUND_BACKUP = os.path.join('tools', 'backup_before_keysound', 'importer.py')
+#: 改過之後會出現的字串，用來判斷這份 importer 收不收按鍵音。
 KEYSOUND_PATCH = '0<=velocity<=127'
+#: 原版那一行的特徵。**用字串比對而不是行號**：Hiraeth 改版時行號一定會動
+#: （V2 在第 74 行），但這是格式規則、文字不太會變。抓不到就不要亂改。
+KEYSOUND_STOCK_MARK = "n.findtext('velocity','-1'))!=0"
+#: 換上去的兩行。縮排沿用原本那一行的。
+KEYSOUND_NEW_LINES = (
+    "velocity=int(n.findtext('velocity','-1'))",
+    "if not 0<=velocity<=127:raise ValueError('Sub-note velocity must be 0..127')",
+)
 
 
 class HiraethError(Exception):
@@ -57,6 +67,53 @@ def importer_accepts_keysound(root: str) -> Optional[bool]:
     except OSError:
         return None
     return KEYSOUND_PATCH in text
+
+
+def apply_keysound_patch(root: str) -> str:
+    """把按鍵音修補套到這份 Hiraeth 的 importer 上，回傳做了什麼。
+
+    **兩個版本都適用**：靠 `KEYSOUND_STOCK_MARK` 這個字串定位，不是行號
+    （V2 在第 74 行，Hiraeth 改版一定會移動）。找不到那一行就丟
+    `HiraethError`，不會亂猜著改——寧可叫人自己看，也不要把別人的安裝改壞。
+
+    改之前先備份到 `tools/backup_before_keysound/importer.py`（已經有備份就
+    不覆蓋，那是**原版**，留著才能還原）。已經修補過的直接回報、不重做。
+    """
+    path = os.path.join(root or '', IMPORTER)
+    try:
+        with io.open(path, encoding='utf-8', errors='replace', newline='') as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise HiraethError(tr('讀不到 importer：%s') % exc)
+    if KEYSOUND_PATCH in text:
+        return tr('這份 importer 已經可以收按鍵音了，沒有改動。')
+
+    lines = text.splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if KEYSOUND_STOCK_MARK in line]
+    if len(hits) != 1:
+        raise HiraethError(tr(
+            '在 importer 裡找到 %d 處擋力度的程式碼（預期剛好 1 處），'
+            '不敢亂改。請自己比對 %s。') % (len(hits), KEYSOUND_BACKUP))
+
+    index = hits[0]
+    original = lines[index]
+    indent = original[:len(original) - len(original.lstrip())]
+    ending = '\r\n' if original.endswith('\r\n') else '\n'
+    lines[index:index + 1] = [indent + body + ending
+                              for body in KEYSOUND_NEW_LINES]
+
+    backup = os.path.join(root, KEYSOUND_BACKUP)
+    kept = False
+    if not os.path.exists(backup):
+        os.makedirs(os.path.dirname(backup), exist_ok=True)
+        with io.open(backup, 'w', encoding='utf-8', newline='') as handle:
+            handle.write(text)
+        kept = True
+    with io.open(path, 'w', encoding='utf-8', newline='') as handle:
+        handle.write(''.join(lines))
+    return tr('已套用（改的是第 %d 行）%s') % (
+        index + 1, tr('，原版備份到 %s') % KEYSOUND_BACKUP if kept
+        else tr('，原本就有備份，沒有覆蓋'))
 
 
 def is_root(path: str) -> bool:

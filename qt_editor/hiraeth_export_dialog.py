@@ -162,6 +162,13 @@ class HiraethExportDialog(QDialog):
         self.keysound_warn.setWordWrap(True)
         self.keysound_warn.setStyleSheet('color: #c08040; font-size: 11px;')
         options.addRow('', self.keysound_warn)
+        # 偵測到原版時才出現。按下去**會寫入 Hiraeth 的安裝目錄**，所以是
+        # 使用者自己按，不是匯出時自動做。
+        self.keysound_patch_btn = QPushButton(tr('把按鍵音修補套到這份 Hiraeth'))
+        self.keysound_patch_btn.setVisible(False)
+        self.keysound_patch_btn.clicked.connect(
+            lambda _c=False: self._apply_keysound_patch())
+        options.addRow('', self.keysound_patch_btn)
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(H.MIN_HOLD_GAP_MS, 1000)
         self.gap_spin.setSuffix(' ms')
@@ -304,10 +311,12 @@ class HiraethExportDialog(QDialog):
         """
         if not self.keysound_check.isChecked():
             self.keysound_warn.setText('')
+            self.keysound_patch_btn.setVisible(False)
             return
         from . import hiraeth_tools as T
         root = T.saved_root()
         state = T.importer_accepts_keysound(root) if root else None
+        self.keysound_patch_btn.setVisible(state is False)
         if state is True:
             self.keysound_warn.setText('')
         elif state is False:
@@ -317,6 +326,18 @@ class HiraethExportDialog(QDialog):
         else:
             self.keysound_warn.setText(tr(
                 '找不到 Hiraeth 的 importer，沒辦法先確認它收不收按鍵音。'))
+
+    def _apply_keysound_patch(self) -> None:
+        """使用者自己按的——這會寫入他的 Hiraeth 安裝目錄。"""
+        from . import hiraeth_tools as T
+        root = T.saved_root()
+        try:
+            done = T.apply_keysound_patch(root)
+        except T.HiraethError as exc:
+            QMessageBox.warning(self, tr('套不上去'), str(exc))
+            return
+        QMessageBox.information(self, tr('按鍵音修補'), done)
+        self._update_keysound_warning()
 
     def _update_layout_label(self) -> None:
         '''把「這次會輸出成幾包、哪個難度對到哪一格」寫出來。

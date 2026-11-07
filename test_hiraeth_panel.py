@@ -518,3 +518,102 @@ class ImporterPatchDetectionTests(unittest.TestCase):
 
     def test_an_empty_root_is_unknown(self):
         self.assertIsNone(T.importer_accepts_keysound(''))
+
+
+class KeysoundPatchTests(unittest.TestCase):
+    """把按鍵音修補套上去——**V2 和 2.1.1 都要能套**。
+
+    使用者：「可以讓我和兩個版本都相容嗎」。所以定位靠的是那一行的**文字**
+    不是行號：V2 在第 74 行，Hiraeth 改版一定會移動（2.1.1 改了 DLL 驗證的
+    部分）。抓不到就拒絕，不要猜著改別人的安裝。
+    """
+
+    STOCK = "        if int(n.findtext('velocity','-1'))!=0:raise ValueError('This package format requires background-only charts')"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def write(self, lines, crlf=False):
+        path = os.path.join(self.root, T.IMPORTER)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        sep = (chr(13) + chr(10)) if crlf else chr(10)
+        with io.open(path, 'w', encoding='utf-8', newline='') as handle:
+            handle.write(sep.join(lines) + sep)
+        return path
+
+    def read(self):
+        with io.open(os.path.join(self.root, T.IMPORTER),
+                     encoding='utf-8', newline='') as handle:
+            return handle.read()
+
+    def test_the_stock_v2_line_gets_patched(self):
+        self.write(['x=%d' % i for i in range(73)] + [self.STOCK] + ['y=1'])
+        T.apply_keysound_patch(self.root)
+        self.assertIs(T.importer_accepts_keysound(self.root), True)
+
+    def test_it_finds_the_line_wherever_it_moved_to(self):
+        """2.1.1 動過 importer，行號不能寫死。"""
+        self.write(['a=%d' % i for i in range(200)] + [self.STOCK] + ['b=1'])
+        T.apply_keysound_patch(self.root)
+        self.assertIs(T.importer_accepts_keysound(self.root), True)
+
+    def test_crlf_files_stay_crlf(self):
+        """Hiraeth 的檔案是 CRLF，換成 LF 會讓整份 diff 爆開。"""
+        self.write(['a=1', self.STOCK, 'b=2'], crlf=True)
+        T.apply_keysound_patch(self.root)
+        text = self.read()
+        self.assertIn(chr(13) + chr(10), text)
+        self.assertNotIn(chr(10) + chr(10), text.replace(chr(13), ''))
+
+    def test_the_indent_is_kept(self):
+        self.write(['def f():', self.STOCK])
+        T.apply_keysound_patch(self.root)
+        for line in self.read().splitlines()[1:]:
+            self.assertTrue(line.startswith('        '), line)
+
+    def test_the_stock_file_is_backed_up(self):
+        self.write(['a=1', self.STOCK])
+        T.apply_keysound_patch(self.root)
+        backup = os.path.join(self.root, T.KEYSOUND_BACKUP)
+        self.assertTrue(os.path.isfile(backup))
+        with io.open(backup, encoding='utf-8') as handle:
+            self.assertIn(T.KEYSOUND_STOCK_MARK, handle.read())
+
+    def test_an_existing_backup_is_never_overwritten(self):
+        """備份裡放的是**原版**，覆蓋掉就還原不了了。"""
+        backup = os.path.join(self.root, T.KEYSOUND_BACKUP)
+        os.makedirs(os.path.dirname(backup), exist_ok=True)
+        with io.open(backup, 'w', encoding='utf-8') as handle:
+            handle.write('# 很久以前的原版')
+        self.write(['a=1', self.STOCK])
+        T.apply_keysound_patch(self.root)
+        with io.open(backup, encoding='utf-8') as handle:
+            self.assertEqual(handle.read(), '# 很久以前的原版')
+
+    def test_running_it_twice_changes_nothing(self):
+        self.write(['a=1', self.STOCK])
+        T.apply_keysound_patch(self.root)
+        once = self.read()
+        T.apply_keysound_patch(self.root)
+        self.assertEqual(self.read(), once)
+
+    def test_it_refuses_when_the_line_is_not_there(self):
+        self.write(['print(1)', 'print(2)'])
+        with self.assertRaises(T.HiraethError):
+            T.apply_keysound_patch(self.root)
+
+    def test_it_refuses_when_there_are_two_candidates(self):
+        """兩處都像的時候不要猜。"""
+        self.write(['a=1', self.STOCK, 'b=2', self.STOCK])
+        with self.assertRaises(T.HiraethError):
+            T.apply_keysound_patch(self.root)
+
+    def test_a_refusal_leaves_the_file_alone(self):
+        self.write(['print(1)', 'print(2)'])
+        before = self.read()
+        with self.assertRaises(T.HiraethError):
+            T.apply_keysound_patch(self.root)
+        self.assertEqual(self.read(), before)
