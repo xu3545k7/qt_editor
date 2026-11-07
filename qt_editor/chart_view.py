@@ -1282,6 +1282,92 @@ class ChartView(QWidget):
             self.model.dirty = was_dirty
         return changed
 
+    #: 疊和聲：'octave' 是把整組原樣複製一個八度，另外兩種是照調性疊和弦音。
+    HARMONY_KINDS = ('octave', 'triad', 'seventh')
+
+    def harmony_group(self) -> List[GNote]:
+        """要疊和聲的那一組：選取裡**最早那一刻**的音符。
+
+        使用者指定「只對同一刻的那一組」。選取跨好幾刻時取最早的那一組，
+        不是每一顆各自加——後者會把一整段旋律變成一整段和弦，那是另一回事。
+        """
+        sel = [n for n in self.model.notes_tree
+               if n.idx in self.selected and n.pitch is not None]
+        if not sel:
+            return []
+        when = min(int(n.start) for n in sel)
+        return [n for n in sel if int(n.start) == when]
+
+    def add_harmony_to_selection(self, anchor: str, kind: str,
+                                 push: bool = True) -> int:
+        """疊和聲。回傳加了幾顆。
+
+        `anchor='low'`  「以此為最低音」——往**高音**側加，原本的音留在原位。
+        `anchor='high'` 「以此為冠音」——往**低音**側加，原本的音是最高的那顆。
+
+        `kind='octave'` 把**整組**原樣複製一個八度（「複製同樣音符編排但是高或
+        低八度」）；`'triad'` / `'seventh'` 則以那一側的極端音當根音／冠音，
+        照譜面調性疊 1-3-5[-7]（走 `build_arpeggio`，大調得大三和弦、小調得
+        小三和弦，不用另外指定品質）。
+
+        加完照 `pack_chord_lanes` 的規則重排鍵道：2 顆隔 1 格、3 顆緊密、
+        4 顆以上收成寬度 2 緊密。
+        """
+        if self.alloc_active or anchor not in ('low', 'high'):
+            return 0
+        if kind not in self.HARMONY_KINDS:
+            return 0
+        group = self.harmony_group()
+        if not group:
+            return 0
+
+        direction = 1 if anchor == 'low' else -1
+        if kind == 'octave':
+            sources = list(group)
+            offsets = [12 * direction] * len(sources)
+        else:
+            edge = (min(group, key=lambda n: int(n.pitch)) if anchor == 'low'
+                    else max(group, key=lambda n: int(n.pitch)))
+            key = self._active_key()
+            if key is None:
+                self.status_changed.emit(
+                    '這份譜推不出調性（沒有音高資料），疊不了和弦')
+                return 0
+            from .music_theory import build_arpeggio
+
+            count = 4 if kind == 'seventh' else 3
+            tones = build_arpeggio(key, int(edge.pitch), count, direction,
+                                   seventh=(kind == 'seventh'))
+            # build_arpeggio 的第一顆就是根音／冠音本身，那顆已經在譜上了
+            sources = [edge] * (len(tones) - 1)
+            offsets = [int(p) - int(edge.pitch) for p in tones[1:]]
+
+        base = len(self.model.notes_tree)
+        added: List[GNote] = []
+        for source, offset in zip(sources, offsets):
+            pitch = int(source.pitch) + offset
+            if not PITCH_MIDI_MIN <= pitch <= PITCH_MIDI_MAX:
+                continue
+            clone = source.clone(base + len(added))
+            clone.pitch = pitch
+            added.append(clone)
+        if not added:
+            self.status_changed.emit('加上去會超出鋼琴音域，沒有變更')
+            return 0
+
+        was_dirty = self.model.dirty
+        if push:
+            self.model.push_history()
+        self.model.notes_tree.extend(added)
+        self.model.pack_chord_lanes(group + added, anchor)
+        self.model.rebuild_display_cache()
+        self.selected = {n.idx for n in group + added}
+        self.update()
+        self.note_edited.emit()
+        self.selection_changed.emit(len(self.selected))
+        _ = was_dirty
+        return len(added)
+
     def selection_start_groups(self) -> Tuple[int, int]:
         """選取裡有幾組「同 start 且不只一顆」，以及那些組共幾顆。
 
@@ -7093,8 +7179,64 @@ class ChartView(QWidget):
         self.note_edited.emit()
         self.status_changed.emit('已拆出 %d 顆隱藏音符' % len(picked))
 
+    def _ctx_build_pitch_menu(self, menu, has_sel: bool) -> None:
+        """音高：整體偏移，以及以選取當最低音／冠音疊上去。
+
+        偏移本來只在「編輯」選單裡（使用者：「音高偏移按鈕右鍵也要放」）。
+
+        疊和聲的兩側語意相反：**以此為最低音**＝往高音側加、原本的音留在原位；
+        **以此為冠音**＝往低音側加、原本那顆是最高的。加完照
+        `pack_chord_lanes` 重排（2 顆隔 1 格、3 顆緊密、4 顆以上寬度 2 緊密）。
+        """
+        group = self.harmony_group() if has_sel else []
+        count = len(group)
+
+        for label, delta in (('＋1 半音', 1), ('－1 半音', -1),
+                             ('＋八度', 12), ('－八度', -12)):
+            a = menu.addAction(label)
+            a.setEnabled(has_sel)
+            a.triggered.connect(
+                lambda checked=False, _d=delta:
+                self.shift_selected_pitch(_d, sync_keys=True))
+        a = menu.addAction('自訂偏移…')
+        a.setEnabled(has_sel)
+        a.triggered.connect(lambda checked=False: self._ctx_shift_pitch_custom())
+        menu.addSeparator()
+
+        note = (('（選取最早那一刻的 %d 顆）' % count) if count
+                else '（先選音符）')
+        info = menu.addAction('疊和聲 %s' % note)
+        info.setEnabled(False)
+        for anchor, side in (('low', '以此為最低音'), ('high', '以此為冠音')):
+            sub = menu.addMenu(side)
+            sub.setEnabled(bool(count))
+            for kind, label in (('octave', '＋八度（整組複製）'),
+                                ('triad', '＋三和弦（調內 1-3-5）'),
+                                ('seventh', '＋七和弦（調內 1-3-5-7）')):
+                a = sub.addAction(label)
+                a.triggered.connect(
+                    lambda checked=False, _a=anchor, _k=kind:
+                    self._ctx_add_harmony(_a, _k))
+
+    def _ctx_shift_pitch_custom(self) -> None:
+        value, ok = QInputDialog.getInt(
+            self, '音高偏移', '把選取的 %d 顆移動幾個半音：' % len(self.selected),
+            0, -48, 48)
+        if ok and value:
+            self.shift_selected_pitch(value, sync_keys=True)
+
+    def _ctx_add_harmony(self, anchor: str, kind: str) -> None:
+        added = self.add_harmony_to_selection(anchor, kind)
+        if not added:
+            return
+        side = '最低音' if anchor == 'low' else '冠音'
+        what = {'octave': '八度', 'triad': '三和弦',
+                'seventh': '七和弦'}.get(kind, kind)
+        self.status_changed.emit('以選取為%s疊了%s：加了 %d 顆'
+                                 % (side, what, added))
+
     def _ctx_build_note_menu(self, menu, has_sel: bool) -> None:
-        """音符屬性：類型 / 左右手 / 寬度 / 遊戲譜面隱藏。"""
+        """音符屬性：類型 / 左右手 / 寬度 / 音高 / 遊戲譜面隱藏。"""
         sel = [n for n in self.model.notes if n.idx in self.selected]
         all_hidden = bool(sel) and all(bool(getattr(n, 'hidden', False)) for n in sel)
         a = menu.addAction('取消遊戲譜面隱藏' if all_hidden else '遊戲譜面隱藏 NOTE')
@@ -7121,6 +7263,8 @@ class ChartView(QWidget):
             a.setEnabled(has_sel and allowed)
             a.triggered.connect(
                 lambda checked=False, _t=ntype: self.set_type_selected(_t))
+
+        self._ctx_build_pitch_menu(menu.addMenu('音高'), has_sel)
 
         trim_act = menu.addAction('裁掉殘響（淺色那段）')
         trim_act.setToolTip('把選取的長音裁到「猜測放開的那一刻」。可以復原。')

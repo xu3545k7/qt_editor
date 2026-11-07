@@ -2449,6 +2449,58 @@ class NoteModel:
             changed += 1
         return changed
 
+    #: 疊和聲時，一組同時發聲的音符照這個規則排鍵道（使用者指定）：
+    #: 2 顆隔開 1 格、3 顆緊密排、4 顆以上全部收成寬度 2 再緊密排。
+    CHORD_PACK_GAP = 1
+    CHORD_PACK_DENSE_FROM = 4
+    CHORD_PACK_DENSE_WIDTH = 2
+
+    @classmethod
+    def pack_chord_lanes(cls, notes: List[GNote], anchor: str = 'low',
+                         total_lanes: int = TOTAL_GAME_KEYS) -> int:
+        """把同一刻的一組音符照音高排成一疊，回傳實際動到幾顆。
+
+        規則是使用者定的：
+
+            2 顆      維持原寬度，中間隔開 1 格
+            3 顆      維持原寬度，緊密相接
+            4 顆以上  全部收成寬度 2，緊密相接
+
+        `anchor='low'` 表示最低音留在原位、其餘往高音側疊（「以此為最低音」）；
+        `'high'` 則是最高音的**右緣**不動、其餘往低音側疊（「以此為冠音」）。
+        右緣是排序權威，所以冠音那一側要釘右緣而不是左緣。
+
+        排不下（撞到鍵盤邊緣）時整疊往內推，推不動就維持原樣、回傳 0。
+        """
+        if len(notes) < 2:
+            return 0
+        ordered = sorted(notes, key=lambda n: (int(n.pitch or 0), int(n.min_key)))
+        count = len(ordered)
+        if count >= cls.CHORD_PACK_DENSE_FROM:
+            widths = [cls.CHORD_PACK_DENSE_WIDTH] * count
+        else:
+            widths = [max(1, int(n.max_key) - int(n.min_key) + 1) for n in ordered]
+        gap = cls.CHORD_PACK_GAP if count == 2 else 0
+        span = sum(widths) + gap * (count - 1)
+        if span > total_lanes:
+            return 0
+
+        if anchor == 'high':
+            start = int(ordered[-1].max_key) - span + 1
+        else:
+            start = int(ordered[0].min_key)
+        start = max(0, min(total_lanes - span, start))
+
+        changed = 0
+        lane = start
+        for note, width in zip(ordered, widths):
+            lo, hi = lane, lane + width - 1
+            if (int(note.min_key), int(note.max_key)) != (lo, hi):
+                note.min_key, note.max_key = lo, hi
+                changed += 1
+            lane = hi + 1 + gap
+        return changed
+
     @staticmethod
     def align_ends_within_start_groups(notes: List[GNote], pick: str) -> int:
         """**同 start 的音符各自一組**，尾端對齊到那一組的最晚／最早。
