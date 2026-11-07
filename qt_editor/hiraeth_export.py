@@ -55,6 +55,12 @@ HIRAETH_NOTE_TYPES = (0, 2, 4, 64)
 AUDIO_RATES = (16000, 22050, 44100, 48000)
 MAX_WAV_BYTES = 128 * 1024 * 1024
 MAX_PACKAGE_BYTES = 300 * 1024 * 1024
+#: 以下三個是照 Hiraeth importer 的 `unpack` / `audio` / `validate_chart`
+#: 抄下來的硬上限。我們產出時本來就符合，驗在這裡是為了「改了輸出流程不會
+#: 無聲壞掉」——不然第一個發現的人是使用者，看到的還是英文的 ValueError。
+MAX_PACKAGE_FILES = 32
+MAX_CHART_BYTES = 16 * 1024 * 1024
+MAX_PREVIEW_SECONDS = 30
 PACKAGE_FILES = {'song.json', 'music.wav', 'preview.wav', 'cover.png',
                  'normal.xml', 'hard.xml', 'expert.xml', 'real.xml'}
 SKIP_DIFFICULTIES = {'test'}
@@ -938,6 +944,45 @@ def validate_package(folder: str, keysound: bool = False) -> List[str]:
         return problems
     if sum(os.path.getsize(os.path.join(folder, n)) for n in names) > MAX_PACKAGE_BYTES:
         problems.append(tr('整包超過 300MB'))
+    # 以下幾條是照 Hiraeth importer 逐條補的。我們**產出**時本來就符合（WAV
+    # 是自己寫的），補在這裡是為了「哪天改了輸出流程不會無聲壞掉」——不然
+    # 第一個發現的人會是使用者，而且看到的是英文的 ValueError。
+    if len(names) > MAX_PACKAGE_FILES:
+        problems.append(tr('包裡有 %d 個檔案，超過 %d 個')
+                        % (len(names), MAX_PACKAGE_FILES))
+    for name in sorted(names):
+        path = os.path.join(folder, name)
+        size = os.path.getsize(path)
+        if name.lower().endswith('.wav'):
+            if size > MAX_WAV_BYTES:
+                problems.append(tr('%s 超過 128MB') % name)
+                continue
+            try:
+                with wave.open(path, 'rb') as handle:
+                    if (handle.getcomptype() != 'NONE'
+                            or handle.getnchannels() != 2
+                            or handle.getsampwidth() != 2
+                            or handle.getframerate() not in AUDIO_RATES):
+                        problems.append(tr('%s 要是 PCM16 立體聲、取樣率 %s')
+                                        % (name, '/'.join(map(str, AUDIO_RATES))))
+                        continue
+                    rate = handle.getframerate()
+                    frames = handle.getnframes()
+                # importer 讀完 PCM 之後要求長度能被 4 整除（16bit × 2 聲道）
+                if not frames:
+                    problems.append(tr('%s 沒有聲音資料') % name)
+                elif name.lower() == 'preview.wav' and frames / float(rate) > MAX_PREVIEW_SECONDS:
+                    problems.append(tr('preview.wav 超過 %d 秒') % MAX_PREVIEW_SECONDS)
+            except (wave.Error, OSError) as exc:
+                problems.append(tr('%s 讀不了：%s') % (name, exc))
+        elif name.lower().endswith('.xml'):
+            if size > MAX_CHART_BYTES:
+                problems.append(tr('%s 超過 16MB') % name)
+            else:
+                with open(path, 'rb') as handle:
+                    head = handle.read(4096).upper()
+                if b'<!DOCTYPE' in head or b'<!ENTITY' in head:
+                    problems.append(tr('%s 含 DOCTYPE/ENTITY，importer 不收') % name)
     with open(os.path.join(folder, 'song.json'), encoding='utf-8-sig') as fh:
         spec = json.load(fh)
     if spec.get('format') != 1 or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{2,79}', spec.get('package_id', '')):

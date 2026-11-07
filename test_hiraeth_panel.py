@@ -480,3 +480,41 @@ class OverwriteSafetyTests(OverwriteTests):
         self.assertIn('Alpha', folders, '挖檔失敗時原本那首不能先被丟掉')
         self.assertIn('Beta', folders)
         self.assertEqual(summary['deleted'], [], '有失敗就不刪多出來的')
+
+
+class ImporterPatchDetectionTests(unittest.TestCase):
+    """勾了按鍵音，就要先確認那份 Hiraeth 的 importer 收不收。
+
+    原版 importer 第 74 行硬擋 `velocity != 0`。我們為了真按鍵音改過它，但
+    **Hiraeth 一更新就會蓋回去**——到時候匯入失敗、訊息還是英文的
+    `This package format requires background-only charts`，看起來像製譜器
+    產的包壞了。先講比事後查快得多。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.root, 'tools', 'import_tools'))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def write(self, line):
+        path = os.path.join(self.root, T.IMPORTER)
+        with io.open(path, 'w', encoding='utf-8') as handle:
+            handle.write(chr(10).join(('x=1', line, 'y=2', '')))
+
+    def test_the_patched_importer_is_recognised(self):
+        self.write("if not 0<=velocity<=127:raise ValueError('bad')")
+        self.assertIs(T.importer_accepts_keysound(self.root), True)
+
+    def test_the_stock_importer_is_recognised(self):
+        self.write("if int(n.findtext('velocity','-1'))!=0:raise ValueError('x')")
+        self.assertIs(T.importer_accepts_keysound(self.root), False)
+
+    def test_a_missing_importer_is_unknown_not_a_crash(self):
+        """讀不到要回 None，不是 False——「不知道」和「確定不收」要分開。"""
+        self.assertIsNone(T.importer_accepts_keysound(self.root))
+        self.assertIsNone(T.importer_accepts_keysound('D:/definitely/not/here'))
+
+    def test_an_empty_root_is_unknown(self):
+        self.assertIsNone(T.importer_accepts_keysound(''))

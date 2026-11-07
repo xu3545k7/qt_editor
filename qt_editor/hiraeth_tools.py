@@ -12,6 +12,7 @@ Hiraeth 的管理器本體是 `tools/manager_backend.py`，它吃一個 JSON 工
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -29,8 +30,33 @@ GAME_PROCESSES = ('spice64.exe', 'spice.exe')
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
+#: 真按鍵音要靠改過的 importer：原版第 74 行硬擋 `velocity != 0`，
+#: 會把我們保留了力度的包退件（訊息是英文的
+#: `This package format requires background-only charts`）。
+IMPORTER = os.path.join('tools', 'import_tools', 'importer.py')
+KEYSOUND_PATCH = '0<=velocity<=127'
+
+
 class HiraethError(Exception):
     pass
+
+
+def importer_accepts_keysound(root: str) -> Optional[bool]:
+    """這份安裝的 importer 收不收帶按鍵音的包？讀不到檔案回 None。
+
+    **Hiraeth 一更新就會把我們的修改蓋回去**，然後勾了「保留按鍵音」匯出的
+    包會被退件，看起來像我們的包壞了。所以匯出前先問一下。
+
+    備份在 `tools/backup_before_keysound/importer.py`（當初為顫音改它時也是
+    同一個作法，見 `backup_before_trill`）。
+    """
+    path = os.path.join(root or '', IMPORTER)
+    try:
+        with io.open(path, encoding='utf-8', errors='replace') as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    return KEYSOUND_PATCH in text
 
 
 def is_root(path: str) -> bool:

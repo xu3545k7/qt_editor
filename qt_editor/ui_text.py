@@ -515,6 +515,26 @@ _TABLE = {
         ('等级被 Hiraeth 的刻度压掉：%s。REAL 只有 1／2／2.5／3／3.5，normal/hard/EX 只收 1~15。',
          "Levels flattened by Hiraeth's scale: %s. REAL has only "
          '1/2/2.5/3/3.5, and normal/hard/EX accept 1-15 only.'),
+    '這份 Hiraeth 的 importer 是原版，會把帶按鍵音的包退件。要用這個模式得先改 tools/import_tools/importer.py。':
+        ('这份 Hiraeth 的 importer 是原版，会把带按键音的包退件。要用这个模式得先改 tools/import_tools/importer.py。',
+         "This Hiraeth install has the stock importer; it rejects packages "
+         'that keep key sounds. Patch tools/import_tools/importer.py first.'),
+    '找不到 Hiraeth 的 importer，沒辦法先確認它收不收按鍵音。':
+        ('找不到 Hiraeth 的 importer，没办法先确认它收不收按键音。',
+         'Cannot find the Hiraeth importer, so key-sound support could not '
+         'be checked up front.'),
+    '%s 要是 PCM16 立體聲、取樣率 %s': ('%s 要是 PCM16 立体声、采样率 %s',
+         '%s must be PCM16 stereo at %s Hz'),
+    '%s 超過 128MB': ('%s 超过 128MB', '%s is over 128MB'),
+    '%s 超過 16MB': ('%s 超过 16MB', '%s is over 16MB'),
+    '%s 沒有聲音資料': ('%s 没有声音数据', '%s has no audio data'),
+    '%s 讀不了：%s': ('%s 读不了：%s', 'Cannot read %s: %s'),
+    'preview.wav 超過 %d 秒': ('preview.wav 超过 %d 秒',
+         'preview.wav is longer than %d seconds'),
+    '%s 含 DOCTYPE/ENTITY，importer 不收': ('%s 含 DOCTYPE/ENTITY，importer 不收',
+         '%s contains DOCTYPE/ENTITY, which the importer rejects'),
+    '包裡有 %d 個檔案，超過 %d 個': ('包里有 %d 个文件，超过 %d 个',
+         'The package has %d files, over the %d limit'),
     'ZIP 打不開：%s': ('ZIP 打不开：%s',
          'Cannot open the ZIP: %s'),
     '%s：找不到譜面檔': ('%s：找不到谱面文件',

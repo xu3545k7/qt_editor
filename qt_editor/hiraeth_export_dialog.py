@@ -151,8 +151,17 @@ class HiraethExportDialog(QDialog):
             '沒有背景音樂的曲子 music.wav 直接是靜音。'))
         self.keysound_check.toggled.connect(
             lambda on: self.mix_check.setEnabled(not on))
+        self.keysound_check.toggled.connect(
+            lambda _on: self._update_keysound_warning())
         self.mix_check.setEnabled(not self.keysound_check.isChecked())
         options.addRow('', self.keysound_check)
+        # Hiraeth 一更新就會把我們改過的 importer 蓋回去，然後這個模式匯出的
+        # 包會被退件——而錯誤訊息是英文的，看起來像我們的包壞了。所以在**勾的
+        # 當下**就去讀那份 importer，不要等到匯入失敗。
+        self.keysound_warn = QLabel('')
+        self.keysound_warn.setWordWrap(True)
+        self.keysound_warn.setStyleSheet('color: #c08040; font-size: 11px;')
+        options.addRow('', self.keysound_warn)
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(H.MIN_HOLD_GAP_MS, 1000)
         self.gap_spin.setSuffix(' ms')
@@ -285,6 +294,29 @@ class HiraethExportDialog(QDialog):
             return
         self._slogan_loaded_from = song_dir
         self.slogan_edit.setText(H.read_slogan(song_dir))
+
+    def _update_keysound_warning(self) -> None:
+        """勾了按鍵音就去看那份 Hiraeth 的 importer 收不收。
+
+        原版第 74 行硬擋 `velocity != 0`。我們為了真按鍵音改過它，但**Hiraeth
+        一更新就會蓋回去**——到時候匯入會失敗、訊息還是英文的，看起來像我們
+        產的包壞了。所以在這裡先講。
+        """
+        if not self.keysound_check.isChecked():
+            self.keysound_warn.setText('')
+            return
+        from . import hiraeth_tools as T
+        root = T.saved_root()
+        state = T.importer_accepts_keysound(root) if root else None
+        if state is True:
+            self.keysound_warn.setText('')
+        elif state is False:
+            self.keysound_warn.setText(tr(
+                '這份 Hiraeth 的 importer 是原版，會把帶按鍵音的包退件。'
+                '要用這個模式得先改 tools/import_tools/importer.py。'))
+        else:
+            self.keysound_warn.setText(tr(
+                '找不到 Hiraeth 的 importer，沒辦法先確認它收不收按鍵音。'))
 
     def _update_layout_label(self) -> None:
         '''把「這次會輸出成幾包、哪個難度對到哪一格」寫出來。
