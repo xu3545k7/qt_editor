@@ -400,19 +400,36 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
         self.assertFalse(any('拖曳小節線' in x for x in self.labels('編輯')),
                          '編輯分頁還留著一顆')
 
-    def test_the_measure_view_mode_moved_here(self):
-        """它不只是檢視——改 BPM／拍號時小節內拍點怎麼重排是看它決定的。"""
+    def test_the_measure_view_mode_is_here_too(self):
+        """它不只是檢視——改 BPM／拍號時小節內拍點怎麼重排是看它決定的。
+
+        後來使用者又要求「檢視也要可以切」，所以檢視分頁上另有直接選的三顆
+        （見 `test_view_mode_switch`）。兩邊共用同一個狀態，這裡只確認小節
+        分頁上那顆循環鈕還在。
+        """
         self.assertTrue(any('小節均分' in x for x in self.labels('小節')))
-        self.assertFalse(any('小節均分' in x for x in self.labels('檢視')),
-                         '檢視分頁還留著一顆')
+
+    def test_the_view_tab_only_has_the_mode_picker(self):
+        """檢視分頁上帶「小節」兩個字的，只能是那三顆檢視模式。"""
+        modes = {i18n.t(key) for _m, key, _tip in self.win.VIEW_MODES}
+        stray = [x for x in self.labels('檢視')
+                 if '小節' in x and x not in modes]
+        self.assertEqual(stray, [], '檢視分頁混進了小節功能')
 
     def test_the_regenerate_entry_is_here(self):
         self.assertTrue(any('重生小節線' in x for x in self.labels('小節')))
 
     def test_nothing_measure_ish_is_left_on_other_tabs(self):
-        """常用分頁是鏡像，不算「散在各處」——它的每一項在別的分頁都有家。"""
+        """常用分頁是鏡像，不算「散在各處」——它的每一項在別的分頁都有家。
+
+        檢視模式那三顆是使用者後來指定要放在檢視的（「檢視也要可以切小節
+        均分和時間均分以及音高模式」），不算散落。
+        """
+        allowed = {i18n.t(key) for _m, key, _tip in self.win.VIEW_MODES}
         for other in ('編輯', '播放', '檢視'):
             for label in self.labels(other):
+                if label in allowed:
+                    continue
                 self.assertNotIn('小節', label,
                                  '「%s」留在「%s」分頁' % (label, other))
 

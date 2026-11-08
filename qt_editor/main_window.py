@@ -29,7 +29,7 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 import logging
 from PyQt5.QtGui import QKeySequence, QCloseEvent
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
+    QAction, QActionGroup, QApplication, QComboBox, QFileDialog, QFrame, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMenuBar, QMessageBox,
     QScrollArea, QSizePolicy, QSlider, QSplitter, QStatusBar, QTabWidget, QToolBar,
     QToolButton, QVBoxLayout, QWidget,
@@ -246,7 +246,10 @@ class ToolbarSet:
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
+        #: 小節分頁上那顆循環鈕（文字會跟著目前模式換）
         self.view_mode_act: Optional[QAction] = None
+        #: 檢視分頁上直接選的三顆：模式字串 → QAction，互斥
+        self.view_mode_acts: Dict[str, QAction] = {}
         self.game_preview_act: Optional[QAction] = None
         # 音量列：key -> {'label','slider','action','text'}
         self.vol: Dict[str, Dict[str, Any]] = {}
@@ -1365,6 +1368,17 @@ class MainWindow(QMainWindow):
 
         # 檢視
         view_m = mb.addMenu(t('menu_view'))
+        # 檢視模式放最上面：它決定橫軸怎麼排，其他檢視設定都在它之下
+        mode_m = view_m.addMenu(t('menu_view_mode'))
+        self._view_mode_menu_acts: Dict[str, QAction] = {}
+        for mode, label_key, tip_key in self.VIEW_MODES:
+            act = QAction(t(label_key), self, checkable=True)
+            act.setToolTip(t(tip_key))
+            act.toggled.connect(
+                lambda checked, m=mode: self._on_view_mode_picked(m, checked))
+            mode_m.addAction(act)
+            self._view_mode_menu_acts[mode] = act
+        view_m.addSeparator()
         self._add_action(view_m, t('action_zoom_in'),  lambda: self.view.zoom(0.5), '=')
         self._add_action(view_m, t('action_zoom_out'), lambda: self.view.zoom(2.0), '-')
         view_m.addSeparator()
@@ -2401,14 +2415,71 @@ class MainWindow(QMainWindow):
         return self._tab_page([
             split_block,
             None,
+            self._build_view_mode_block(tbs),
+            None,
             self._tab_button(act_zoom_out),
             self._tab_button(act_zoom_in),
             None,
             self._tab_button(tbs.preview_act),
-            # 小節均分模式搬到「小節」分頁了——它不只是檢視，改 BPM／拍號時
-            # 小節內的拍點怎麼重排是看它決定的。
             self._tab_button(tbs.game_preview_act),
         ])
+
+    #: 檢視模式：(模式字串, 標籤的 i18n key, 提示的 i18n key)
+    VIEW_MODES = (
+        ('measure', 'tb_view_mode_measure', 'tb_view_mode_measure_tip'),
+        ('time',    'tb_view_mode_time',    'tb_view_mode_time_tip'),
+        ('pitch',   'tb_view_mode_pitch',   'tb_view_mode_pitch_tip'),
+    )
+
+    def _build_view_mode_block(self, tbs: ToolbarSet) -> QWidget:
+        """檢視模式：三顆互斥的按鈕，看一眼就知道現在是哪一個。
+
+        使用者：「檢視也要可以切小節均分和時間均分以及音高模式」。
+
+        小節分頁上那顆循環鈕留著不動——它在那裡是因為這個模式不只是檢視，
+        `set_measure_bpm` 和 `set_measure_time_signature` 都吃它來決定小節內
+        的拍點怎麼重排，改 BPM 的人需要順手看到。但「現在是哪個模式」本身
+        是檢視的事，而循環鈕要按兩下才到得了第三個模式、也看不出有幾個模式；
+        所以這裡攤開成三顆，兩邊共用同一個狀態（`_refresh_view_mode_action`
+        會把每條工具列刷成它那一格的模式）。
+        """
+        # 不用 QActionGroup：它靠 changed() 訊號維護「現在是哪一顆」，而同步
+        # 顯示時必須 blockSignals（不然會再觸發一次切換），群組的狀態就會和
+        # 畫面脫鉤、出現兩顆同時亮著。互斥改成 `_check_only` 自己保證。
+        tbs.view_mode_acts = {}
+        for mode, label_key, tip_key in self.VIEW_MODES:
+            tbs.view_mode_acts[mode] = self._tab_action(
+                tbs, t(label_key),
+                lambda checked, m=mode: self._on_view_mode_picked(m, checked),
+                tip=t(tip_key), checkable=True, keys=())
+
+        block = QWidget()
+        hbox = QHBoxLayout(block)
+        hbox.setContentsMargins(0, 0, 0, 0)
+        hbox.setSpacing(2)
+        caption = QLabel(t('tb_view_mode_label'))
+        caption.setStyleSheet('color: palette(mid); margin-right: 2px;')
+        hbox.addWidget(caption)
+        for mode, _label_key, _tip_key in self.VIEW_MODES:
+            hbox.addWidget(self._tab_button(tbs.view_mode_acts[mode]))
+        self._refresh_view_mode_action()
+        return block
+
+    def _on_view_mode_picked(self, mode: str, checked: bool) -> None:
+        """選了一個檢視模式（檢視分頁的三顆、或選單的三項）。
+
+        每一條出口都要重畫勾選：互斥是自己維護的，而且點到已經亮著的那顆會
+        把它關掉（QAction 本來就是開關），不拉回來的話三顆會同時暗掉。
+        """
+        if not checked or mode == self.view.view_mode:
+            self._refresh_view_mode_action()
+            return
+        # 離開音高檢視前要先確認譜面排過（和循環鈕同一個守門）
+        if mode != 'pitch' and not self._require_arranged_for_view():
+            self._refresh_view_mode_action()
+            return
+        self.view.set_view_mode(mode)
+        self._refresh_view_mode_action()
 
     def _build_split_block(self, tbs: ToolbarSet) -> QWidget:
         """分割模式：開關 + 版面循環 + 紅藍作用格選擇，下面一行放提示文字。
@@ -5646,17 +5717,36 @@ class MainWindow(QMainWindow):
         self._refresh_view_mode_action()
 
     def _refresh_view_mode_action(self) -> None:
-        """檢視模式按鈕的文字：每條工具列各自顯示「自己那一格」的模式。"""
+        """檢視模式的顯示：每條工具列各自顯示「自己那一格」的模式。
+
+        三個地方要同一個答案：小節分頁的循環鈕（換文字）、檢視分頁的三顆
+        （換勾選）、選單的檢視模式（換勾選）。選單只有一份，照作用格走。
+        """
         for tbs in self._toolbars:
+            mode = getattr(self._pane_of(tbs), 'view_mode', 'measure')
             act = tbs.view_mode_act
+            if act is not None:
+                self._set_labeled_text(act, t({
+                    'measure': 'tb_time_uniform_measure',
+                    'time': 'tb_time_uniform_time',
+                    'pitch': 'tb_time_uniform_pitch',
+                }.get(mode, 'tb_time_uniform_measure')), t('tb_time_uniform_tip'))
+            self._check_only(tbs.view_mode_acts, mode)
+            # 「常用」那一頁上的鏡像（按得夠多次就會自己長出來）也要跟著亮
+            self._check_only({m: (tbs.common_acts or {}).get(t(key))
+                              for m, key, _tip in self.VIEW_MODES}, mode)
+        self._check_only(getattr(self, '_view_mode_menu_acts', None),
+                         getattr(self.view, 'view_mode', 'measure'))
+
+    @staticmethod
+    def _check_only(acts, mode: str) -> None:
+        """一組互斥動作裡只勾 `mode` 那一顆，而且不要觸發它的 slot。"""
+        for key, act in (acts or {}).items():
             if act is None:
                 continue
-            mode = getattr(self._pane_of(tbs), 'view_mode', 'measure')
-            self._set_labeled_text(act, t({
-                'measure': 'tb_time_uniform_measure',
-                'time': 'tb_time_uniform_time',
-                'pitch': 'tb_time_uniform_pitch',
-            }.get(mode, 'tb_time_uniform_measure')), t('tb_time_uniform_tip'))
+            act.blockSignals(True)
+            act.setChecked(key == mode)
+            act.blockSignals(False)
 
     def _set_pause_text(self, key: str) -> None:
         """暫停／繼續按鈕的文字（兩條工具列都要跟著換）。"""
