@@ -363,6 +363,14 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
             return out
         self.fail('沒有「%s」分頁' % title)
 
+    def is_view_mode(self, label):
+        """這個標籤是檢視模式那顆下拉、或它選單裡的一項嗎？
+
+        按鈕上是目前模式加一個 ▾，選單項則是純標籤，所以用包含判斷。
+        """
+        return any(i18n.t(key) in label
+                   for _m, key, _tip in self.win.VIEW_MODES)
+
     def visible_controls(self, title):
         from PyQt5.QtWidgets import QToolButton
         tabs = self.win._toolbars[0].tabs
@@ -410,10 +418,9 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
         self.assertTrue(any('小節均分' in x for x in self.labels('小節')))
 
     def test_the_view_tab_only_has_the_mode_picker(self):
-        """檢視分頁上帶「小節」兩個字的，只能是那三顆檢視模式。"""
-        modes = {i18n.t(key) for _m, key, _tip in self.win.VIEW_MODES}
+        """檢視分頁上帶「小節」兩個字的，只能是檢視模式那顆下拉與它的選項。"""
         stray = [x for x in self.labels('檢視')
-                 if '小節' in x and x not in modes]
+                 if '小節' in x and not self.is_view_mode(x)]
         self.assertEqual(stray, [], '檢視分頁混進了小節功能')
 
     def test_the_regenerate_entry_is_here(self):
@@ -425,10 +432,9 @@ class MeasureTabIsConsolidatedTests(unittest.TestCase):
         檢視模式那三顆是使用者後來指定要放在檢視的（「檢視也要可以切小節
         均分和時間均分以及音高模式」），不算散落。
         """
-        allowed = {i18n.t(key) for _m, key, _tip in self.win.VIEW_MODES}
         for other in ('編輯', '播放', '檢視'):
             for label in self.labels(other):
-                if label in allowed:
+                if self.is_view_mode(label):
                     continue
                 self.assertNotIn('小節', label,
                                  '「%s」留在「%s」分頁' % (label, other))

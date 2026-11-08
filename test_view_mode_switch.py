@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""檢視分頁上的三顆檢視模式按鈕。
+"""檢視分頁上的檢視模式下拉。
 
-使用者：「檢視也要可以切小節均分和時間均分以及音高模式」。
+使用者：「檢視也要可以切小節均分和時間均分以及音高模式」，接著
+「依次顯示一種，用下拉選單選就好」。
 
 小節分頁上原本就有一顆循環鈕（因為這個模式也決定改 BPM／拍號時小節內的
-拍點怎麼重排），但它要按兩下才到得了第三個模式、而且看不出總共有幾個。
-現在檢視分頁、檢視選單各有一組直接選的，三邊共用同一個狀態。
+拍點怎麼重排），但它要按兩下才到得了第三個模式。現在檢視分頁有一顆顯示
+目前模式的下拉、檢視選單也有一組，三邊共用同一個狀態。
 """
 
 import contextlib
@@ -77,21 +78,38 @@ class SwitchTests(unittest.TestCase):
             for act in tbs.view_mode_acts.values():
                 self.assertTrue(act.isCheckable(), '要看得出現在是哪一個')
 
-    def test_they_sit_on_the_view_tab(self):
-        """不是只有建出來——要真的在檢視那一頁上。"""
+    def view_page(self):
         tbs = self.tbs()
-        page = None
         for i in range(tbs.tabs.count()):
             if tbs.tabs.tabText(i) == i18n.t('tb_tab_view'):
-                page = tbs.tabs.widget(i)
-        self.assertIsNotNone(page, '找不到檢視分頁')
-        on_page = {b.defaultAction() for b in page.findChildren(QToolButton)}
+                return tbs.tabs.widget(i)
+        self.fail('找不到檢視分頁')
+
+    def test_the_picker_sits_on_the_view_tab(self):
+        """不是只有建出來——要真的在檢視那一頁上。"""
+        btn = self.tbs().view_mode_btn
+        self.assertIn(btn, self.view_page().findChildren(QToolButton))
+
+    def test_it_is_one_dropdown_not_three_buttons(self):
+        """使用者：「依次顯示一種，用下拉選單選就好」。"""
+        tbs = self.tbs()
+        menu = tbs.view_mode_btn.menu()
+        self.assertIsNotNone(menu, '沒有下拉選單')
+        self.assertEqual(list(menu.actions()),
+                         [tbs.view_mode_acts[m] for m in MODES])
+        on_page = {b.defaultAction() for b in self.view_page().findChildren(QToolButton)}
         for mode, act in tbs.view_mode_acts.items():
-            self.assertIn(act, on_page, mode)
+            self.assertNotIn(act, on_page, '%s 又被攤成一顆按鈕了' % mode)
+
+    def test_the_button_shows_the_mode_it_is_in(self):
+        for mode, label_key, _tip in MainWindow.VIEW_MODES:
+            self.tbs().view_mode_acts[mode].trigger()
+            self.assertIn(i18n.t(label_key), self.tbs().view_mode_btn.text())
 
     def test_each_one_explains_itself(self):
         for act in self.tbs().view_mode_acts.values():
             self.assertTrue(act.toolTip(), act.text())
+        self.assertTrue(self.tbs().view_mode_btn.toolTip())
 
     def test_the_view_menu_offers_the_same_three(self):
         self.assertEqual(set(self.win._view_mode_menu_acts), set(MODES))
@@ -108,7 +126,7 @@ class SwitchTests(unittest.TestCase):
             self.assertEqual(self.checked(self.tbs().view_mode_acts), {mode})
 
     def test_clicking_the_lit_one_leaves_it_lit(self):
-        """QAction 本來是開關，點第二下會把自己關掉——那會三顆全暗。"""
+        """QAction 本來是開關，點第二下會把自己關掉——那會變成沒有打勾。"""
         acts = self.tbs().view_mode_acts
         acts['time'].trigger()
         acts['time'].trigger()
@@ -188,13 +206,13 @@ class UnarrangedTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_the_gate_is_the_same_one_as_the_cycle_button(self):
-        names = mw.MainWindow._on_view_mode_picked.__code__.co_names
+        names = mw.MainWindow._pick_view_mode.__code__.co_names
         self.assertIn('_require_arranged_for_view', names)
 
 
 class TranslationTests(unittest.TestCase):
     def test_every_language_has_the_new_labels(self):
-        keys = ('tb_view_mode_label', 'menu_view_mode',
+        keys = ('tb_view_mode_label', 'tb_view_mode_tip', 'menu_view_mode',
                 *(k for _m, k, _tip in MainWindow.VIEW_MODES),
                 *(k for _m, _l, k in MainWindow.VIEW_MODES))
         for lang, table in i18n._STRINGS.items():

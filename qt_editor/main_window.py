@@ -248,7 +248,8 @@ class ToolbarSet:
         self.preview_act: Optional[QAction] = None
         #: 小節分頁上那顆循環鈕（文字會跟著目前模式換）
         self.view_mode_act: Optional[QAction] = None
-        #: 檢視分頁上直接選的三顆：模式字串 → QAction，互斥
+        #: 檢視分頁上那顆下拉按鈕，以及它選單裡的三項（模式字串 → QAction）
+        self.view_mode_btn: Optional[QToolButton] = None
         self.view_mode_acts: Dict[str, QAction] = {}
         self.game_preview_act: Optional[QAction] = None
         # 音量列：key -> {'label','slider','action','text'}
@@ -1374,8 +1375,7 @@ class MainWindow(QMainWindow):
         for mode, label_key, tip_key in self.VIEW_MODES:
             act = QAction(t(label_key), self, checkable=True)
             act.setToolTip(t(tip_key))
-            act.toggled.connect(
-                lambda checked, m=mode: self._on_view_mode_picked(m, checked))
+            act.triggered.connect(lambda _c=False, m=mode: self._pick_view_mode(m))
             mode_m.addAction(act)
             self._view_mode_menu_acts[mode] = act
         view_m.addSeparator()
@@ -2432,26 +2432,36 @@ class MainWindow(QMainWindow):
     )
 
     def _build_view_mode_block(self, tbs: ToolbarSet) -> QWidget:
-        """檢視模式：三顆互斥的按鈕，看一眼就知道現在是哪一個。
+        """檢視模式：一顆下拉按鈕，按鈕上就是現在這一個。
 
-        使用者：「檢視也要可以切小節均分和時間均分以及音高模式」。
+        使用者：「檢視也要可以切小節均分和時間均分以及音高模式」，接著
+        「依次顯示一種，用下拉選單選就好」——所以不是攤成三顆，而是一顆顯示
+        目前模式、點開才看到另外兩個。
 
         小節分頁上那顆循環鈕留著不動——它在那裡是因為這個模式不只是檢視，
         `set_measure_bpm` 和 `set_measure_time_signature` 都吃它來決定小節內
-        的拍點怎麼重排，改 BPM 的人需要順手看到。但「現在是哪個模式」本身
-        是檢視的事，而循環鈕要按兩下才到得了第三個模式、也看不出有幾個模式；
-        所以這裡攤開成三顆，兩邊共用同一個狀態（`_refresh_view_mode_action`
-        會把每條工具列刷成它那一格的模式）。
+        的拍點怎麼重排，改 BPM 的人需要順手看到。兩邊共用同一個狀態
+        （`_refresh_view_mode_action` 會把每條工具列刷成它那一格的模式）。
         """
-        # 不用 QActionGroup：它靠 changed() 訊號維護「現在是哪一顆」，而同步
-        # 顯示時必須 blockSignals（不然會再觸發一次切換），群組的狀態就會和
-        # 畫面脫鉤、出現兩顆同時亮著。互斥改成 `_check_only` 自己保證。
+        btn = QToolButton()
+        btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        btn.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(btn)
         tbs.view_mode_acts = {}
         for mode, label_key, tip_key in self.VIEW_MODES:
-            tbs.view_mode_acts[mode] = self._tab_action(
-                tbs, t(label_key),
-                lambda checked, m=mode: self._on_view_mode_picked(m, checked),
-                tip=t(tip_key), checkable=True, keys=())
+            act = menu.addAction(t(label_key))
+            act.setCheckable(True)          # 打勾的那個＝現在這個
+            act.setToolTip(t(tip_key))
+            slot = (lambda m=mode: self._pick_view_mode(m))
+            self._register_toolbar_item(t(label_key), slot, t(tip_key))
+            act.triggered.connect(self._bind(tbs, slot, forward=False))
+            act.triggered.connect(
+                lambda _c=False, _l=t(label_key): self._count_toolbar_use(_l))
+            tbs.view_mode_acts[mode] = act
+        btn.setMenu(menu)
+        # QToolButton 不持有 menu 的所有權，被 GC 掉按鈕就點不開
+        tbs.tool_menus.append(menu)
+        tbs.view_mode_btn = btn
 
         block = QWidget()
         hbox = QHBoxLayout(block)
@@ -2460,25 +2470,20 @@ class MainWindow(QMainWindow):
         caption = QLabel(t('tb_view_mode_label'))
         caption.setStyleSheet('color: palette(mid); margin-right: 2px;')
         hbox.addWidget(caption)
-        for mode, _label_key, _tip_key in self.VIEW_MODES:
-            hbox.addWidget(self._tab_button(tbs.view_mode_acts[mode]))
+        hbox.addWidget(btn)
         self._refresh_view_mode_action()
         return block
 
-    def _on_view_mode_picked(self, mode: str, checked: bool) -> None:
-        """選了一個檢視模式（檢視分頁的三顆、或選單的三項）。
+    def _pick_view_mode(self, mode: str) -> None:
+        """選了一個檢視模式（檢視分頁的下拉、或檢視選單）。
 
-        每一條出口都要重畫勾選：互斥是自己維護的，而且點到已經亮著的那顆會
-        把它關掉（QAction 本來就是開關），不拉回來的話三顆會同時暗掉。
+        接 `triggered` 而不是 `toggled`：同步打勾時的 `setChecked` 不會發
+        `triggered`，所以不必擔心同步又觸發一次切換。
         """
-        if not checked or mode == self.view.view_mode:
-            self._refresh_view_mode_action()
-            return
-        # 離開音高檢視前要先確認譜面排過（和循環鈕同一個守門）
-        if mode != 'pitch' and not self._require_arranged_for_view():
-            self._refresh_view_mode_action()
-            return
-        self.view.set_view_mode(mode)
+        if mode != self.view.view_mode and (
+                # 離開音高檢視前要先確認譜面排過（和循環鈕同一個守門）
+                mode == 'pitch' or self._require_arranged_for_view()):
+            self.view.set_view_mode(mode)
         self._refresh_view_mode_action()
 
     def _build_split_block(self, tbs: ToolbarSet) -> QWidget:
@@ -5719,9 +5724,11 @@ class MainWindow(QMainWindow):
     def _refresh_view_mode_action(self) -> None:
         """檢視模式的顯示：每條工具列各自顯示「自己那一格」的模式。
 
-        三個地方要同一個答案：小節分頁的循環鈕（換文字）、檢視分頁的三顆
-        （換勾選）、選單的檢視模式（換勾選）。選單只有一份，照作用格走。
+        三個地方要同一個答案：小節分頁的循環鈕（換文字）、檢視分頁的下拉
+        （換按鈕文字＋打勾）、選單的檢視模式（打勾）。選單只有一份，照作用
+        格走。
         """
+        labels = {m: key for m, key, _tip in self.VIEW_MODES}
         for tbs in self._toolbars:
             mode = getattr(self._pane_of(tbs), 'view_mode', 'measure')
             act = tbs.view_mode_act
@@ -5731,10 +5738,11 @@ class MainWindow(QMainWindow):
                     'time': 'tb_time_uniform_time',
                     'pitch': 'tb_time_uniform_pitch',
                 }.get(mode, 'tb_time_uniform_measure')), t('tb_time_uniform_tip'))
+            if tbs.view_mode_btn is not None:
+                tbs.view_mode_btn.setText(
+                    t(labels.get(mode, 'tb_view_mode_measure')) + ' ▾')
+                tbs.view_mode_btn.setToolTip(t('tb_view_mode_tip'))
             self._check_only(tbs.view_mode_acts, mode)
-            # 「常用」那一頁上的鏡像（按得夠多次就會自己長出來）也要跟著亮
-            self._check_only({m: (tbs.common_acts or {}).get(t(key))
-                              for m, key, _tip in self.VIEW_MODES}, mode)
         self._check_only(getattr(self, '_view_mode_menu_acts', None),
                          getattr(self.view, 'view_mode', 'measure'))
 

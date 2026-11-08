@@ -190,6 +190,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'tb_time_uniform_off':      '⏱ 小節均分模式',
         # 檢視分頁上直接選的三顆（和小節分頁那顆循環鈕同一個狀態）
         'tb_view_mode_label':       '檢視模式：',
+        'tb_view_mode_tip':         '橫軸怎麼排：小節均分 / 時間均分 / 音高。點開選一個。',
         'tb_view_mode_measure':     '⏱ 小節均分',
         'tb_view_mode_time':        '⏱ 時間均分',
         'tb_view_mode_pitch':       '🎹 音高',
@@ -575,6 +576,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'tb_time_uniform_on':       '⏱ 时间均分模式',
         'tb_time_uniform_off':      '⏱ 小节均分模式',
         'tb_view_mode_label':       '检视模式：',
+        'tb_view_mode_tip':         '横轴怎么排：小节均分 / 时间均分 / 音高。点开选一个。',
         'tb_view_mode_measure':     '⏱ 小节均分',
         'tb_view_mode_time':        '⏱ 时间均分',
         'tb_view_mode_pitch':       '🎹 音高',
@@ -947,6 +949,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'tb_time_uniform_on':       '⏱ Time Uniform',
         'tb_time_uniform_off':      '⏱ Measure Uniform',
         'tb_view_mode_label':       'View:',
+        'tb_view_mode_tip':         'How the horizontal axis is laid out: measure-uniform / time-uniform / pitch. Open to pick one.',
         'tb_view_mode_measure':     '⏱ Measure',
         'tb_view_mode_time':        '⏱ Time',
         'tb_view_mode_pitch':       '🎹 Pitch',
