@@ -29,6 +29,7 @@ CORE_MODULES = (
     'music_theory',         # 調性、音程
     'json_layout',          # 手改得動的 JSON 排版
     'smart_resnap',         # 智慧重排吸附
+    'beat_grid_check',      # 拍線體檢（量化前的判斷）
     'midi_to_xml_converter',
     'song_library',         # 曲庫索引
     'i18n',                 # 介面字串（原生 UI 也要照這份翻譯）
@@ -46,7 +47,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 def source_of(name):
-    return (HERE / 'qt_editor' / (name + '.py')).read_text(encoding='utf-8')
+    # utf-8-sig 不是 utf-8：有些檔案開頭帶著 BOM（編輯器或 PowerShell 寫出來的
+    # 常常會），Python 自己 import 時會吃掉它，但 `ast.parse` 看到就會報
+    # 「invalid non-printable character U+FEFF」——那是讀檔的方式不對，不是
+    # 那份原始碼真的有問題。
+    return (HERE / 'qt_editor' / (name + '.py')).read_text(encoding='utf-8-sig')
 
 
 def imported_tops(name):

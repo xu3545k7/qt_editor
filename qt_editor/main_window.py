@@ -7342,15 +7342,17 @@ class MainWindow(QMainWindow):
 
     def quantize_dialog(self) -> None:
         """量化：把音符起點對齊到拍點格線。"""
+        from . import beat_grid_check
         from .quantize_dialog import QuantizeDialog
 
         view = self.view
         if view.alloc_active or not view.model.notes_tree:
             QMessageBox.information(self, '量化', '譜面沒有音符。')
             return
+        report = beat_grid_check.check_model(view.model)
         dlg = QuantizeDialog(
             self, grids=view.QUANTIZE_GRIDS, sel_count=len(view.selected),
-            default_grid_beats=0.25)
+            default_grid_beats=0.25, grid_report=report)
         if dlg.exec_() != QDialog.Accepted:
             return
         params = dlg.params()
@@ -7358,11 +7360,37 @@ class MainWindow(QMainWindow):
                        if isinstance(v, (int, float, str, bool))})
         moved = view.quantize_notes(**params)
         if not moved:
-            QMessageBox.information(self, '量化', '沒有音符需要移動（本來就在格線上）。')
+            QMessageBox.information(self, '量化',
+                                    self.quantize_nothing_msg(report))
             return
         self.statusBar().showMessage(
             '量化：%d 顆對齊到格線（強度 %d%%）'
             % (moved, int(round(params['strength'] * 100))), 6000)
+
+    @staticmethod
+    def quantize_nothing_msg(report=None) -> str:
+        """「沒有音符需要移動」要說清楚它比對的是什麼格線。
+
+        使用者回饋：「有的稍微偏離了節拍線有的時間靠得比較近，但是製譜器告訴我
+        所有的 note 是量化好的，我不太懂這是哪方面的問題。」那句話本身沒說錯，
+        但它只講了「在格線上」——而量化的格線是「相鄰兩條拍線之間的等分」，
+        拍線歪掉時，「在格線上」就不等於「在節拍線上」、也不等於間隔平均。
+        不講明白的話，這句話會被讀成「這份譜沒問題」。
+        """
+        msg = ('沒有音符需要移動：每一顆都已經落在格線上。\n\n'
+               '這裡的格線是「把相鄰兩條拍線之間切成等分」算出來的。')
+        if report is None or not getattr(report, 'enough', False):
+            return msg
+        if not report.trustworthy:
+            return msg + (
+                '\n\n不過這份譜的拍線本身有問題（%s）。「在格線上」因此不等於'
+                '「在節拍線上」，也不等於間隔平均——先修拍線再量化。'
+                % report.summary())
+        if report.rubato:
+            return msg + (
+                '\n\n這份譜的拍線間距有 %.0f%% 的起伏（速度變化），所以對齊之後'
+                '各段的毫秒間隔本來就不會一樣長。' % report.rough_pct)
+        return msg
 
     def snap_notes_to_key(self) -> None:
         """把離調的音符吸到最近的調內音。有選取就只處理選取。"""
