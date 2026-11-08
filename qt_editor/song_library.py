@@ -118,7 +118,9 @@ def safe_folder_name(value: str) -> str:
 
 
 def resolve_resource(song_dir: str, resource: Optional[str], exts: Tuple[str, ...]) -> Optional[str]:
-    """`songs/<資料夾>/<子資料夾>/<檔名>`（無副檔名）→ 實際檔案。
+    # docstring 要是 raw：裡面舉的 Windows 路徑例子帶反斜線，
+    # `\A`、`\R` 不是合法的跳脫序列，未來的 Python 會直接報錯。
+    r"""`songs/<資料夾>/<子資料夾>/<檔名>`（無副檔名）→ 實際檔案。
 
     手改壞的 register 只能讓**這一個資源**解析不出來，不能讓整份曲庫清單掛掉。
     以前 `songs/Alpha` 這種只有兩段的路徑會在 `split('/', 2)[2]` 丟
