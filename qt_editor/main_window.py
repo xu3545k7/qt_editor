@@ -228,6 +228,8 @@ class ToolbarSet:
         self.pattern_step_combo = None
         self.pattern_key_combo = None
         self.pattern_key_label = None
+        #: 編輯精度那顆下拉的標籤（它從放置那一串搬出來了，要自己有名字）
+        self.dur_label = None
         self.hand_filter_combo = None
         # 分割區塊
         self.split_act: Optional[QAction] = None
@@ -243,6 +245,10 @@ class ToolbarSet:
         self.measure_lock_act: Optional[QAction] = None
         #: 常用分頁上的鏡像：標籤 → QAction。開關類的狀態要跟著本尊走。
         self.common_acts: Dict[str, QAction] = {}
+        #: 常用分頁上的下拉鏡像：本尊的屬性名 → 那些鏡像下拉。
+        #: 「常用」每次切過去都重建，所以這份要在 `_build_tab_common` 開頭清掉——
+        #: 舊的 widget 連著整頁被回收，留著參照就會踩到已刪除的 C++ 物件。
+        self.mirror_combos: Dict[str, List[QComboBox]] = {}
         self.offset_label = None
         # 檢視分頁
         self.preview_act: Optional[QAction] = None
@@ -1914,7 +1920,15 @@ class MainWindow(QMainWindow):
         """
         from .toolbar_usage import MIN_COUNT
 
-        widgets = []
+        # 這一頁每次切過來都重建，舊的 widget 連著整頁被回收。登記簿要先清掉，
+        # 不然 `_mirror_combos` 會去碰已經刪掉的 C++ 物件。
+        tbs.mirror_combos = {}
+
+        # 唯一一個**釘住**的項目：編輯精度。它不是「按過幾次」長出來的，是使用者
+        # 指定要常駐在這裡的——因為它管格線間隔和拖拉的一格，每個模式下都要動得到
+        # （「請把編輯精度放在常用，使其在放置以外的情況也可以做調整」）。
+        widgets = list(self._common_precision_widgets(tbs))
+        pinned = len(widgets)
         tbs.common_acts = {}
         for label, count in self._toolbar_usage.top():
             entry = self._toolbar_registry.get(label)
@@ -1929,15 +1943,38 @@ class MainWindow(QMainWindow):
             tbs.common_acts[label] = act
             widgets.append(self._tab_button(act))
         self._sync_common_mirrors()
-        if not widgets:
+        if len(widgets) == pinned:
+            # 「還是空的」是指**按鈕**還沒長出來；釘住的精度不算，不然這句話
+            # 永遠不會出現，使用者就不知道這一頁會自己長東西。
             # 不要 setWordWrap：`_tab_page` 後面接 addStretch，會換行的標籤
             # 會被擠成一條 130px 的窄柱、折成四行（實測）。這一行不長，讓它
             # 佔一整列就好。
-            hint = QLabel('還是空的 — 你在其他分頁按過 %d 次以上的功能，'
+            hint = QLabel('按鈕還是空的 — 你在其他分頁按過 %d 次以上的功能，'
                           '會自動排到這裡。' % MIN_COUNT, tbs.root)
             hint.setStyleSheet('color: palette(mid); margin: 0 8px;')
             widgets.append(hint)
         return self._tab_page(widgets)
+
+    def _common_precision_widgets(self, tbs: ToolbarSet):
+        """「常用」上那顆編輯精度（＋標籤＋分隔線）。本尊的家在「編輯」分頁。
+
+        這裡是**鏡像**：兩顆下拉連到同一個 `_on_dur_combo_changed`，再由
+        `_mirror_combos` 把另一顆的顯示值推上去。所以要登記進
+        `tbs.mirror_combos`，不然在這裡改完，「編輯」分頁那顆會停在舊值。
+        """
+        from PyQt5.QtCore import QSize
+
+        label = QLabel('精度', tbs.root)
+        label.setStyleSheet('margin-left: 6px;')
+        label.setToolTip(self._DUR_COMBO_TIP)
+
+        combo = QComboBox(tbs.root)
+        combo.setIconSize(QSize(28, 20))
+        self._fill_dur_combo(combo)          # 自訂的 N 分音符也要在這顆裡
+        combo.setToolTip(self._DUR_COMBO_TIP)
+        combo.currentIndexChanged.connect(self._bind(tbs, self._on_dur_combo_changed))
+        tbs.mirror_combos.setdefault('dur_combo', []).append(combo)
+        return [label, combo, None]
 
     def _refresh_common_tab(self) -> None:
         """重建「常用」那一頁。切到它的時候才做——每按一次就重建太重。
@@ -2014,8 +2051,7 @@ class MainWindow(QMainWindow):
 
         tbs.dur_combo = make_combo(
             [name for name, _ in self._note_dur_items], 88, self._ni_dur_idx,
-            '音符時值（放置音符模式下生效）。最後一項「自訂…」可以輸入任意 N 分音符',
-            self._on_dur_combo_changed)
+            self._DUR_COMBO_TIP, self._on_dur_combo_changed)
         tbs.hand_combo = make_combo(
             [t('tb_note_hand_r'), t('tb_note_hand_l')], 56, self._ni_hand_idx,
             '放置音符的預設手', self._on_hand_combo_changed)
@@ -2054,19 +2090,28 @@ class MainWindow(QMainWindow):
         self._label_shortcut(tbs.hand_combo, '', tbs.hand_combo.toolTip(),
                              '_shortcut_toggle_hand', 'tooltip')
 
-        # 格線配置：不屬於放置參數（沒開放置模式也能看格線），所以不放進變灰的那組
+        # 精度和格線都不屬於放置參數（沒開放置模式也能看格線、也要能改精度），
+        # 所以不放進會收起來的那組。給精度一個標籤：它從放置那一串搬出來之後
+        # 沒有相鄰的開關可以借語意了。
+        tbs.dur_label = QLabel('精度', tbs.root)
+        tbs.dur_label.setStyleSheet('margin-left: 6px;')
+        tbs.dur_label.setToolTip(self._DUR_COMBO_TIP)
+
         tbs.grid_btn = QToolButton(tbs.root)
         tbs.grid_btn.setText('格線 ▾')
         tbs.grid_btn.setPopupMode(QToolButton.InstantPopup)
-        tbs.grid_btn.setToolTip('格線配置：跟著放置時值，或自己搭幾層（例如 4 分＋16 分），'
+        tbs.grid_btn.setToolTip('格線配置：跟著編輯精度，或自己搭幾層（例如 4 分＋16 分），'
                                 '也可以加自訂 N 分音符')
         grid_menu = QMenu(tbs.grid_btn)
         grid_menu.aboutToShow.connect(lambda m=grid_menu: self._fill_grid_menu(m))
         tbs.grid_btn.setMenu(grid_menu)
 
-        # 放置模式沒開時參數變灰（不隱藏，免得每次切換整條工具列跳位）
+        # 放置模式沒開就整組收起來。**時值不在這組裡**：它不只是放置參數，
+        # 格線的間隔（`grid_layers` 的「跟著放置時值」那層）和長條尾端拖動
+        # 一格有多大（`drag_step_beats`）都看它，所以沒開放置模式也要動得到
+        # （使用者：「請把編輯精度放在常用，使其在放置以外的情況也可以做調整」）。
         tbs.note_input_group = [
-            tbs.dur_combo, tbs.hand_combo, tbs.width_combo, tbs.type_combo,
+            tbs.hand_combo, tbs.width_combo, tbs.type_combo,
         ]
 
         # 同步初始值到 view
@@ -2135,9 +2180,12 @@ class MainWindow(QMainWindow):
             None,
             tbs.pattern_key_label,
             None,
+            # 精度＋格線：常駐，和放置模式無關
+            tbs.dur_label, tbs.dur_combo, tbs.grid_btn,
+            None,
+            # 放置模式＋只有放置才有意義的參數（關了整組收起來）
             self._tab_button(tbs.note_input_act),
-            tbs.dur_combo, tbs.hand_combo, tbs.width_combo, tbs.type_combo,
-            tbs.grid_btn,
+            tbs.hand_combo, tbs.width_combo, tbs.type_combo,
             None,
             self._tab_button(tbs.pattern_act),
             tbs.pattern_kind_combo, tbs.pattern_dir_combo,
@@ -2861,11 +2909,26 @@ class MainWindow(QMainWindow):
         elif ti >= 0:
             v.set_note_input_note_type(ti)
 
-    def _mirror_combos(self, name: str, idx: int) -> None:
-        """放置參數是兩條工具列共用的，一邊改了另一邊要跟著顯示同一個值。"""
+    def _combos_named(self, name: str) -> List[QComboBox]:
+        """所有條工具列上這個名字的下拉，含「常用」分頁上的鏡像。
+
+        時值那顆在兩個分頁都有（家在「編輯」、捷徑在「常用」），所以同步、
+        重建清單、取消自訂這三件事都得走整份清單，漏掉哪一顆那一顆就會停在
+        舊值上，看起來像設定沒生效。
+        """
+        out: List[QComboBox] = []
         for tbs in self._toolbars:
             combo = getattr(tbs, name, None)
-            if combo is None or combo.currentIndex() == idx:
+            if combo is not None:
+                out.append(combo)
+            out.extend(c for c in (getattr(tbs, 'mirror_combos', None) or {}).get(name, ())
+                       if c is not None)
+        return out
+
+    def _mirror_combos(self, name: str, idx: int) -> None:
+        """放置參數是兩條工具列共用的，一邊改了另一邊要跟著顯示同一個值。"""
+        for combo in self._combos_named(name):
+            if combo.currentIndex() == idx:
                 continue
             combo.blockSignals(True)
             combo.setCurrentIndex(idx)
@@ -2874,6 +2937,13 @@ class MainWindow(QMainWindow):
     #: 自訂 N 分音符最多記幾個（最近用的留著）
     _MAX_CUSTOM_DIVISIONS = 8
     _CUSTOM_DUR_LABEL = '自訂…'
+
+    #: 時值下拉的說明。它管的不只是放置，所以不能再寫「放置音符模式下生效」。
+    _DUR_COMBO_TIP = ('編輯精度：這三件事都看它\n'
+                      '　• 格線的間隔（格線設成「跟著編輯精度」時）\n'
+                      '　• 長條尾端、往上拖拉長縮短時一格有多大\n'
+                      '　• 放置音符模式放下去的時值\n'
+                      '沒開放置模式也可以改。最後一項「自訂…」可輸入任意 N 分音符。')
 
     def _insert_custom_duration(self, division) -> Optional[int]:
         """把「N 分音符」加進時值清單（照長短排好），回傳它的位置。已經有就回傳那一項。"""
@@ -2937,12 +3007,10 @@ class MainWindow(QMainWindow):
             '例：5 = 五連四分音符、20 = 五連 16 分音符、96 = 64 分三連音',
             16, 1, 256, 1)
         if not ok:
-            for tbs in self._toolbars:
-                combo = getattr(tbs, 'dur_combo', None)
-                if combo is not None:
-                    combo.blockSignals(True)
-                    combo.setCurrentIndex(self._ni_dur_idx)
-                    combo.blockSignals(False)
+            for combo in self._combos_named('dur_combo'):
+                combo.blockSignals(True)
+                combo.setCurrentIndex(self._ni_dur_idx)
+                combo.blockSignals(False)
             return
         self._select_custom_duration(n)
 
@@ -2961,12 +3029,10 @@ class MainWindow(QMainWindow):
                      if int(x) != int(n)]
             saved = (saved + [int(n)])[-self._MAX_CUSTOM_DIVISIONS:]
             settings.set('custom_note_divisions', saved)
-        for tbs in self._toolbars:
-            combo = getattr(tbs, 'dur_combo', None)
-            if combo is not None:
-                self._fill_dur_combo(combo)
+        for combo in self._combos_named('dur_combo'):
+            self._fill_dur_combo(combo)
         self._on_dur_combo_changed(pos)
-        self.statusBar().showMessage('放置時值：%s' % self._note_dur_items[pos][0], 2000)
+        self.statusBar().showMessage('編輯精度：%s' % self._note_dur_items[pos][0], 2000)
 
     # ── 格線配置 ─────────────────────────────────────────────────────
 
@@ -2993,10 +3059,12 @@ class MainWindow(QMainWindow):
         """每次打開才重建：勾選狀態、自訂的 N 分音符都是當下的設定。"""
         from .note_icons import note_value_icon
         menu.clear()
-        follow = menu.addAction('跟著放置時值')
+        # 標籤跟著工具列上那顆改叫「編輯精度」：同一個東西在介面上不要兩個名字。
+        # 設定鍵還是 `grid_follow_placement`，只是顯示字串換掉。
+        follow = menu.addAction('跟著編輯精度')
         follow.setCheckable(True)
         follow.setChecked(bool(settings.get('grid_follow_placement', True)))
-        follow.setToolTip('放置模式選幾分音符，就多畫那一層（原本的放置格線）')
+        follow.setToolTip('「精度」選幾分音符，就多畫那一層（原本的放置格線）')
         follow.toggled.connect(lambda on: self._set_grid_follow(on))
         menu.addSeparator()
 

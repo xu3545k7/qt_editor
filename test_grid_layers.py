@@ -126,7 +126,7 @@ class GridMenuTests(unittest.TestCase):
 
     def test_the_menu_lists_the_placement_values(self):
         texts = self.menu_texts()
-        for name in ('跟著放置時值', '四分音符', '16分音符', '12分音符（八分三連）', '自訂 N 分音符…'):
+        for name in ('跟著編輯精度', '四分音符', '16分音符', '12分音符（八分三連）', '自訂 N 分音符…'):
             self.assertIn(name, texts)
 
     def test_ticking_a_division_saves_it_and_shows_the_grid(self):
