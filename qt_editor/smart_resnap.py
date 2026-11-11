@@ -389,7 +389,11 @@ MAX_REGEN_BARS = 4000
 #: 合理的 BPM 範圍。`normalise` 只擋「一拍短到不合理」（MIN_BEAT_MS），擋不到
 #: **太慢**——BPM 填 0.0001 的話一拍 10 分鐘、整條格線橫跨 27 天，而它只鋪一個
 #: 小節，所以 MAX_REGEN_BARS 也攔不住。兩頭都要有界。
-MIN_REGEN_BPM, MAX_REGEN_BPM = 20.0, 600.0
+#:
+#: 上限原本是 600，那是隨手給的——真正該守的下限是 `MIN_BEAT_MS`（一拍 10ms
+#: ＝ 6000 BPM）。600 擋掉了真實存在的譜：SDVX 的《666》就是 666 BPM，而那
+#: 種譜正是最需要這個功能的（AI 轉譜會判成 166.5／167，剛好差 4 倍）。
+MIN_REGEN_BPM, MAX_REGEN_BPM = 20.0, 1000.0
 
 
 def regenerate(model: Any, bpm: float, numerator: int = 4,

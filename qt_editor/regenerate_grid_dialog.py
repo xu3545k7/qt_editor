@@ -51,7 +51,10 @@ class RegenerateGridDialog(QDialog):
         form = QFormLayout(speed)
         row = QHBoxLayout()
         self._bpm = QDoubleSpinBox()
-        self._bpm.setRange(1.0, 999.0)
+        # 範圍直接取 `smart_resnap` 的常數，不要自己寫一組。原本框是 1~999、
+        # 函式收 20~600，中間那兩段（1~19 和 601~999）打得進去卻一定被退回，
+        # 看起來就像功能壞掉。
+        self._bpm.setRange(SR.MIN_REGEN_BPM, SR.MAX_REGEN_BPM)
         self._bpm.setDecimals(2)
         self._bpm.setValue(float(getattr(model, 'bpm', 0) or 120.0))
         self._bpm.valueChanged.connect(lambda _v: self._refresh())

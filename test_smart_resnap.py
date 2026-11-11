@@ -545,6 +545,51 @@ class RegenerateTests(unittest.TestCase):
         for bpm in (60, 90, 120, 150, 180, 200, 240, 300):
             self.assertTrue(SR.regenerate(self.chart(), float(bpm)).ok, bpm)
 
+    def test_a_real_hardcore_bpm_is_not_refused(self):
+        """上限原本是 600，擋掉了真實存在的譜。
+
+        SDVX 的《666》就是 666 BPM，而那種譜正是最需要這個功能的：AI 轉譜把
+        它判成 167（＝668/4，差 4 倍），音符的毫秒位置卻是對的。使用者填 666
+        進去只會被退回，看起來像功能壞掉。
+        """
+        for bpm in (600.0, 666.0, 668.0, 1000.0):
+            item = SR.regenerate(self.chart(), bpm)
+            self.assertTrue(item.ok, '%g 被擋掉了：%s' % (bpm, item.reason))
+
+    def test_the_bounds_are_still_both_closed(self):
+        """放寬上限不等於拿掉上限——兩頭都還要有界。"""
+        self.assertGreater(SR.MAX_REGEN_BPM, 666.0, '要收得下 666')
+        for bpm in (SR.MIN_REGEN_BPM - 0.01, SR.MAX_REGEN_BPM + 0.01):
+            item = SR.regenerate(self.chart(), bpm)
+            self.assertFalse(item.ok, bpm)
+            self.assertIn('BPM', item.reason)
+
+    def test_a_quarter_tempo_grid_lands_on_the_notes_when_quadrupled(self):
+        """×4 的歧義：167 和 668 的格線是**同一組位置**，差別只在誰叫四分音符。
+
+        所以分辨的方法不是看時間對不對，是看**音符有沒有落在拍線上**。
+        音符每 250ms 一顆時，250ms 一拍（240 BPM）每顆都在線上；拿 60 BPM
+        （1000ms 一拍）去鋪，只有每第 4 顆在線上。
+        """
+        import bisect
+
+        def on_line_ratio(bpm):
+            m = self.chart(step=250)
+            SR.apply(m, SR.regenerate(m, bpm), snap=False)
+            m.rebuild_display_cache()
+            lines = [int(e[1]) for e in m.get_beat_entries()]
+            hits = 0
+            onsets = sorted({int(n.start) for n in m.notes_tree})
+            for t in onsets:
+                i = bisect.bisect_left(lines, t)
+                near = [lines[j] for j in (i - 1, i) if 0 <= j < len(lines)]
+                if near and min(abs(c - t) for c in near) <= 2:
+                    hits += 1
+            return hits / max(1, len(onsets))
+
+        self.assertGreater(on_line_ratio(240.0), 0.95, '對的速度：每顆都在線上')
+        self.assertLess(on_line_ratio(60.0), 0.45, '四分之一的速度：只接到每第 4 顆')
+
     def test_detect_bpm_reads_the_chart_itself(self):
         """音符每 250ms 一顆 ＝ 240 BPM 的四分音符。"""
         self.assertAlmostEqual(SR.detect_bpm(self.chart(step=250)) or 0,
