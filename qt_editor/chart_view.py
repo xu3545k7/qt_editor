@@ -1285,18 +1285,29 @@ class ChartView(QWidget):
     #: 疊和聲：'octave' 是把整組原樣複製一個八度，另外兩種是照調性疊和弦音。
     HARMONY_KINDS = ('octave', 'triad', 'seventh')
 
-    def harmony_group(self) -> List[GNote]:
-        """要疊和聲的那一組：選取裡**最早那一刻**的音符。
+    def harmony_groups(self, kind: str = 'octave') -> List[List[GNote]]:
+        """要疊和聲的那幾組（選取按 start 分組、照時間排）。
 
-        使用者指定「只對同一刻的那一組」。選取跨好幾刻時取最早的那一組，
-        不是每一顆各自加——後者會把一整段旋律變成一整段和弦，那是另一回事。
+        兩種語意，因為兩種操作的「一組」不是同一件事：
+
+        * ``octave``：使用者要的是「**複製同樣音符編排**但是高或低八度」，
+          所以選取裡**每一刻**都複製。只做最早那一刻的話，選一整段八度
+          樂句下去只有第一顆長出夥伴（使用者：「加八度那些的還是只加了
+          第一個音」）。
+        * ``triad`` / ``seventh``：以極端音當根音／冠音疊 1-3-5[-7]。這個
+          套到每一刻會把一整段旋律變成一整段和弦，那是另一回事——使用者
+          指定「只對同一刻的那一組」，所以仍然只取**最早那一刻**。
         """
         sel = [n for n in self.model.notes_tree
                if n.idx in self.selected and n.pitch is not None]
         if not sel:
             return []
-        when = min(int(n.start) for n in sel)
-        return [n for n in sel if int(n.start) == when]
+        by_start: Dict[int, List[GNote]] = {}
+        for n in sel:
+            by_start.setdefault(int(n.start), []).append(n)
+        if kind != 'octave':
+            return [by_start[min(by_start)]]
+        return [by_start[when] for when in sorted(by_start)]
 
     def add_harmony_to_selection(self, anchor: str, kind: str,
                                  push: bool = True) -> int:
@@ -1305,52 +1316,64 @@ class ChartView(QWidget):
         `anchor='low'`  「以此為最低音」——往**高音**側加，原本的音留在原位。
         `anchor='high'` 「以此為冠音」——往**低音**側加，原本的音是最高的那顆。
 
-        `kind='octave'` 把**整組**原樣複製一個八度（「複製同樣音符編排但是高或
-        低八度」）；`'triad'` / `'seventh'` 則以那一側的極端音當根音／冠音，
-        照譜面調性疊 1-3-5[-7]（走 `build_arpeggio`，大調得大三和弦、小調得
-        小三和弦，不用另外指定品質）。
+        `kind='octave'` 把選取的**每一刻、每一顆**原樣複製一個八度（「複製同樣
+        音符編排但是高或低八度」）；`'triad'` / `'seventh'` 則以那一側的極端音
+        當根音／冠音，照譜面調性疊 1-3-5[-7]（走 `build_arpeggio`，大調得大三
+        和弦、小調得小三和弦，不用另外指定品質），而且只動最早那一刻——為什麼
+        兩者範圍不同寫在 `harmony_groups`。
 
-        加完照 `pack_chord_lanes` 的規則重排鍵道：2 顆隔 1 格、3 顆緊密、
-        4 顆以上收成寬度 2 緊密。
+        加完**每一刻各自**照 `pack_chord_lanes` 的規則重排鍵道：2 顆隔 1 格、
+        3 顆緊密、4 顆以上收成寬度 2 緊密。跨刻一起排會把不同時間的音符擠成
+        一疊，所以要分開排。
         """
         if self.alloc_active or anchor not in ('low', 'high'):
             return 0
         if kind not in self.HARMONY_KINDS:
             return 0
-        group = self.harmony_group()
-        if not group:
+        groups = self.harmony_groups(kind)
+        if not groups:
             return 0
 
         direction = 1 if anchor == 'low' else -1
-        if kind == 'octave':
-            sources = list(group)
-            offsets = [12 * direction] * len(sources)
-        else:
-            edge = (min(group, key=lambda n: int(n.pitch)) if anchor == 'low'
-                    else max(group, key=lambda n: int(n.pitch)))
+        key = None
+        if kind != 'octave':
             key = self._active_key()
             if key is None:
                 self.status_changed.emit(
                     '這份譜推不出調性（沒有音高資料），疊不了和弦')
                 return 0
-            from .music_theory import build_arpeggio
-
-            count = 4 if kind == 'seventh' else 3
-            tones = build_arpeggio(key, int(edge.pitch), count, direction,
-                                   seventh=(kind == 'seventh'))
-            # build_arpeggio 的第一顆就是根音／冠音本身，那顆已經在譜上了
-            sources = [edge] * (len(tones) - 1)
-            offsets = [int(p) - int(edge.pitch) for p in tones[1:]]
 
         base = len(self.model.notes_tree)
         added: List[GNote] = []
-        for source, offset in zip(sources, offsets):
-            pitch = int(source.pitch) + offset
-            if not PITCH_MIDI_MIN <= pitch <= PITCH_MIDI_MAX:
-                continue
-            clone = source.clone(base + len(added))
-            clone.pitch = pitch
-            added.append(clone)
+        packs: List[Tuple[List[GNote], List[GNote]]] = []
+        for group in groups:
+            if kind == 'octave':
+                sources = list(group)
+                offsets = [12 * direction] * len(sources)
+            else:
+                edge = (min(group, key=lambda n: int(n.pitch))
+                        if anchor == 'low'
+                        else max(group, key=lambda n: int(n.pitch)))
+                from .music_theory import build_arpeggio
+
+                count = 4 if kind == 'seventh' else 3
+                tones = build_arpeggio(key, int(edge.pitch), count, direction,
+                                       seventh=(kind == 'seventh'))
+                # build_arpeggio 的第一顆就是根音／冠音本身，那顆已經在譜上了
+                sources = [edge] * (len(tones) - 1)
+                offsets = [int(p) - int(edge.pitch) for p in tones[1:]]
+
+            made: List[GNote] = []
+            for source, offset in zip(sources, offsets):
+                pitch = int(source.pitch) + offset
+                if not PITCH_MIDI_MIN <= pitch <= PITCH_MIDI_MAX:
+                    continue
+                clone = source.clone(base + len(added) + len(made))
+                clone.pitch = pitch
+                made.append(clone)
+            if made:
+                added.extend(made)
+                packs.append((group, made))
         if not added:
             self.status_changed.emit('加上去會超出鋼琴音域，沒有變更')
             return 0
@@ -1359,9 +1382,11 @@ class ChartView(QWidget):
         if push:
             self.model.push_history()
         self.model.notes_tree.extend(added)
-        self.model.pack_chord_lanes(group + added, anchor)
+        for group, made in packs:
+            self.model.pack_chord_lanes(group + made, anchor)
         self.model.rebuild_display_cache()
-        self.selected = {n.idx for n in group + added}
+        self.selected = ({n.idx for group in groups for n in group}
+                         | {n.idx for n in added})
         self.update()
         self.note_edited.emit()
         self.selection_changed.emit(len(self.selected))
@@ -7188,8 +7213,12 @@ class ChartView(QWidget):
         **以此為冠音**＝往低音側加、原本那顆是最高的。加完照
         `pack_chord_lanes` 重排（2 顆隔 1 格、3 顆緊密、4 顆以上寬度 2 緊密）。
         """
-        group = self.harmony_group() if has_sel else []
-        count = len(group)
+        # 八度和和弦的範圍不一樣（理由在 `harmony_groups`），所以標籤要分開報，
+        # 不然使用者會以為按下去動到的是同一批音符。
+        oct_groups = self.harmony_groups('octave') if has_sel else []
+        oct_count = sum(len(g) for g in oct_groups)
+        chord_count = len(oct_groups[0]) if oct_groups else 0
+        count = oct_count
 
         for label, delta in (('＋1 半音', 1), ('－1 半音', -1),
                              ('＋八度', 12), ('－八度', -12)):
@@ -7203,16 +7232,19 @@ class ChartView(QWidget):
         a.triggered.connect(lambda checked=False: self._ctx_shift_pitch_custom())
         menu.addSeparator()
 
-        note = (('（選取最早那一刻的 %d 顆）' % count) if count
-                else '（先選音符）')
-        info = menu.addAction('疊和聲 %s' % note)
+        info = menu.addAction('疊和聲 %s' % ('（先選音符）' if not count else
+                                            '（選取 %d 顆、%d 刻）'
+                                            % (oct_count, len(oct_groups))))
         info.setEnabled(False)
         for anchor, side in (('low', '以此為最低音'), ('high', '以此為冠音')):
             sub = menu.addMenu(side)
             sub.setEnabled(bool(count))
-            for kind, label in (('octave', '＋八度（整組複製）'),
-                                ('triad', '＋三和弦（調內 1-3-5）'),
-                                ('seventh', '＋七和弦（調內 1-3-5-7）')):
+            for kind, label in (
+                    ('octave', '＋八度（選取的 %d 顆全部複製）' % oct_count),
+                    ('triad', '＋三和弦（調內 1-3-5，只動最早那一刻的 %d 顆）'
+                              % chord_count),
+                    ('seventh', '＋七和弦（調內 1-3-5-7，只動最早那一刻的 %d 顆）'
+                                % chord_count)):
                 a = sub.addAction(label)
                 a.triggered.connect(
                     lambda checked=False, _a=anchor, _k=kind:
@@ -7226,14 +7258,17 @@ class ChartView(QWidget):
             self.shift_selected_pitch(value, sync_keys=True)
 
     def _ctx_add_harmony(self, anchor: str, kind: str) -> None:
+        moments = len(self.harmony_groups(kind))
         added = self.add_harmony_to_selection(anchor, kind)
         if not added:
             return
         side = '最低音' if anchor == 'low' else '冠音'
         what = {'octave': '八度', 'triad': '三和弦',
                 'seventh': '七和弦'}.get(kind, kind)
-        self.status_changed.emit('以選取為%s疊了%s：加了 %d 顆'
-                                 % (side, what, added))
+        # 八度跨多刻時要報「幾刻」，不然看不出有沒有整段複製到
+        where = ('、%d 刻' % moments) if moments > 1 else ''
+        self.status_changed.emit('以選取為%s疊了%s：加了 %d 顆%s'
+                                 % (side, what, added, where))
 
     def _ctx_build_note_menu(self, menu, has_sel: bool) -> None:
         """音符屬性：類型 / 左右手 / 寬度 / 音高 / 遊戲譜面隱藏。"""

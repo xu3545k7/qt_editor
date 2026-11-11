@@ -166,12 +166,55 @@ class HarmonyTests(unittest.TestCase):
         self.assertEqual([(int(n.min_key), int(n.max_key)) for n in made],
                          [(10, 11), (12, 13), (14, 15), (16, 17)])
 
-    # ── 只對同一刻的那一組 ────────────────────────────────────
-    def test_only_the_earliest_instant_is_touched(self):
-        """使用者指定「只對同一刻的那一組」，不是每一顆各自加。"""
+    # ── 範圍：八度跨刻、和弦只動一刻 ──────────────────────────
+    def test_an_octave_copies_every_selected_instant(self):
+        """使用者：「加八度那些的還是只加了第一個音」。
+
+        八度是「複製同樣音符編排」，所以選一整段八度樂句下去，每一刻都要
+        長出夥伴，不是只有第一顆。
+        """
         view, model = self.view([60, 64], starts=[1000, 2000])
+        self.assertEqual(view.add_harmony_to_selection('low', 'octave'), 2)
+        self.assertEqual(self.pitches_at(model, 1000), [60, 72])
+        self.assertEqual(self.pitches_at(model, 2000), [64, 76])
+
+    def test_an_octave_handles_a_long_run(self):
+        starts = [1000 + 200 * i for i in range(6)]
+        view, model = self.view([60, 62, 64, 65, 67, 69], starts=starts)
+        self.assertEqual(view.add_harmony_to_selection('high', 'octave'), 6)
+        for when, pitch in zip(starts, (60, 62, 64, 65, 67, 69)):
+            self.assertEqual(self.pitches_at(model, when), [pitch - 12, pitch])
+
+    def test_each_instant_is_packed_on_its_own(self):
+        """跨刻一起排會把不同時間的音符擠成一疊；每一刻要各自排。"""
+        view, model = self.view([60, 64], starts=[1000, 2000])
+        view.add_harmony_to_selection('low', 'octave')
+        for when in (1000, 2000):
+            made = sorted((n for n in model.notes_tree if int(n.start) == when),
+                          key=lambda n: int(n.pitch))
+            self.assertEqual([(int(n.min_key), int(n.max_key)) for n in made],
+                             [(10, 12), (14, 16)])
+
+    def test_chords_still_only_touch_the_earliest_instant(self):
+        """和弦套到每一刻會把一整段旋律變成一整段和弦——那條限制留著。"""
+        view, model = self.view([60, 64], starts=[1000, 2000])
+        self.assertEqual(view.add_harmony_to_selection('low', 'triad'), 2)
+        self.assertEqual(self.pitches_at(model, 1000), [60, 64, 67])
+        self.assertEqual(self.pitches_at(model, 2000), [64])
+
+    def test_an_octave_skips_only_the_instants_that_leave_the_piano(self):
+        """一刻超出音域不該連累其他刻。"""
+        view, model = self.view([60, 107], starts=[1000, 2000])
         self.assertEqual(view.add_harmony_to_selection('low', 'octave'), 1)
         self.assertEqual(self.pitches_at(model, 1000), [60, 72])
+        self.assertEqual(self.pitches_at(model, 2000), [107])
+
+    def test_the_whole_run_is_one_undo(self):
+        view, model = self.view([60, 64], starts=[1000, 2000])
+        view.add_harmony_to_selection('low', 'octave')
+        model.undo()
+        model.rebuild_display_cache()
+        self.assertEqual(self.pitches_at(model, 1000), [60])
         self.assertEqual(self.pitches_at(model, 2000), [64])
 
     # ── 邊界 ──────────────────────────────────────────────────
@@ -236,6 +279,26 @@ class PitchMenuTests(unittest.TestCase):
     def test_it_says_how_many_notes_it_will_use(self):
         texts = [a.text() for a in self.sub.actions()]
         self.assertTrue(any('2 顆' in x for x in texts), texts)
+
+    def test_the_labels_separate_the_two_scopes(self):
+        """八度動整個選取、和弦只動最早那一刻——標籤要講清楚，不然按下去才發現。"""
+        model = NoteModel.create_new('t', 120.0, 20.0, 4)
+        model.notes_tree = [note(0, 1000, 60), note(1, 1000, 64),
+                            note(2, 2000, 67)]
+        model.rebuild_display_cache()
+        view = ChartView()
+        view.model = model
+        view.selected = {0, 1, 2}
+        menu = QMenu()
+        view._ctx_build_note_menu(menu, True)
+        sub = next(a.menu() for a in menu.actions() if a.text() == '音高')
+        side = next(a.menu() for a in sub.actions()
+                    if a.text() == '以此為最低音')
+        labels = {('octave' if '八度' in b.text() else 'chord'): b.text()
+                  for b in side.actions()}
+        self.assertIn('3 顆', labels['octave'], labels)
+        self.assertIn('2 顆', labels['chord'], labels)
+        menu.clear()
 
 
 if __name__ == '__main__':
