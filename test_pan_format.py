@@ -221,14 +221,32 @@ class TrillTests(unittest.TestCase):
         self.assertEqual(len(back.notes_tree[0].sub_elems), 6)
 
     def test_a_trill_does_not_host_hidden_notes(self):
+        """同一刻有顔音和一般音符時，寄主要挑一般音符。
+
+        顔音的 sub_note 是每一下敲擊，併進去的隱藏音會變成多出來的敲擊。
+        """
         m = NoteModel.create_new('t', 120.0, 5.0, 4)
         trill = note(0, 0, 60, note_type=64, end=800)
-        tap = note(1, 20, 50)
+        tap = note(1, 0, 50)
         hidden = note(2, 0, 67)
         hidden.hidden = True
         m.notes_tree = [trill, tap, hidden]
         hosts = dict((id(n), h) for n, h in m.resolve_hidden_hosts())
         self.assertIs(hosts[id(hidden)], tap)
+
+    def test_a_hidden_note_before_every_visible_one_has_no_host(self):
+        """寄主必須比隱藏音早，所以最前面那顆沒有寄主——而那是合法的。"""
+        m = NoteModel.create_new('t', 120.0, 5.0, 4)
+        later = note(0, 200, 60)
+        hidden = note(1, 0, 67)
+        hidden.hidden = True
+        m.notes_tree = [later, hidden]
+        hosts = dict((id(n), h) for n, h in m.resolve_hidden_hosts())
+        self.assertIsNone(hosts[id(hidden)])
+        # 寫 XML 時才走退路，不然整顆從檔案裡消失
+        with_fallback = dict((id(n), h)
+                             for n, h in m.resolve_hidden_hosts(fallback=True))
+        self.assertIs(with_fallback[id(hidden)], later)
 
 
 class JsonKeepsPanDataTests(unittest.TestCase):

@@ -252,8 +252,7 @@ class WindowWiringTests(unittest.TestCase):
         from unittest import mock
         self.model.dirty = True
         self.win._on_autosave_tick()
-        with mock.patch('qt_editor.main_window.QMessageBox.information'), \
-                mock.patch.object(self.win, '_block_on_unassigned', return_value=False):
+        with mock.patch('qt_editor.main_window.QMessageBox.information'):
             self.win._do_save(self.path)
         self.assertEqual(os.listdir(self.folder), [])
 

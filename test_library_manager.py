@@ -102,8 +102,7 @@ class LibraryManagerTests(unittest.TestCase):
             self.win._load_path(chart)
         before = self.revision()['revision'] if os.path.exists(
             os.path.join(self.root, '.editor_revision.json')) else 0
-        with mock.patch('qt_editor.main_window.QMessageBox.information'), \
-                mock.patch.object(self.win, '_block_on_unassigned', return_value=False):
+        with mock.patch('qt_editor.main_window.QMessageBox.information'):
             self.win._do_save(chart)
         after = self.revision()
         self.assertEqual(after['revision'], before + 1)

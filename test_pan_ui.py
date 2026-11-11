@@ -56,8 +56,7 @@ class PanUiTests(unittest.TestCase):
     def save(self, path, answer=QMessageBox.Yes):
         with mock.patch('qt_editor.main_window.QMessageBox.question', return_value=answer) as q, \
                 mock.patch('qt_editor.main_window.QMessageBox.information') as info, \
-                mock.patch('qt_editor.main_window.QMessageBox.warning') as warn, \
-                mock.patch.object(self.win, '_block_on_unassigned', return_value=False):
+                mock.patch('qt_editor.main_window.QMessageBox.warning') as warn:
             self.win._do_save(path)
         return q, info, warn
 

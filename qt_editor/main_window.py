@@ -5249,7 +5249,14 @@ class MainWindow(QMainWindow):
         self._refresh_title()
 
     def _first_unassigned_note(self):
-        """譜面上最早的一顆無主音（`hand=2`），沒有就回 None。"""
+        """譜面上最早的一顆無主音（`hand=2`），沒有就回 None。
+
+        以前有一顆無主音就**擋下存檔跟匯出**，現在不擋了（使用者：
+        「請把無主音保護關掉，它可以存在並保存」）。`hand=2` 本來就是官方
+        格式的合法值（官方 normal 譜有 54% 的音符是 hand=2，PAN 寫出去是
+        track 3），把它當成「未完成」而擋住存檔是錯的。這個定位器留下來
+        當存檔完成訊息的告知用。
+        """
         model = getattr(self.view, 'model', None)
         if model is None:
             return None
@@ -5259,32 +5266,6 @@ class MainWindow(QMainWindow):
             return None
         return min(unassigned, key=lambda n: (int(n.start), int(n.min_key)))
 
-    def _block_on_unassigned(self) -> bool:
-        """有無主音就擋下存檔／匯出，並把畫面跳到最早的那一顆。
-
-        無主音（`hand=2`）是「還沒決定用哪隻手」的中間狀態——疊加匯入 MIDI
-        會產生它。帶著這種音符存檔等於把未完成的譜交出去，所以直接擋掉，
-        並且**跳到最早的那一顆**、選起來，讓人知道要處理哪裡。
-
-        回傳 True 表示已經擋下來了，呼叫端要直接 return。
-        """
-        note = self._first_unassigned_note()
-        if note is None:
-            return False
-        total = sum(1 for n in self.view.model.notes_tree
-                    if int(getattr(n, 'hand', 0)) == 2)
-        try:
-            self.view.scroll_to_ms(float(note.start))
-            self.view.selected.clear()
-            self.view.selected.add(note)
-            self.view.update()
-            self.view.selection_changed.emit(len(self.view.selected))
-        except Exception:            # noqa: BLE001
-            pass
-        QMessageBox.warning(
-            self, t('dlg_unassigned_title'),
-            t('dlg_unassigned_msg', total, int(note.start)))
-        return True
 
     def _confirm_pan_conversion(self, path: str) -> bool:
         """存成 XML 之前：列出 PAN 沒有、會被換掉或拿掉的東西，同意才轉換。
@@ -5318,8 +5299,6 @@ class MainWindow(QMainWindow):
         return True
 
     def _do_save(self, path: str, use_midi_restore: bool = False) -> None:
-        if self._block_on_unassigned():
-            return
         ext = os.path.splitext(path)[1].lower()
         if ext not in ('.json', '.mid', '.midi') and not use_midi_restore:
             if not self._confirm_pan_conversion(path):
@@ -5357,6 +5336,14 @@ class MainWindow(QMainWindow):
                 msg = t('dlg_save_ok_msg', actual)
                 if validation is not None:
                     msg += '\n\n已照 PAN 讀檔規則檢查，沒有問題。'
+                # 無主音不再擋存檔，但還是要讓人知道譜裡有幾顆——疊加
+                # 匯入 MIDI 分不出左右手時會產生它，有人是有意留的、
+                # 有人是忘了指定。
+                if self._first_unassigned_note() is not None:
+                    unassigned = sum(1 for n in self.view.model.notes_tree
+                                     if int(getattr(n, 'hand', 0)) == 2)
+                    msg += ('\n\n含 %d 顆無主音（hand=2），照原樣寫入。'
+                            % unassigned)
                 QMessageBox.information(self, t('dlg_save_ok_title'), msg)
         except Exception as e:
             QMessageBox.critical(self, t('dlg_save_fail_title'), t('dlg_save_fail_msg', e))
@@ -6377,8 +6364,6 @@ class MainWindow(QMainWindow):
 
     def export_midi_file(self) -> None:
         """把目前譜面存成 .mid。"""
-        if self._block_on_unassigned():
-            return
         m = self.view.model
         if not m.notes_tree:
             QMessageBox.warning(self, t('dlg_warn'), t('dlg_export_no_chart'))
@@ -6678,8 +6663,6 @@ class MainWindow(QMainWindow):
 
     def export_song(self) -> None:
         """匯出完整曲目格式（register.json + 音源 + 譜面 + 曲繪）。"""
-        if self._block_on_unassigned():
-            return
         logging.debug('export_song: start')
         import json
         import shutil
@@ -8336,8 +8319,8 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.Save:
                 self.save_file()
-                # 存不成就不能關。以前是無條件 accept()，於是存檔被擋下來
-                # （現在有無主音會擋）或使用者在「另存新檔」按取消時，視窗
+                # 存不成就不能關。以前是無條件 accept()，於是存檔失敗
+                # （寫不進去、PAN 轉換被拒絕）或使用者在「另存新檔」按取消時，視窗
                 # 照關、改動直接消失。用 dirty 判斷有沒有真的存到。
                 if self.view.model.dirty:
                     self._title_timer.start(500)

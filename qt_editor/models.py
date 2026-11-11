@@ -4781,11 +4781,16 @@ class NoteModel:
         self._merged_hosts = []
         hosts: Dict[int, List[Tuple[int, Any]]] = {}
         orphans = 0
-        for note, host in self.resolve_hidden_hosts():
+        for note, host in self.resolve_hidden_hosts(fallback=True):
             if host is None:
-                # 沒有寄主可掛就不能隱藏——隱藏音符不會單獨寫成 <note>，
-                # 放著不管等於整顆音消失。取消隱藏至少把音留住。
-                note.hidden = False
+                # 這裡已經走過退路了，還是 None 就是「整份譜沒有任何可見音符」。
+                #
+                # **不碰 `hidden`**。以前這裡會把它取消隱藏「至少把音留住」，
+                # 但那是在存檔時偷偷改譜：使用者放的「無論如何都會響的
+                # keysound」存一次就變成一顆要打的音符，而且
+                # `_unmerge_hidden_from_hosts` 只還原 `sub_elems`、不還原 `hidden`，
+                # 所以記憶體裡的譜面也跟著被改掉。沒有寄主是合法狀態：
+                # JSON 存得住，遊戲端有自己的退路。
                 orphans += 1
                 continue
             order = (getattr(note, '_sub_order', None) or [10_000])[0]
@@ -4802,8 +4807,9 @@ class NoteModel:
                 se = self._make_sub_elem(note)
             hosts.setdefault(id(host), []).append((order, se))
         if orphans:
+            # 警告而不是改譜：XML 帶不走這幾顆，但 JSON（編輯器的原始檔）帶得走。
             logging.warning(
-                '%d hidden notes had no host and were kept visible', orphans)
+                '%d hidden notes have no host at all; they stay hidden and are written to JSON only', orphans)
         if not hosts:
             return 0
         by_id = {id(n): n for n in self.notes_tree}
@@ -5009,15 +5015,34 @@ class NoteModel:
             return sum(values) / len(values)
         return float(note.pitch) if note.pitch is not None else None
 
+    #: 隱藏音符往前找寄主的固定時間窗（毫秒）
+    HIDDEN_HOST_WINDOW_MS = 120
+
     def resolve_hidden_hosts(
-        self, window_ms: int = 120
+        self, window_ms: Optional[int] = None, fallback: bool = False
     ) -> List[Tuple[Any, Optional[Any]]]:
         """替每個隱藏音符找出要掛載的可見音符。
 
-        規則：同一時刻（容許 `window_ms`）的可見音符中，音高最接近的那顆。
-        隱藏音符自帶多音時用平均音高比對。找不到寄主就回 None——那種情況不能
-        隱藏，否則音就消失了。
+        規則：**同一隻手、比它早、而且在 `window_ms` 之内的可見音符裡
+        最晚的那一顆**。同一刻也算「早」（把和絃音折進同一個按鍵是最常見
+        的用法）；同一刻有好幾顆時取音高最近的。
+
+        為何要「比它早」：遊戲端的 sub_note 是**寄主被打到的那一刻才排程**
+        的（`PianoVoiceManager.ScheduleHiddenNotes`），之後各自照自己的
+        `start_timing_msec` 出聲。寄主比隱藏音早，打到寄主時這顆 keysound
+        還沒到時間，就能準時響；寄主比它晚的話根本等不到，遊戲只能丟進
+        `autoHidden` 自動播放佇列。
+
+        找不到就回 None，**而且那不是錯誤**——「沒有寄主的隱藏音符」是
+        合法狀態：它存得下來（JSON 的 `hidden` 欄位），遊戲端有自己的退路
+        （`ChartData.ResolveHost`）把它接起來。以前回 None 會讓存檔時整顆被取消隱藏。
+
+        `fallback=True` 時多一層退路：先往前找最近的可見音符（不限手、不限
+        距離），再不然往後找最近的。**只有寫 XML 要用**——XML 沒有「獨立的
+        隱藏音符」這種東西，掛不上任何寄主就等於整顆從檔案裡消失。
         """
+        if window_ms is None:
+            window_ms = self.HIDDEN_HOST_WINDOW_MS
         # 顫音不能當寄主：它的 sub_note 是每一下敲擊，併進去的隱藏音會變成多出來的
         # 敲擊，讀回來時音符就不見了（載入時顫音不拆 sub，見 _split_sub_notes_into_hidden）。
         visible = [n for n in self.notes_tree if not getattr(n, 'hidden', False)
@@ -5038,16 +5063,26 @@ class NoteModel:
                 continue
             mine = self._mean_pitch(note)
             when = int(note.start)
-            lo = bisect_left(starts, when - window_ms)
-            hi = bisect_right(starts, when + window_ms)
-            pool = visible[lo:hi]
-            if not pool or mine is None:
-                out.append((note, pool[0] if pool else None))
-                continue
-            host = min(pool, key=lambda v: (
-                abs((self._mean_pitch(v) if self._mean_pitch(v) is not None else 1e9) - mine),
-                abs(int(v.start) - when),
-            ))
+            hand = int(getattr(note, 'hand', 0))
+            # 同一刻也算「早」，所以右界用 `bisect_right`（含 when 本身）。
+            hi = bisect_right(starts, when)
+            lo = bisect_left(starts, when - int(window_ms))
+            pool = [v for v in visible[lo:hi]
+                    if int(getattr(v, 'hand', 0)) == hand]
+            host = None
+            if pool:
+                # `visible` 照 start 排過，過濾不改順序，最後一顆就是「最晚」。
+                newest = int(pool[-1].start)
+                same = [v for v in pool if int(v.start) == newest]
+                if mine is None or len(same) == 1:
+                    host = same[0]
+                else:
+                    host = min(same, key=lambda v: abs(
+                        (self._mean_pitch(v) if self._mean_pitch(v) is not None
+                         else 1e9) - mine))
+            elif fallback:
+                host = (visible[hi - 1] if hi > 0
+                        else (visible[hi] if hi < len(visible) else None))
             out.append((note, host))
         return out
 

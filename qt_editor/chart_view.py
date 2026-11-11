@@ -7128,8 +7128,13 @@ class ChartView(QWidget):
 
         重繪每一幀都會用到，所以照音符集合的簽章快取；集合一變就重算。
         """
-        sig = (len(self.model.notes_tree),
-               sum(1 for n in self.model.notes_tree if getattr(n, 'hidden', False)))
+        # 寄主的挑法看「同一隻手」，所以改了 L／R 也要重算，不然虛線還指著舊寄主。
+        hidden = hands = 0
+        for n in self.model.notes_tree:
+            if getattr(n, 'hidden', False):
+                hidden += 1
+            hands += int(getattr(n, 'hand', 0))
+        sig = (len(self.model.notes_tree), hidden, hands)
         if getattr(self, '_host_sig', None) != sig:
             self._host_map = {id(h): host
                               for h, host in self.model.resolve_hidden_hosts()}

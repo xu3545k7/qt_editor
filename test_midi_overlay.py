@@ -93,11 +93,15 @@ class MidiOverlayTests(unittest.TestCase):
         self.assertNotEqual(NOTE_NONE, NOTE_RIGHT)
 
 
-class UnassignedSaveGuardTests(unittest.TestCase):
-    """有無主音就不准存檔／匯出，而且要跳到最早的那一顆。
+class UnassignedNotesAreAllowedTests(unittest.TestCase):
+    """無主音可以存在，也可以存檔。
 
-    無主音（hand=2）是「還沒決定用哪隻手」的中間狀態。帶著它存檔等於把
-    未完成的譜交出去，所以直接擋掉。
+    以前有一顆 `hand=2` 就擋下存檔跟匯出，理由是「那是還沒決定用哪隻手
+    的中間狀態」。那個理由站不住腱：`hand=2` 是官方格式的合法值（官方
+    normal 譜有 54% 的音符是 hand=2，PAN 寫出去走 track 3），使用者也會
+    故意留著它。使用者：「請把無主音保護關掉，它可以存在並保存」。
+
+    `_first_unassigned_note` 留下來，只當存檔完成訊息裡的告知用。
     """
 
     def _window(self):
@@ -130,53 +134,48 @@ class UnassignedSaveGuardTests(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(int(found.start), 400)
 
-    def test_no_unassigned_means_no_block(self):
+    def test_no_unassigned_means_nothing_to_report(self):
         window = self._window()
         window.view.model.notes_tree = self._notes([(0, 0), (100, 1)])
         self.assertIsNone(window._first_unassigned_note())
 
-    def test_blocked_save_jumps_to_and_selects_that_note(self):
-        from PyQt5 import QtWidgets
+    def test_the_guard_is_gone(self):
+        """擋存檔的那個把關整個拿掉了，不是改成預設關。"""
+        window = self._window()
+        self.assertFalse(hasattr(window, '_block_on_unassigned'))
+
+    def test_a_chart_with_unassigned_notes_really_saves(self):
+        from unittest import mock
 
         window = self._window()
         window.view.model.notes_tree = self._notes(
-            [(900, 2), (100, 0), (400, 2)])
+            [(0, 0), (400, 2), (900, 2)])
         window.view.model.rebuild_display_cache()
-        shown = {}
-        original = QtWidgets.QMessageBox.warning
-        QtWidgets.QMessageBox.warning = staticmethod(
-            lambda *a, **k: shown.setdefault('args', a))
-        try:
-            blocked = window._block_on_unassigned()
-        finally:
-            QtWidgets.QMessageBox.warning = original
-        self.assertTrue(blocked, '有無主音卻沒擋下來')
-        self.assertIn('args', shown, '沒有跳出警告')
-        selected = list(window.view.selected)
-        self.assertEqual(len(selected), 1)
-        self.assertEqual(int(selected[0].start), 400)
+        path = os.path.join(tempfile.mkdtemp(), 'unassigned.json')
+        with mock.patch('qt_editor.main_window.QMessageBox.information') as info:
+            window._do_save(path)
+        self.assertTrue(os.path.exists(path), '有無主音就沒寫出任何檔案')
+        self.assertGreater(os.path.getsize(path), 0)
+        back = NoteModel()
+        back.load_json(path)
+        kept = sum(1 for n in back.notes_tree
+                   if int(getattr(n, 'hand', 0)) == 2)
+        self.assertEqual(kept, 2, '無主音沒有原樣存下來')
+        # 不擋了，但存檔完成的訊息要說出有幾顆
+        said = ' '.join(str(a) for a in info.call_args[0])
+        self.assertIn('2 顆無主音', said)
 
-
-    def test_blocked_save_does_not_clear_dirty(self):
-        """存檔被擋下來時，dirty 必須維持 True。
-
-        關閉視窗時選「儲存」是靠 dirty 判斷有沒有真的存到才決定關不關；
-        擋下來卻把 dirty 清掉的話，視窗會照關、改動直接消失。
-        """
-        from PyQt5 import QtWidgets
+    def test_a_clean_chart_says_nothing_about_unassigned(self):
+        from unittest import mock
 
         window = self._window()
-        window.view.model.notes_tree = self._notes([(0, 0), (400, 2)])
+        window.view.model.notes_tree = self._notes([(0, 0), (400, 1)])
         window.view.model.rebuild_display_cache()
-        window.view.model.current_file = None
-        window.view.model.dirty = True
-        original = QtWidgets.QMessageBox.warning
-        QtWidgets.QMessageBox.warning = staticmethod(lambda *a, **k: None)
-        try:
-            window._do_save('unused.xml')
-        finally:
-            QtWidgets.QMessageBox.warning = original
-        self.assertTrue(window.view.model.dirty, '被擋下來卻清掉了 dirty')
+        path = os.path.join(tempfile.mkdtemp(), 'clean.json')
+        with mock.patch('qt_editor.main_window.QMessageBox.information') as info:
+            window._do_save(path)
+        said = ' '.join(str(a) for a in info.call_args[0])
+        self.assertNotIn('無主音', said)
 
 
 if __name__ == '__main__':
