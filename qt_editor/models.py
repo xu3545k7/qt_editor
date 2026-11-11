@@ -8184,6 +8184,10 @@ class NoteModel:
             moved, max_shift = _SR.snap_notes(self, [float(ms) for _i, ms in out])
         self.rebuild_display_cache()
         self.dirty = True
+        # 只有第一列真的被改過才寫：沒改過的那一列帶的是從格線量回來的值
+        # （`measure_grid_rows`），照寫會讓宣告值每開一次表格就漂一點。
+        if rows and orig and abs(float(rows[0][2]) - float(orig[0][2])) > self.MEASURE_BPM_EPS:
+            self._sync_declared_bpm(0, rows[0][2])
         return {'measures': total, 'changed': changed, 'beats': len(out),
                 'shift_ms': int(round(delta)), 'moved': int(moved),
                 'max_shift_ms': float(max_shift)}
@@ -9139,6 +9143,34 @@ class NoteModel:
             last = mi
         return last, total_bpm / count
 
+    def _sync_declared_bpm(self, measure_idx: int, new_bpm: float) -> None:
+        """第一小節的速度改了，檔頭宣告的 BPM 也要跟著改。
+
+        **為什麼需要這個。** 檔頭的 `bpm`／`first_bpm` 和小節線是兩份各自獨立的
+        資料：小節線決定音符落在哪裡，檔頭那個欄位只是個標示。三個改速度的入口
+        （單一小節、多小節、每小節表格）動的都只有小節線，所以改完之後檔頭還留著
+        舊值 —— 譜面是新的速度，標示是舊的速度。
+
+        實測：「初音狂奏曲第01番」用多小節 BPM 從 215 改成 220，3782 顆音符全部
+        重排、全曲從 196.5 秒縮到 192.1 秒（正好是 215/220），檔頭卻還是 215。
+        遊戲端 HUD 直接印這個欄位，所以玩家看到的是 215。
+
+        **為什麼存進去的是輸入值，不是量回來的值。** 小節長度是整數毫秒，220 BPM
+        的一拍是 272.727 ms、存進去變 273，量回來是 219.78。標示欄位該寫使用者說
+        的那個數，不是量化誤差之後的數。
+
+        只認第 0 小節：`first_bpm` 的語意就是「第一個速度」，後面的變速走的是速度
+        事件，不是這個欄位。
+        """
+        if measure_idx != 0:
+            return
+        try:
+            value = float(new_bpm)
+        except (TypeError, ValueError):
+            return
+        if value > 0:
+            self.bpm = value
+
     def set_measure_bpm(self, measure_idx: int, new_bpm: float, uniform: bool = False, mode: str = 'scale', adjust_notes: bool = True) -> None:
         """修改第 measure_idx 小節的 BPM。
         mode='scale'（預設）：等比例縮放小節內音符時間，並平移後續音符與拍子（原有行為）。
@@ -9166,6 +9198,7 @@ class NoteModel:
         delta   = new_dur - old_dur
         if delta == 0 and mode == 'scale':
             return
+        self._sync_declared_bpm(measure_idx, new_bpm)
         ratio = new_dur / max(1, old_dur)
 
         # Notes handling differs by mode
