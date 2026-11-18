@@ -48,10 +48,12 @@ if __package__ is None:
     from qt_editor.main_window import MainWindow
     from qt_editor.settings import settings
     from qt_editor.i18n import set_lang
+    from qt_editor.ui_text import LANGUAGES
 else:
     from .main_window import MainWindow
     from .settings import settings
     from .i18n import set_lang
+    from .ui_text import LANGUAGES
 
 
 def _icon_path() -> str:
@@ -77,7 +79,9 @@ def pop_lang_arg(argv: list) -> str:
             del argv[i]
         else:
             i += 1
-    return lang if lang in ('zh_tw', 'zh_cn', 'en') else ''
+    # 清單只有一份（ui_text.LANGUAGES）。這裡本來自己抄了一份，
+    # 加語言時漏掉它的話，啟動器傳 --lang ja 進來會被當成不認得而忽略。
+    return lang if lang in dict(LANGUAGES) else ''
 
 
 def pop_library_arg(argv: list) -> str:
@@ -136,6 +140,12 @@ def main() -> None:
         from qt_editor.settings import settings as _st
         from qt_editor.theme import apply_theme
     apply_theme(app, bool(_st.get('dark_mode', False)))
+    # 語言在上面就設好了，所以這裡已經知道要不要換成日文字型
+    try:
+        from .ui_font import apply_ui_font
+    except ImportError:
+        from qt_editor.ui_font import apply_ui_font
+    apply_ui_font(app)
     try:
         from .i18n import t as _t
     except Exception:

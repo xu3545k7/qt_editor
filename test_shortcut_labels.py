@@ -78,7 +78,9 @@ class ShortcutLabelTests(unittest.TestCase):
         self.assertIn('[', self.tbs.dur_combo.toolTip())
         self.assertIn(']', self.tbs.dur_combo.toolTip())
         self.assertIn('Q', self.tbs.hand_combo.toolTip())
-        self.assertTrue(self.tbs.dur_combo.toolTip().startswith('音符時值'),
+        # 這顆在介面上叫「編輯精度」（工具列和格線選單同一個名字），
+        # 說明文字跟著改過；這裡要釘的是「快捷鍵標籤沒有把原本的說明蓋掉」。
+        self.assertTrue(self.tbs.dur_combo.toolTip().startswith('編輯精度'),
                         '原本的說明要留著')
 
     def test_buttons_without_shortcuts_are_left_alone(self):

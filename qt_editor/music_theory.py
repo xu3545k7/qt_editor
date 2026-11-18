@@ -59,16 +59,32 @@ def scale_of(mode: str) -> Scale:
     return SCALE_BY_KEY.get(str(mode), SCALE_BY_KEY['major'])
 
 
+#: 顫音的兩個 kind：音高完全一樣，差在**產生幾顆音符**。使用者的說法是
+#: 「分開的」和「有套上的」（2026-11-18），UI 就照這個講。
+#: `trill`（分開的）放一串交替的普通音符，一下一顆、各自判定——他自己寫的譜
+#: 都是這種（oplog 的 type_hist 只有 0 和 2，一顆顫音音符都沒有）；
+#: `trill_note`（套上的）把整段套成一顆遊戲顫音（寬音符 + sub_notes，type=64），
+#: 要持續接觸才繼續響。
+#: 做成兩個 kind 而不是看類型下拉：開「音階輔助」時放置模式會關掉，類型下拉
+#: 跟著整組隱藏（`_refresh_toolbar_groups`），拿看不見的狀態決定輸出等於沒得選。
+TRILL_KINDS: Tuple[str, ...] = ('trill', 'trill_note')
+
 #: 「插入音階／琶音」的音型清單：(顯示名, kind)。工具列和對話框共用這一份。
-#: 前四個吃譜面調性（`scale` 就是這個調自己的音階），後面是指定音階。
+#: 前面這幾個吃譜面調性（`scale` 就是這個調自己的音階），後面是指定音階。
 PATTERN_KINDS: Tuple[Tuple[str, str], ...] = (
     ('音階（依調性）', 'scale'),
     ('三度進行',       'thirds'),
     ('琶音（三和弦）', 'arpeggio'),
     ('琶音（七和弦）', 'arpeggio7'),
+    ('顫音（分開的）', 'trill'),
+    ('顫音（套上的）', 'trill_note'),
 ) + tuple(
     (s.name, s.key) for s in SCALES if s.key not in ('major', 'minor')
 )
+
+#: 吃譜面調性、不是「指定某個音階」的那些音型。
+SHAPE_KINDS: Tuple[str, ...] = (
+    'scale', 'thirds', 'arpeggio', 'arpeggio7') + TRILL_KINDS
 
 PATTERN_KIND_NAMES: Dict[str, str] = dict(
     (value, label) for label, value in PATTERN_KINDS)
@@ -211,6 +227,28 @@ def build_scale(key: Key, start_pitch: int, count: int,
     return [pitch_at_scale_index(base + sign * step * i, key) for i in range(count)]
 
 
+def build_trill(key: Key, start_pitch: int, count: int,
+                direction: int = 1) -> List[int]:
+    """兩個相鄰的音來回 `count` 顆：下筆的那個音，和它在調內的鄰音。
+
+    `direction >= 0` 取**上**鄰音（樂譜上的顫音就是主音與上方鄰音交替），負的
+    取下鄰音。方向選「上行後下行」在這裡沒有意義——來回本身就是折返——所以
+    0 當上鄰音處理，不走 `build_pattern` 的折返路徑。
+
+    鄰音取**調內的下一級**而不是固定一個半音：C 大調的 C 顫到 D（全音）、E 顫
+    到 F（半音），這才是譜上 tr 的意思。想要某個半音顫音就把調性改成含那個半音
+    的調（C 要顫到 C# 就選「C# 大調」，實測給 60→61），或者自己放兩顆再右鍵
+    「打包成 Trill」。
+    """
+    if count <= 0:
+        return []
+    base = scale_index_of(start_pitch, key)
+    step = 1 if int(direction) >= 0 else -1
+    pair = (pitch_at_scale_index(base, key),
+            pitch_at_scale_index(base + step, key))
+    return [pair[i % 2] for i in range(int(count))]
+
+
 def build_arpeggio(key: Key, start_pitch: int, count: int,
                    direction: int = 1, seventh: bool = False) -> List[int]:
     """從 `start_pitch` 這個級數當根音，照和弦音（1-3-5[-7]）往上/下堆。
@@ -234,12 +272,12 @@ def build_arpeggio(key: Key, start_pitch: int, count: int,
 def pattern_key(kind: str, key: Key, start_pitch: int) -> Key:
     """某個音型實際要用的調。
 
-    `scale`/`thirds`/`arpeggio*` 用譜面的調；其他 kind 是指定音階：
+    `SHAPE_KINDS`（音階／三度／琶音／顫音）用譜面的調；其他 kind 是指定音階：
     有調性的（五聲、藍調、各調式）掛在譜面的主音上——C 大調就給 C 藍調；
     對稱音階（半音階、全音階、減音階）移調之後還是自己，主音只是「從哪個音
     開始數」，就直接掛在下筆的那個音上，這樣拖出來的第一顆就是點到的音。
     """
-    if kind in ('scale', 'thirds', 'arpeggio', 'arpeggio7'):
+    if kind in SHAPE_KINDS:
         return key
     scale = SCALE_BY_KEY.get(str(kind))
     if scale is None:
@@ -252,11 +290,17 @@ def build_pattern(kind: str, key: Key, start_pitch: int, count: int,
                   direction: int = 1) -> List[int]:
     """UI 用的統一入口。
 
-    `kind` 是 'scale' | 'thirds' | 'arpeggio' | 'arpeggio7'，或 `SCALES` 裡的
-    任一個音階 id（'chromatic'、'blues'、'dorian' …），後者就是照那個音階級進。
+    `kind` 是 `SHAPE_KINDS` 裡的一個（'scale' | 'thirds' | 'arpeggio' |
+    'arpeggio7' | 'trill' | 'trill_note'），或 `SCALES` 裡的任一個音階 id
+    （'chromatic'、'blues'、'dorian' …），後者就是照那個音階級進。
     `direction=0` 表示上行之後再原路下行（去掉重複的頂點）。
     """
     use = pattern_key(kind, key, start_pitch)
+
+    # 顫音是來回，不是一條線：`direction` 在這裡只決定鄰音在上還是在下，所以
+    # 不能走下面的折返路徑（來回再反著來回一次，等於最後兩顆同音連按）。
+    if kind in TRILL_KINDS:
+        return build_trill(use, start_pitch, count, direction)
 
     def once(dir_: int) -> List[int]:
         if kind == 'arpeggio':

@@ -147,6 +147,91 @@ class GridMenuTests(unittest.TestCase):
         self.assertTrue(any(getattr(t, 'grid_btn', None) is not None for t in self.win._toolbars))
 
 
+class GridIsPinnedNextToPrecisionTests(unittest.TestCase):
+    """使用者：「隔線顯示也放在常用，放在精度旁」。
+
+    「常用」那一頁是照操作紀錄長出來的，但精度一直是**釘住**的（使用者早先
+    指定）。格線跟著它釘在旁邊：格線設成「跟著編輯精度」時，精度選什麼就畫
+    哪一層——它們是同一件事的兩半，分開放等於要人在兩個分頁之間來回。
+    """
+
+    def setUp(self):
+        from qt_editor.main_window import MainWindow
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.win = MainWindow()
+        self.addCleanup(lambda: (setattr(self.win.view.model, 'dirty', False),
+                                 self.win.close()))
+        self.tbs = self.win._toolbars[0]
+
+    def common_page(self):
+        tabs = self.tbs.tabs
+        for i in range(tabs.count()):
+            if tabs.tabText(i) == '常用':
+                return tabs.widget(i)
+        self.fail('找不到「常用」分頁')
+
+    def test_the_grid_button_is_on_the_common_tab(self):
+        from PyQt5.QtWidgets import QToolButton
+        texts = [b.text() for b in self.common_page().findChildren(QToolButton)]
+        self.assertIn('格線 ▾', texts)
+
+    def test_it_sits_right_after_precision(self):
+        from PyQt5.QtWidgets import QComboBox, QLabel, QToolButton
+        order = []
+        for ch in self.common_page().findChildren((QLabel, QComboBox, QToolButton)):
+            if isinstance(ch, QLabel) and ch.text() == '精度':
+                order.append('精度')
+            elif isinstance(ch, QComboBox):
+                order.append('下拉')
+            elif isinstance(ch, QToolButton) and ch.text() == '格線 ▾':
+                order.append('格線')
+        self.assertEqual(order[:3], ['精度', '下拉', '格線'])
+
+    def test_it_opens_the_same_menu(self):
+        btn = self.tbs.common_grid_btn
+        self.assertIsNotNone(btn.menu())
+        btn.menu().aboutToShow.emit()
+        texts = [a.text() for a in btn.menu().actions()]
+        self.assertIn('跟著編輯精度', texts)
+        self.assertIn('自訂 N 分音符…', texts)
+
+    def test_the_two_buttons_stay_in_step(self):
+        """不必同步狀態——選單每次打開都從設定重建，按下去也只寫設定。"""
+        saved = {k: settings._data.get(k) for k in KEYS}
+        self.addCleanup(lambda: settings._data.update(
+            {k: v for k, v in saved.items() if v is not None}))
+        settings._data.update(grid_divisions=[], place_grid_mode='placement')
+
+        def checked(btn, name):
+            btn.menu().aboutToShow.emit()
+            return next(a.isChecked() for a in btn.menu().actions()
+                        if a.text() == name)
+
+        common, home = self.tbs.common_grid_btn, self.tbs.grid_btn
+        self.assertFalse(checked(common, '16分音符'))
+        self.assertFalse(checked(home, '16分音符'))
+        for act in common.menu().actions():
+            if act.text() == '16分音符':
+                act.setChecked(True)
+                break
+        self.assertEqual(settings.get('grid_divisions'), [16])
+        self.assertTrue(checked(common, '16分音符'))
+        self.assertTrue(checked(home, '16分音符'), '「編輯」分頁那顆沒跟上')
+
+    def test_the_home_button_is_not_clobbered(self):
+        """常用那一頁每次切過來都重建；`tbs.grid_btn` 要還是「編輯」分頁那顆，
+        不然別處拿到的會是已經被回收的 C++ 物件。"""
+        home = self.tbs.grid_btn
+        self.win._refresh_common_tab()
+        self.assertIs(self.tbs.grid_btn, home)
+        self.assertIsNot(self.tbs.common_grid_btn, home)
+        self.assertEqual(self.tbs.grid_btn.text(), '格線 ▾')
+
+    def test_both_buttons_say_the_same_thing(self):
+        self.assertEqual(self.tbs.common_grid_btn.toolTip(),
+                         self.tbs.grid_btn.toolTip())
+
+
 if __name__ == '__main__':
     unittest.main()
 

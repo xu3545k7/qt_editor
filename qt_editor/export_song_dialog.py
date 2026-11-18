@@ -246,7 +246,18 @@ class ExportSongDialog(QDialog):
         self._cb_category.setToolTip(
             '選歌畫面的分類頁籤。可以直接打新的分類名稱。\n'
             '存在 <匯出根目錄>/library.json，不在 register.json 裡。')
-        form.addRow('分類', self._cb_category)
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(self._cb_category, 1)
+        # 直接在框裡打新名字也會生效（匯出時一併寫進 library.json），但那條路
+        # 不檢查名稱：打到非法字元或和既有分類只差大小寫，要到遊戲裡才看得出
+        # 不對。這顆按鈕走 `SongLibrary.add_category`，和「管理曲庫」同一套規則，
+        # 而且**現在就建好**——不必等這首歌匯出，下一首就選得到。
+        new_cat = QPushButton('新增…')
+        new_cat.setToolTip('在匯出根目錄的 library.json 裡建立一個新分類，\n'
+                           '規則和「管理曲庫」的新增分類一樣。')
+        new_cat.clicked.connect(lambda _c=False: self._new_category())
+        cat_row.addWidget(new_cat)
+        form.addRow('分類', cat_row)
         self._reload_categories()
 
         # 無背景音樂：純鋼琴曲不需要伴奏，遊戲裡只該響玩家打出來的音。
@@ -581,6 +592,41 @@ class ExportSongDialog(QDialog):
         self._cb_category.clear()
         self._cb_category.addItems(names)
         self._cb_category.setCurrentText(current or DEFAULT_CATEGORY)
+
+    def _new_category(self) -> None:
+        """在匯出根目錄的曲庫裡建一個新分類，建完直接選起來。
+
+        走 `SongLibrary.add_category`，所以名稱規則、歷史快照（復原上一步）和
+        「曲庫改過了」的記號都和「管理曲庫」那邊一致——兩條路寫出來的
+        library.json 必須是同一種東西。
+        """
+        from .song_library import LibraryError, SongLibrary
+
+        root = self._export_root or ''
+        if not root or not os.path.isdir(root):
+            QMessageBox.information(self, '新增分類',
+                                    '先選好匯出根目錄，分類是存在它底下的 '
+                                    'library.json 裡。')
+            return
+        existing = []
+        for i in range(self._cb_category.count()):
+            existing.append(self._cb_category.itemText(i))
+        name, ok = QInputDialog.getText(
+            self, '新增分類',
+            '分類名稱：\n（目前有：%s）' % ('、'.join(existing) or '無'))
+        name = (name or '').strip()
+        if not ok or not name:
+            return
+        try:
+            SongLibrary(root).add_category(name)
+        except LibraryError as exc:
+            QMessageBox.warning(self, '新增分類', str(exc))
+            return
+        except Exception as exc:                        # noqa: BLE001
+            QMessageBox.critical(self, '新增分類', str(exc))
+            return
+        self._reload_categories()
+        self._cb_category.setCurrentText(name)
 
     def _category_of_folder(self, folder_name: str) -> str:
         """library.json 裡這個曲目資料夾目前的分類；沒有就回預設值。"""

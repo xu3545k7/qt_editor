@@ -133,6 +133,32 @@ class HiraethExportDialog(QDialog):
             '樂曲資料夾／曲庫：有 pianoAudioResourcePath 的曲子把那份鋼琴音軌疊上去。\n'
             '目前譜面：用內建音源把譜面算成鋼琴音軌再疊上去。'))
         options.addRow(tr('音樂'), self.mix_check)
+        # 包是給**別人**匯入的，別人那份 Hiraeth 是原版。原版會退件的有三樣：
+        # 顫音（note_type 64）、REAL 的半級（2.5／3.5）、按鍵音（velocity≠0）。
+        # 以前三樣都照我們這台改過的 importer 輸出，所以只有自己匯得進去。
+        self.stock_check = QCheckBox(tr('相容沒改過的 Hiraeth（要給別人匯入就勾著）'))
+        self.stock_check.setChecked(bool(settings.get('hiraeth_stock_compatible', True)))
+        self.stock_check.setToolTip(tr(
+            '勾選：只用原版 importer 收得下的東西，任何一台 Hiraeth 都匯得進去。'
+            + chr(10) +
+            '  ・REAL 等級只用 1／2／3（Lv≤11→1、Lv12~13→2、Lv≥14→3）'
+            + chr(10) +
+            '  ・不做顫音（連續的 soft 各自變點擊；手寫的顫音變長押）'
+            + chr(10) +
+            '  ・不能保留按鍵音'
+            + chr(10) + chr(10) +
+            '不勾：用 REAL 半級（2.5／3.5）和顫音，刻度比較細、看起來也對，'
+            + chr(10) +
+            '但對方的 tools/import_tools/importer.py 必須改過，否則**整包退件**，'
+            + chr(10) +
+            '訊息是英文的：REAL display level must be 1/2/3; game levels must be 1..15。'))
+        options.addRow(tr('相容性'), self.stock_check)
+        # 關掉的後果要**看得到**，不能只寫在提示裡：這個選項關掉之後，包照樣
+        # 輸出成功、自己也匯得進去，要等到別人匯入失敗才會發現。
+        self.stock_warn = QLabel('')
+        self.stock_warn.setWordWrap(True)
+        self.stock_warn.setStyleSheet('color: #c08040; font-size: 11px;')
+        options.addRow('', self.stock_warn)
         self.keysound_check = QCheckBox(tr('保留按鍵音（velocity 不歸零）'))
         self.keysound_check.setChecked(bool(settings.get('hiraeth_keysound', False)))
         self.keysound_check.setToolTip(tr(
@@ -155,6 +181,9 @@ class HiraethExportDialog(QDialog):
             lambda _on: self._update_keysound_warning())
         self.mix_check.setEnabled(not self.keysound_check.isChecked())
         options.addRow('', self.keysound_check)
+        self.stock_check.toggled.connect(self._on_stock_toggled)
+        self.keysound_check.setEnabled(not self.stock_check.isChecked())
+        self._update_stock_warning()
         # Hiraeth 一更新就會把我們改過的 importer 蓋回去，然後這個模式匯出的
         # 包會被退件——而錯誤訊息是英文的，看起來像我們的包壞了。所以在**勾的
         # 當下**就去讀那份 importer，不要等到匯入失敗。
@@ -350,7 +379,9 @@ class HiraethExportDialog(QDialog):
         mode = self.mode()
         if mode == MODE_CHART:
             self.layout_label.setText(tr(
-                '目前開著的這一份譜 → 一包，放進上面選的那一格。'))
+                '目前開著的這一份譜 → 一包，放進上面選的那一格。')
+                + ('' if self.stock_check.isChecked() else
+                   chr(10) + tr('沒有勾相容：對方的 importer 必須改過才匯得進去。')))
             return
         if mode == MODE_LIBRARY:
             root = self.library_edit.text().strip()
@@ -390,8 +421,14 @@ class HiraethExportDialog(QDialog):
                 if slot == 'real':
                     shown = (chart.real_display if chart.real_display is not None
                              else H.real_level(chart.level))
-                    mark = ('  ← %s' % tr('Hiraeth 的 REAL 上限，比它高的都一樣')
-                            if int(chart.level) > 15 else '')
+                    if self.stock_check.isChecked():
+                        stock_shown = H.to_stock_real(shown)
+                        mark = ('  ← %s' % tr('原版 Hiraeth 的 REAL 只有 1／2／3')
+                                if stock_shown != shown else '')
+                        shown = stock_shown
+                    else:
+                        mark = ('  ← %s' % tr('Hiraeth 的 REAL 上限，比它高的都一樣')
+                                if int(chart.level) > 15 else '')
                     lines.append('    %-6s ← %s（Lv%s）＝ REAL %s%s'
                                  % (slot, chart.name, chart.level, shown, mark))
                 else:
@@ -419,21 +456,51 @@ class HiraethExportDialog(QDialog):
         self.chart_box.setEnabled(mode == MODE_CHART)
         self._update_layout_label()
         real = self.slot_combo.currentText() == 'real'
-        if real == getattr(self, '_level_is_real', None):
+        # 相容模式的 REAL 只有 1／2／3，所以範圍跟著「哪一格」和「相不相容」兩件事走
+        state = (real, bool(self.stock_check.isChecked()))
+        if state == getattr(self, '_level_state', None):
             return
         # REAL（1～3.5 半級）和其他難度（1～15）各記各的，切換難度格時不會
         # 被新的範圍夾掉：原本填 12 切到 real 再切回來，要還是 12。
-        previous = getattr(self, '_level_is_real', None)
+        previous = getattr(self, '_level_state', None)
         if previous is not None:
-            self._level_memory[previous] = self.level_spin.value()
+            self._level_memory[previous[0]] = self.level_spin.value()
+        self._level_state = state
         self._level_is_real = real
         self.level_spin.blockSignals(True)
-        self.level_spin.setDecimals(1 if real else 0)
-        self.level_spin.setSingleStep(0.5 if real else 1)
-        self.level_spin.setRange(1, 3.5 if real else 15)
-        self.level_spin.setToolTip(tr('REAL 等級 1～3.5，每格 0.5') if real else '1～15')
+        if real and state[1]:
+            self.level_spin.setDecimals(0)
+            self.level_spin.setSingleStep(1)
+            self.level_spin.setRange(1, 3)
+            self.level_spin.setToolTip(tr('REAL 等級 1～3（原版 Hiraeth 只收這三格）'))
+        elif real:
+            self.level_spin.setDecimals(1)
+            self.level_spin.setSingleStep(0.5)
+            self.level_spin.setRange(1, 3.5)
+            self.level_spin.setToolTip(tr('REAL 等級 1～3.5，每格 0.5'))
+        else:
+            self.level_spin.setDecimals(0)
+            self.level_spin.setSingleStep(1)
+            self.level_spin.setRange(1, 15)
+            self.level_spin.setToolTip('1～15')
+        # 值會被新的上限夾掉，那正是我們要的（3.5 在相容模式就是 3）
         self.level_spin.setValue(self._level_memory.get(real, 3 if real else 10))
         self.level_spin.blockSignals(False)
+
+    def _on_stock_toggled(self, on: bool) -> None:
+        """相容模式和按鍵音互斥：原版 importer 第 74 行硬擋 velocity≠0。"""
+        if on and self.keysound_check.isChecked():
+            self.keysound_check.setChecked(False)
+        self.keysound_check.setEnabled(not on)
+        self._update_stock_warning()
+        self._sync()
+        self._update_layout_label()
+
+    def _update_stock_warning(self) -> None:
+        self.stock_warn.setText('' if self.stock_check.isChecked() else tr(
+            '沒有勾：這個包只有 importer 改過的 Hiraeth 裝得進去。'
+            '別人匯入會**整包**退件（REAL display level must be 1/2/3…），'
+            '自己這台因為改過，匯得進去看不出問題。'))
 
     def _pick_song(self) -> None:
         path = QFileDialog.getExistingDirectory(self, tr('選擇樂曲資料夾'), self.song_edit.text())
@@ -506,7 +573,8 @@ class HiraethExportDialog(QDialog):
     def _apply_options(self, plans):
         slogan = H.clean_slogan(self.slogan_edit.text())
         for plan in plans:
-            plan.keysound = self.keysound_check.isChecked()
+            plan.stock_compatible = self.stock_check.isChecked()
+            plan.keysound = self.keysound_check.isChecked() and not plan.stock_compatible
             plan.mix_piano = self.mix_check.isChecked() and not plan.keysound
             plan.lead_in_bars = self.lead_in_bars()
             if self.mode() != MODE_LIBRARY:
@@ -531,6 +599,7 @@ class HiraethExportDialog(QDialog):
         settings.set('hiraeth_export_dir', self.out_edit.text().strip())
         settings.set('hiraeth_mix_piano', self.mix_check.isChecked())
         settings.set('hiraeth_keysound', self.keysound_check.isChecked())
+        settings.set('hiraeth_stock_compatible', self.stock_check.isChecked())
         settings.set('hiraeth_process_hold_tails', self.tail_check.isChecked())
         settings.set('hiraeth_hold_gap_ms', int(self.gap_spin.value()))
         settings.set('hiraeth_lead_in_bars', self.lead_in_bars())

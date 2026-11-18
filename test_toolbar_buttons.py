@@ -252,9 +252,25 @@ class CommonTabTests(unittest.TestCase):
     def page(self):
         return self.win._toolbars[0].tabs.widget(0)
 
+    #: 釘在「常用」上的東西，不是「按過幾次」長出來的，所以這一類測試要排除。
+    #: 精度是 QLabel＋QComboBox（本來就不會被 `buttons()` 抓到），格線是一顆
+    #: QToolButton（使用者：「隔線顯示也放在常用，放在精度旁」）。
+    PINNED_BUTTONS = ('格線 ▾',)
+
     def buttons(self):
+        """**照使用次數長出來的**那些按鈕。釘住的不算。"""
         from PyQt5.QtWidgets import QToolButton
-        return [b.text() for b in self.page().findChildren(QToolButton)]
+        return [b.text() for b in self.page().findChildren(QToolButton)
+                if b.text() not in self.PINNED_BUTTONS]
+
+    def test_the_pinned_ones_are_there_whatever_you_pressed(self):
+        """排除是刻意的，不是沒看到——釘住的那些一開始就該在。"""
+        from PyQt5.QtWidgets import QLabel, QToolButton
+        texts = [b.text() for b in self.page().findChildren(QToolButton)]
+        for name in self.PINNED_BUTTONS:
+            self.assertIn(name, texts)
+        labels = [l.text() for l in self.page().findChildren(QLabel)]
+        self.assertIn('精度', labels)
 
     def press(self, label, times=1):
         for _ in range(times):
@@ -305,9 +321,16 @@ class CommonTabTests(unittest.TestCase):
         self.assertLessEqual(len(self.buttons()), MAX_COMMON)
 
     def test_every_button_says_how_often_you_pressed_it(self):
+        """長出來的那些要講「按過幾次、家在別的分頁」。
+
+        釘住的不講——它不是因為你按過才在那裡的，寫「按過 0 次」只會誤導。
+        """
         self.press('PianoTrans 轉譜整理…', 4)
         from PyQt5.QtWidgets import QToolButton
-        for b in self.page().findChildren(QToolButton):
+        grown = [b for b in self.page().findChildren(QToolButton)
+                 if b.text() not in self.PINNED_BUTTONS]
+        self.assertTrue(grown)
+        for b in grown:
             self.assertIn('按過', b.toolTip())
 
     def test_the_registry_covers_every_tab(self):
@@ -495,14 +518,29 @@ class NotesLockedTests(unittest.TestCase):
 
     def test_locked_snaps_to_note_ends(self):
         self.view.notes_locked = True
-        self.assertIn(1700, self.view._barline_snap_targets())
+        self.assertEqual(dict(self.view._barline_snap_targets()).get(1700), '音符尾')
         got, hit = self.view._barline_snap(1690.0)
         self.assertEqual((got, hit), (1700.0, 1700))
 
-    def test_it_snaps_to_ends_not_starts(self):
-        """尾拍＝音符終點。起點 1500 不該是吸附目標。"""
+    def test_starts_and_beat_lines_are_targets_too(self):
+        """使用者後來要求「兩種都吸，取最近的」，所以起音點和拍線也算。
+
+        原本只有音符終點；那條測試（`test_it_snaps_to_ends_not_starts`）當時
+        釘的是「起點 1500 不該是吸附目標」，現在刻意翻掉。可以在「拖曳小節線」
+        的下拉裡整個關掉。詳見 test_barline_drag_modes.py。
+        """
         self.view.notes_locked = True
-        self.assertNotIn(1500, self.view._barline_snap_targets())
+        kinds = dict(self.view._barline_snap_targets())
+        self.assertEqual(kinds.get(1500), '起音')
+        self.assertIn('拍線', kinds.values())
+
+    def test_the_snapping_can_be_turned_off(self):
+        self.view.notes_locked = True
+        self.view.barline_snap_enabled = False
+        self.view._snap_targets_cache = None
+        self.addCleanup(setattr, self.view, 'barline_snap_enabled', True)
+        self.assertEqual(self.view._barline_snap_targets(), [])
+        self.assertEqual(self.view._barline_snap(1690.0), (1690.0, None))
 
     def test_it_does_not_drag_you_across_the_room(self):
         self.view.notes_locked = True

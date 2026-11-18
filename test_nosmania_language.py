@@ -62,6 +62,112 @@ class TranslationTableTests(unittest.TestCase):
         self.assertEqual(tr('曲庫'), '曲庫')
 
 
+class JapaneseTableTests(unittest.TestCase):
+    """日文是第四種語言，兩張表（i18n 的 key 表、ui_text 的繁體原文表）都要滿。
+
+    日文和韓文在遊戲端走的是「繁體字串當鍵查表」，這裡的 `_JA` 是同一個做法。
+    漏翻時**退英文不退繁體**：日文畫面上冒出一句繁體中文像是程式壞了。
+    """
+
+    def tearDown(self):
+        i18n.set_lang('zh_tw')
+
+    def test_i18n_has_every_key(self):
+        zh = i18n._STRINGS['zh_tw']
+        ja = i18n._STRINGS['ja']
+        self.assertEqual([k for k in zh if k not in ja], [])
+        self.assertEqual([k for k, v in zh.items() if v and not ja.get(k)], [])
+
+    def test_ui_text_has_every_key(self):
+        from qt_editor.ui_text import _JA, _TABLE
+        self.assertEqual([k for k in _TABLE if k not in _JA], [])
+        self.assertEqual([k for k, v in _JA.items() if not v], [])
+
+    def test_placeholders_match(self):
+        import re
+        from qt_editor.ui_text import _JA
+        # %s %d %r %.1f %+.1f 都要照數量留著，不然 tr(...) % args 會當場炸
+        spec = re.compile(r'%(?:\d+\$)?[-+ #0]*\d*(?:\.\d+)?[a-zA-Z]')
+        for src_text, ja in _JA.items():
+            self.assertEqual(len(spec.findall(ja)), len(spec.findall(src_text)), src_text)
+        brace = re.compile(r'\{[^{}]*\}')
+        zh = i18n._STRINGS['zh_tw']
+        for key, ja in i18n._STRINGS['ja'].items():
+            want = sorted(x.split(':')[0].rstrip('}') + '}' for x in brace.findall(zh[key]))
+            got = sorted(x.split(':')[0].rstrip('}') + '}' for x in brace.findall(ja))
+            self.assertEqual(got, want, key)
+
+    def test_japanese_is_returned(self):
+        from qt_editor.ui_text import tr
+        i18n.set_lang('ja')
+        self.assertEqual(tr('曲庫'), 'ライブラリ')
+        self.assertEqual(i18n.t('menu_file'), 'ファイル(&F)')
+        self.assertEqual(i18n.t('dlg_bpm_label', 120.0), '現在の BPM = 120.00\n新しい BPM：')
+
+    def test_missing_falls_back_to_english_not_chinese(self):
+        ja = i18n._STRINGS['ja']
+        saved = ja.pop('menu_file')
+        try:
+            i18n.set_lang('ja')
+            self.assertEqual(i18n.t('menu_file'), 'File(&F)')
+        finally:
+            ja['menu_file'] = saved
+
+    def test_every_language_reaches_the_game(self):
+        """選單上列得出來的語言，啟動器都要能寫進 nosmania_launcher.json。"""
+        from qt_editor.launcher import GAME_LANGUAGE
+        from qt_editor.ui_text import LANGUAGES
+        self.assertEqual([c for c, _ in LANGUAGES if c not in GAME_LANGUAGE], [])
+        self.assertEqual(GAME_LANGUAGE['ja'], 'Japanese')
+
+    def test_language_lists_are_not_copied(self):
+        """三個地方以前各抄一份語言清單，加語言時只改一處就會漏。"""
+        from qt_editor.app import pop_lang_arg
+        from qt_editor.settings_dialog import _LANG_OPTIONS
+        from qt_editor.ui_text import LANGUAGES
+        self.assertEqual(pop_lang_arg(['x', '--lang', 'ja']), 'ja')
+        self.assertEqual(pop_lang_arg(['x', '--lang', 'ko']), '')
+        self.assertEqual([c for _, c in _LANG_OPTIONS], [c for c, _ in LANGUAGES])
+
+
+class JapaneseFontTests(unittest.TestCase):
+    """日文介面要換字型：系統字型的漢字是本地字形，日文看起來會怪。"""
+
+    def tearDown(self):
+        i18n.set_lang('zh_tw')
+        from qt_editor.ui_font import apply_ui_font
+        apply_ui_font()
+
+    def test_font_file_ships_with_the_package(self):
+        from qt_editor.ui_font import _font_path
+        self.assertTrue(os.path.isfile(_font_path()), _font_path())
+
+    def test_switches_and_switches_back(self):
+        # 家族名不寫死：Qt 回的是 'Gen Shin Gothic' 還是 'Gen Shin Gothic Regular'
+        # 要看平台和這個 process 裡已經註冊過什麼，兩種都對。
+        from qt_editor.ui_font import _load_family, apply_ui_font
+        app = QApplication.instance()
+        i18n.set_lang('zh_tw')
+        apply_ui_font(app)
+        before = app.font().family()
+        size = app.font().pointSize()
+        family = _load_family()
+        self.assertTrue(family.startswith('Gen Shin Gothic'), family)
+        i18n.set_lang('ja')
+        apply_ui_font(app)
+        self.assertEqual(app.font().family(), family)
+        self.assertEqual(app.font().pointSize(), size)   # 只換家族，不動字級
+        i18n.set_lang('zh_tw')
+        apply_ui_font(app)
+        self.assertEqual(app.font().family(), before)
+
+    def test_specs_bundle_the_font(self):
+        for name in ('NostalgiaChartEditor.spec', 'NosMania.spec',
+                     'NostalgiaChartEditor-mac.spec'):
+            with io.open(os.path.join(HERE, name), encoding='utf-8') as fh:
+                self.assertIn("('qt_editor/fonts', 'qt_editor/fonts')", fh.read(), name)
+
+
 class LauncherLanguageTests(unittest.TestCase):
     def setUp(self):
         from qt_editor.launcher import LauncherWindow

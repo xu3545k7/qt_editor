@@ -15,7 +15,9 @@ importer（`tools/import_tools/importer.py`）比 PAN 讀檔程式嚴格很多�
 - 長押長度照偏好設定縮成官方長度（預設 80%，從官方 XML 來的不縮）
 - 譜面先跑一次「處理長條尾端」（最小間距預設 80ms），手才來得及放開
 - 封面 PNG 74～4096 像素；曲名、作者要能用 Shift_JIS X 0213 編碼
-- 難度只有 normal／hard／expert／real，real 等級 1～3.5（半級）、其他 1～15
+- 難度只有 normal／hard／expert／real，其他格 1～15。**原版 importer 的 real
+  只收 1／2／3**；半級（2.5／3.5）和顫音、按鍵音一樣要改過的 importer 才收，
+  見 `PackagePlan.stock_compatible`
 - ZIP 根目錄只能有 song.json、music.wav、preview.wav、cover.png 與四種難度 xml
 
 `validate_package()` 照 importer 的檢查逐條實作，輸出前先自己驗過。
@@ -49,9 +51,17 @@ SLOTS = ('normal', 'hard', 'expert', 'real')
 #: Hiraeth 收的音符類型：Tap、Long、Slide、Trill(0x40)。
 #:
 #: 原版 importer 只收 0／2／4，所以以前輸出時把顫音改成長押 —— 玩家在套件裡看到的是
-#: 一條長條，不是顫音。本機的 importer 已經加上 64（本家遊戲本來就有顫音），這裡
-#: 就照原樣輸出。
+#: 一條長條，不是顫音。本機的 importer 已經加上 64（本家遊戲本來就有顫音），所以
+#: **關掉相容模式時**照原樣輸出 64；相容模式還是走老路（見 STOCK_NOTE_TYPES）。
 HIRAETH_NOTE_TYPES = (0, 2, 4, 64)
+#: 原版（沒改過的）importer 收的音符類型與 REAL 等級。
+#:
+#: 包是拿來給**別人**匯入的，別人那份 Hiraeth 是官方原版：顫音（64）會退件
+#: （'Unsupported note type/hand/key kind'）、REAL 的半級也會退件
+#: （'REAL display level must be 1/2/3; game levels must be 1..15'）。
+#: 所以預設照原版的規則輸出，見 `PackagePlan.stock_compatible`。
+STOCK_NOTE_TYPES = (0, 2, 4)
+STOCK_REAL_LEVELS = (1, 2, 3)
 AUDIO_RATES = (16000, 22050, 44100, 48000)
 MAX_WAV_BYTES = 128 * 1024 * 1024
 MAX_PACKAGE_BYTES = 300 * 1024 * 1024
@@ -172,18 +182,32 @@ REAL_LEVELS = (1, 2, 2.5, 3, 3.5)
 _REAL_BY_LEVEL = {12: 2, 13: 2.5, 14: 3}
 
 
-def real_level(level: int) -> float:
+def real_level(level: int, stock: bool = False) -> float:
     """遊戲的難度等級（整數）→ REAL 顯示等級。
 
     ≤11 → 1、12 → 2、13 → 2.5、14 → 3、15 以上 → 3.5。整數回傳 int，
     song.json 才寫成 `2` 而不是 `2.0`。
+
+    `stock=True` ＝ 只用原版 importer 收的 1／2／3（≤11 → 1、12~13 → 2、
+    ≥14 → 3）。刻度從六格變三格，但對方不必改 importer 就能匯入。
     """
     value = int(round(float(level or 0)))
+    if stock:
+        return 1 if value <= 11 else (2 if value <= 13 else 3)
     if value <= 11:
         return 1
     if value >= 15:
         return 3.5
     return _REAL_BY_LEVEL[value]
+
+
+def to_stock_real(display: float) -> int:
+    """REAL 顯示等級（可能是半級）→ 原版 importer 收得下的 1／2／3。
+
+    平手時往下取：2.5 離 2 和 3 一樣遠，標低一點比標高一點安全
+    （照標示挑到的是比預期難的譜，不是看到數字就先跳過）。
+    """
+    return int(min(STOCK_REAL_LEVELS, key=lambda v: (abs(v - float(display)), v)))
 
 
 def resolve_resource(song_dir: str, resource: Optional[str], exts: Tuple[str, ...]) -> Optional[str]:
@@ -335,7 +359,7 @@ def _trim_beats(root: Any, duration_ms: int, log: Dict[str, int]) -> None:
 
 def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
                       hold_gap_ms: int = DEFAULT_HOLD_GAP_MS,
-                      keysound: bool = False) -> bytes:
+                      keysound: bool = False, stock: bool = False) -> bytes:
     """PAN 相容 XML 再收緊到 Hiraeth 的規則。`model` 會被改，請傳副本。
 
     `keysound=True` ＝ 保留 sub_note 的 velocity，讓遊戲在玩家敲下去的時候
@@ -366,8 +390,19 @@ def hiraeth_chart_xml(model: Any, duration_ms: int, log: Dict[str, int],
         type_el = note.find('note_type')
         nt = int(type_el.text)
         if nt & 0x40:
-            nt = 0x40                      # 顫音照原樣（連同它的 sub_note）
-            trills += 1
+            if stock:
+                # 原版 importer 只收 0／2／4，所以顫音要壓成長押——顫音在遊戲裡
+                # 就是「按住、在區間裡交替」，判定走的本來就是長押那條
+                # （clone 的 `HoldJudgment` 直接認 note_type == 64）。
+                #
+                # **要自己補上 0x02**：只清掉 0x40 的話，`note_type` 剛好是 0x40
+                # 的顫音（`make_trill_from_notes` 給的就是這個值）會變成 0 ＝
+                # 點擊，744ms 的顫音塌成一次按鍵。2026-09-15 整庫 96 包是這樣
+                # 過的，但那批掃出 0 顆顫音，所以這條路從來沒被走到過。
+                nt = (nt & ~0x40) | 0x02
+            else:
+                nt = 0x40                  # 顫音照原樣（連同它的 sub_note）
+                trills += 1
         nt &= ~0x08
         if nt not in HIRAETH_NOTE_TYPES:
             nt = 0
@@ -497,6 +532,10 @@ class PackagePlan:
     #: （本家本來就是這樣）。打開之後**不會**把鋼琴軌混進 music.wav，否則同一個
     #: 音會聽到兩次。要搭配改過的 Hiraeth importer（它第 74 行硬擋 velocity≠0）。
     keysound: bool = False
+    #: 包要能在**沒改過的** Hiraeth 上匯入（預設開）。不做顫音（連續的 soft 各自
+    #: 變點擊、手寫的顫音照 2026-09-15 那版變長押）、REAL 等級壓成 1／2／3。
+    #: 關掉才會用半級和顫音，但對方的 importer 必須改過，否則整包退件。
+    stock_compatible: bool = True
     mix_piano: bool = True            # 有背景音樂時疊上鋼琴音軌
     render_piano_layer: bool = False  # 沒有鋼琴音軌檔時用內建音源算一份來疊（目前譜面模式）
     lead_in_bars: int = DEFAULT_LEAD_IN_BARS   # 譜面開頭要空幾小節（0 = 照原樣）
@@ -716,6 +755,11 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
     result = PackageResult(plan)
     work = tempfile.mkdtemp(prefix='hiraeth_')
     try:
+        if plan.stock_compatible and plan.keysound:
+            # 兩個願望一次滿足不了：原版 importer 第 74 行硬擋 velocity≠0。
+            # 寧可在這裡停下來，也不要**默默**把按鍵音丟掉。
+            raise ValueError(tr('相容模式不能保留按鍵音：原版 importer 只收 '
+                                'sub_note 力度 0 的包。'))
         charts: List[Tuple[ChartSource, Any]] = []
         for chart in plan.charts:
             if chart.model is not None:
@@ -732,7 +776,10 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
         from .soft_runs import convert_soft_runs
         slides = trills = 0
         for _chart, model in charts:
-            converted = convert_soft_runs(model)
+            # 相容模式不做顫音（原版 importer 不收 note_type 64）：那些 soft 各自
+            # 變點擊。做了再降級更糟——顫音是**一顆**帶 sub_note 的音，降成長押
+            # 的話整串就只剩一條。
+            converted = convert_soft_runs(model, allow_trills=not plan.stock_compatible)
             slides += converted.slide_chains
             trills += converted.trills
         if slides or trills:
@@ -853,7 +900,8 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
         for chart, model in charts:
             log: Dict[str, int] = {}
             data = hiraeth_chart_xml(model, duration_ms, log, hold_gap_ms,
-                                     keysound=plan.keysound)
+                                     keysound=plan.keysound,
+                                     stock=plan.stock_compatible)
             with open(os.path.join(work, chart.slot + '.xml'), 'wb') as fh:
                 fh.write(data)
             trills += log['trills_kept']
@@ -867,7 +915,16 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
                     flattened.append((chart.name, int(chart.level),
                                       '%s %d' % (chart.slot.upper(), 15)))
             elif chart.real_display is not None:
-                levels[chart.slot] = chart.real_display
+                levels[chart.slot] = (to_stock_real(chart.real_display)
+                                      if plan.stock_compatible else chart.real_display)
+                if levels[chart.slot] != chart.real_display:
+                    flattened.append((chart.name, int(chart.level),
+                                      'REAL %g' % levels[chart.slot]))
+            elif plan.stock_compatible:
+                levels[chart.slot] = real_level(chart.level, stock=True)
+                if real_level(chart.level) != levels[chart.slot]:
+                    flattened.append((chart.name, int(chart.level),
+                                      'REAL %g' % levels[chart.slot]))
             else:
                 levels[chart.slot] = real_level(chart.level)
                 if int(chart.level) >= 15:
@@ -879,9 +936,10 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
                     flattened.append((chart.name, int(chart.level), 'REAL 1'))
         if flattened:
             result.notes.append(tr(
-                '等級被 Hiraeth 的刻度壓掉：%s。'
-                'REAL 只有 1／2／2.5／3／3.5，normal/hard/EX 只收 1~15。')
-                % '、'.join('%s Lv%d→%s' % row for row in flattened))
+                '等級被 Hiraeth 的刻度壓掉：%s。%s，normal/hard/EX 只收 1~15。')
+                % ('、'.join('%s Lv%d→%s' % row for row in flattened),
+                   tr('原版 importer 的 REAL 只有 1／2／3') if plan.stock_compatible
+                   else tr('REAL 只有 1／2／2.5／3／3.5')))
         if trills:
             result.notes.append(tr('%d 顆顫音照原樣保留') % trills)
         if dropped:
@@ -909,7 +967,7 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
         with open(os.path.join(work, 'song.json'), 'w', encoding='utf-8') as fh:
             json.dump(spec, fh, ensure_ascii=False, indent=2)
 
-        problems = validate_package(work, plan.keysound)
+        problems = validate_package(work, plan.keysound, stock=plan.stock_compatible)
         if problems:
             raise ValueError(tr('沒通過 Hiraeth 的檢查：') + '；'.join(problems))
 
@@ -931,7 +989,8 @@ def build_package(plan: PackagePlan, out_dir: str, version: Optional[int] = None
 
 # ── 驗證（照 Hiraeth importer 逐條實作）───────────────────────────────
 
-def validate_package(folder: str, keysound: bool = False) -> List[str]:
+def validate_package(folder: str, keysound: bool = False,
+                     stock: bool = False) -> List[str]:
     problems: List[str] = []
     names = set(os.listdir(folder))
     extra = {n for n in names if n.lower() not in PACKAGE_FILES}
@@ -1015,7 +1074,7 @@ def validate_package(folder: str, keysound: bool = False) -> List[str]:
     for slot, level in levels.items():
         if slot == 'real':
             ok = (not isinstance(level, bool) and isinstance(level, (int, float))
-                  and level in REAL_LEVELS)
+                  and level in (STOCK_REAL_LEVELS if stock else REAL_LEVELS))
         else:
             ok = not isinstance(level, bool) and isinstance(level, int) and 1 <= level <= 15
         if not ok:
@@ -1032,11 +1091,12 @@ def validate_package(folder: str, keysound: bool = False) -> List[str]:
         path = os.path.join(folder, slot + '.xml')
         if os.path.exists(path):
             problems += ['%s.xml：%s' % (slot, p)
-                         for p in validate_chart(path, seconds, keysound)]
+                         for p in validate_chart(path, seconds, keysound, stock)]
     return problems
 
 
-def validate_chart(path: str, seconds: float, keysound: bool = False) -> List[str]:
+def validate_chart(path: str, seconds: float, keysound: bool = False,
+                   stock: bool = False) -> List[str]:
     if os.path.getsize(path) > 16 * 1024 * 1024:
         return [tr('譜面超過 16MB')]
     root = ET.parse(path).getroot()
@@ -1067,9 +1127,10 @@ def validate_chart(path: str, seconds: float, keysound: bool = False) -> List[st
         if not 0 <= values['start_timing_msec'] <= values['end_timing_msec'] <= duration + 2000 \
                 or not 1 <= values['scale_piano'] <= 88:
             bad_note = tr('音符時間或音高不合格')
-        elif values['note_type'] not in HIRAETH_NOTE_TYPES or values['hand'] not in (0, 1) \
-                or values['key_kind'] != 0:
-            bad_note = tr('音符類型／手／key_kind 不合格（只收 Tap、Long、Slide、Trill，手 0／1）')
+        elif values['note_type'] not in (STOCK_NOTE_TYPES if stock else HIRAETH_NOTE_TYPES) \
+                or values['hand'] not in (0, 1) or values['key_kind'] != 0:
+            bad_note = tr('音符類型／手／key_kind 不合格（只收 Tap、Long、Slide%s，手 0／1）') \
+                % ('' if stock else tr('、Trill'))
         elif not 0 <= values['min_key_index'] <= values['max_key_index'] <= 28:
             bad_note = tr('鍵範圍不合格')
         if bad_note:

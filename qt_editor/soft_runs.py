@@ -186,8 +186,12 @@ def classify_run(run: Sequence[Any]) -> List[tuple]:
     return out
 
 
-def convert_soft_runs(model: Any) -> SoftRunResult:
-    """把 model 裡連續的 soft 轉成滑奏鏈／顫音（就地修改）。其他 soft 不動。"""
+def convert_soft_runs(model: Any, allow_trills: bool = True) -> SoftRunResult:
+    """把 model 裡連續的 soft 轉成滑奏鏈／顫音（就地修改）。其他 soft 不動。
+
+    `allow_trills=False` ＝ 不做顫音（原版 Hiraeth importer 不收 note_type 64），
+    那些音照原樣留著，之後各自變成點擊。滑奏（4）原版本來就收，不受影響。
+    """
     result = SoftRunResult()
     notes = list(model.notes_tree)
     remove = set()
@@ -199,6 +203,8 @@ def convert_soft_runs(model: Any) -> SoftRunResult:
                 result.slide_chains += 1
                 result.slide_notes += len(group)
             else:
+                if not allow_trills:
+                    continue
                 trill = make_trill_from_notes(list(group), int(group[0].hand))
                 if trill is None:
                     continue

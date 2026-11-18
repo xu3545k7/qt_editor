@@ -146,6 +146,45 @@ class AHostlessHiddenNoteIsLegalTests(unittest.TestCase):
         self.assertEqual(
             sum(1 for n in back.notes_tree if getattr(n, 'hidden', False)), 1)
 
+    def test_json_says_this_one_always_plays(self):
+        """沒有寄主 → 寫 `autoPlay`，遊戲端才知道要無條件播。
+
+        不能靠「沒有 hostIndex」判斷：那是舊檔的常態，而遊戲對沒有 hostIndex
+        的隱藏音符會挑時間最近的那顆當寄主——挑到排在它前面的那顆時，玩家沒
+        打到就不響。
+        """
+        path = os.path.join(self.dir, 'auto.json')
+        m, _ghost = self.orphan_chart()
+        m.save_json(path)
+        with open(path, encoding='utf-8') as fh:
+            buried = [d for d in json.load(fh)['notes'] if d.get('hidden')]
+        self.assertIs(buried[0].get('autoPlay'), True)
+
+    def test_a_hidden_note_with_a_host_is_not_marked(self):
+        path = os.path.join(self.dir, 'hosted.json')
+        host = make(0, 1000, 60)
+        ghost = make(1, 1000, 67, hidden=True)
+        m = chart([host, ghost])
+        self.assertIsNotNone(host_of(m, ghost), '這個測試需要一顆找得到寄主的')
+        m.save_json(path)
+        with open(path, encoding='utf-8') as fh:
+            buried = [d for d in json.load(fh)['notes'] if d.get('hidden')]
+        self.assertNotIn('autoPlay', buried[0],
+                         '有寄主就走寄主，不要也標成無條件播')
+        self.assertIn('hostIndex', buried[0])
+
+    def test_giving_it_a_host_clears_the_mark(self):
+        """這個旗標是存檔時算出來的，不是音符上的狀態。"""
+        path = os.path.join(self.dir, 'fixed.json')
+        m, ghost = self.orphan_chart()
+        m.notes_tree.append(make(2, 1000, 55))      # 同手、同刻 → 變成寄主
+        m.rebuild_display_cache()
+        self.assertIsNotNone(host_of(m, ghost))
+        m.save_json(path)
+        with open(path, encoding='utf-8') as fh:
+            buried = [d for d in json.load(fh)['notes'] if d.get('hidden')]
+        self.assertNotIn('autoPlay', buried[0])
+
     def test_a_chart_of_nothing_but_hidden_notes_keeps_them_hidden(self):
         """連退路都沒有（一顆可見音符都沒有）時也不准改譜。"""
         ghost = make(0, 1000, 67, hidden=True)

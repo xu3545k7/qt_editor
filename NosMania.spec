@@ -13,6 +13,9 @@ from PyInstaller.utils.hooks import collect_submodules
 datas = [
     ('qt_editor/graphic', 'qt_editor/graphic'),
     ('qt_editor/icon.png', 'qt_editor'),
+    # 日文介面的字型（源真ゴシック）。少了它日文會退回系統字型，
+    # 漢字變成本地字形 —— 見 qt_editor/ui_font.py。
+    ('qt_editor/fonts', 'qt_editor/fonts'),
     ('qt_editor/icon.ico', 'qt_editor'),
     ('qt_editor/Tap.wav', 'qt_editor'),
     ('qt_editor/settings.json', 'qt_editor'),

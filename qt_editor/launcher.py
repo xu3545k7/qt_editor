@@ -94,7 +94,8 @@ def editor_command(path: Optional[str] = None) -> List[str]:
 
 
 GAME_LANGUAGE_FILE = 'nosmania_launcher.json'
-GAME_LANGUAGE = {'zh_tw': 'TraditionalChinese', 'zh_cn': 'SimplifiedChinese', 'en': 'English'}
+GAME_LANGUAGE = {'zh_tw': 'TraditionalChinese', 'zh_cn': 'SimplifiedChinese',
+                 'en': 'English', 'ja': 'Japanese'}
 
 
 def write_game_language(game_dir: str, lang: str, library_root: str = '') -> str:
@@ -665,6 +666,8 @@ class LauncherWindow(QWidget):
         settings.set('language', lang)
         changed = get_lang() != lang
         set_lang(lang)
+        from .ui_font import apply_ui_font
+        apply_ui_font()
         self.write_game_language()
         editor_ipc.send({'lang': lang})
         if not changed:
@@ -980,6 +983,8 @@ def main() -> None:
     app = QApplication(sys.argv)
     from .theme import apply_theme
     apply_theme(app, bool(settings.get('dark_mode', False)))
+    from .ui_font import apply_ui_font
+    apply_ui_font(app)
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(QIcon(icon_path()))
     window = LauncherWindow()

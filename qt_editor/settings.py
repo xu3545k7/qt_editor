@@ -7,7 +7,7 @@ settings.py
 ----
 from .settings import settings
 settings.load()
-lang = settings.get('language')      # 'zh_tw' / 'zh_cn' / 'en'
+lang = settings.get('language')      # 'zh_tw' / 'zh_cn' / 'en' / 'ja'
 settings.set('language', 'en')       # 自動寫入磁碟
 """
 
@@ -66,7 +66,7 @@ _DEFAULTS: dict[str, object] = {
     'dark_mode':          False,
     'keyboard_height_px': 0,      # 0 = 照版面自己算
     'show_statusbar':     True,
-    'language':      'zh_tw',   # 'zh_tw' | 'zh_cn' | 'en'
+    'language':      'zh_tw',   # 'zh_tw' | 'zh_cn' | 'en' | 'ja'
     # 轉譜風格：'eather'（Eather 的手寫譜風格）| 'official'（官方語料風格）
     'chart_style':   'eather',
     'scroll_invert': False,     # bool
@@ -146,6 +146,11 @@ _DEFAULTS: dict[str, object] = {
     'shortcut_toggle_width': 'E',
     'shortcut_measures_bpm': '',
     'shortcut_events': '',
+    # 補標記的跳轉：預設不給鍵，使用者自己在偏好設定裡指定。
+    # 沒登記在這裡的 key，`Settings.set` 會整個丟掉——指了鍵也存不起來。
+    'shortcut_next_melody_break': '',
+    'shortcut_next_overlap': '',
+    'shortcut_next_echo': '',
     # 音源（SoundFont）：空字串 = 用內建那一份；preset 負數 = 跟著音源的預設音色
     'soundfont_path': '',
     'soundfont_preset': -1,

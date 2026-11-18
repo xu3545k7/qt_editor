@@ -49,6 +49,9 @@ VERSION = _read_version()
 datas = [
     ('qt_editor/graphic', 'qt_editor/graphic'),
     ('qt_editor/icon.png', 'qt_editor'),
+    # 日文介面的字型（源真ゴシック）。少了它日文會退回系統字型，
+    # 漢字變成本地字形 —— 見 qt_editor/ui_font.py。
+    ('qt_editor/fonts', 'qt_editor/fonts'),
     ('qt_editor/Tap.wav', 'qt_editor'),
     ('qt_editor/settings.json', 'qt_editor'),
     ('qt_editor/ai_transcribe_worker.py', 'qt_editor'),
@@ -78,7 +81,9 @@ hiddenimports += ['generate_pedal', 'batch_restore_expression']
 hiddenimports += ['qt_editor.ai_transcribe', 'qt_editor.ai_transcribe_dialog',
                   'qt_editor.ai_grid', 'qt_editor.ai_grid_dialog',
                   'qt_editor.beat_detect', 'qt_editor.audio_backend_sd',
-                  'qt_editor.game_preview']
+                  'qt_editor.game_preview',
+                  'qt_editor.audio_pedal', 'qt_editor.audio_pedal_dialog',
+                  'qt_editor.arrange_by_example', 'qt_editor.arrange_by_example_dialog']
 
 a = Analysis(
     ['qt_editor/app.py'],

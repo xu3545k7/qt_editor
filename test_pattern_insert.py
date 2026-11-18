@@ -9,7 +9,10 @@ import unittest
 from PyQt5.QtWidgets import QApplication
 
 from qt_editor.chart_view import ChartView
-from qt_editor.models import GNote, NoteModel
+from qt_editor.models import (
+    GNote, NoteModel, TOTAL_GAME_KEYS, TRILL_NOTE_TYPE, explode_trill,
+    note_is_trill, trill_sub_cells,
+)
 from qt_editor.music_theory import PATTERN_KINDS, Key
 
 _app = QApplication.instance() or QApplication([])
@@ -271,7 +274,8 @@ class ScaleKindInsertTests(unittest.TestCase):
             self.model.rebuild_display_cache()
             made = self.view.insert_pattern(kind, C_MAJOR, 60, 6, 1,
                                             0.0, 0.25, 0)
-            self.assertEqual(made, 6, kind)
+            # 「打包成 Trill」刻意只產生一顆：6 顆都成了它的 sub_note
+            self.assertEqual(made, 1 if kind == 'trill_note' else 6, kind)
 
     def test_the_status_label_names_the_scale(self):
         self.view.set_pattern_params(kind='chromatic')
@@ -282,6 +286,151 @@ class ScaleKindInsertTests(unittest.TestCase):
                                         0.0, 0.25, 0)
         self.assertLess(made, 40)
         self.assertTrue(all(21 <= n.pitch <= 108 for n in self.model.notes_tree))
+
+
+class TrillInsertTests(unittest.TestCase):
+    """顫音：放一串兩音來回，或直接收成一顆遊戲的 Trill 音符。"""
+
+    def setUp(self):
+        self.view = ChartView()
+        self.view.resize(1200, 720)
+        self.model = NoteModel.create_new('t', 120.0, 30.0, 4)
+        self.view.load_model(self.model)
+        self.view.rebuild_mapper()
+        self.view.set_view_mode('pitch')
+
+    def notes(self):
+        return sorted(self.model.notes_tree, key=lambda n: n.start)
+
+    def trill(self):
+        got = [n for n in self.model.notes_tree if note_is_trill(n.note_type)]
+        self.assertEqual(len(got), 1, '應該只有一顆顫音')
+        return got[0]
+
+    # ── 一串普通音符 ────────────────────────────────────────────
+    def test_a_plain_trill_is_a_run_of_ordinary_notes(self):
+        made = self.view.insert_pattern('trill', C_MAJOR, 60, 6, 1, 0.0, 0.25, 0)
+        self.assertEqual(made, 6)
+        self.assertEqual([n.pitch for n in self.notes()],
+                         [60, 62, 60, 62, 60, 62])
+        self.assertEqual({int(n.note_type) for n in self.notes()}, {0})
+
+    def test_the_two_notes_sit_on_neighbouring_lanes(self):
+        """照音高換算兩顆會落在同一格（28 格要分 88 鍵），那就看不出來回了。"""
+        self.view.insert_pattern('trill', C_MAJOR, 60, 4, 1, 0.0, 0.25, 0)
+        low = next(n for n in self.notes() if n.pitch == 60)
+        high = next(n for n in self.notes() if n.pitch == 62)
+        self.assertEqual(low.max_key + 1, high.min_key, '相鄰且不重疊')
+        self.assertLess(low.min_key, high.min_key, '低音在左')
+        self.assertEqual(low.max_key - low.min_key,
+                         high.max_key - high.min_key, '兩塊一樣寬')
+
+    def test_every_repeat_lands_on_the_same_lane(self):
+        self.view.insert_pattern('trill', C_MAJOR, 60, 6, 1, 0.0, 0.25, 0)
+        spots = {(n.pitch, n.min_key, n.max_key) for n in self.notes()}
+        self.assertEqual(len(spots), 2, '只有兩個位置，不該每顆都不一樣')
+
+    def test_the_lanes_stay_on_the_board_at_the_top(self):
+        self.view.insert_pattern('trill', C_MAJOR, 107, 4, 1, 0.0, 0.25, 0)
+        for n in self.notes():
+            self.assertGreaterEqual(n.min_key, 0)
+            self.assertLess(n.max_key, TOTAL_GAME_KEYS)
+
+    def test_the_preview_and_the_insert_use_the_same_lanes(self):
+        lanes = self.view._pattern_lane_ranges('trill', [60, 62, 60], 3)
+        self.assertEqual(lanes[0], lanes[2])
+        self.assertEqual(lanes[0][1] + 1, lanes[1][0])
+        self.view.insert_pattern('trill', C_MAJOR, 60, 3, 1, 0.0, 0.25, 0)
+        self.assertEqual([(n.min_key, n.max_key) for n in self.notes()], lanes)
+
+    def test_other_kinds_keep_the_pitch_mapping(self):
+        lanes = self.view._pattern_lane_ranges('scale', [60, 62], 3)
+        want = [self.view._center_to_lane_range(
+            self.view._pitch_to_lane_center(p), 3) for p in (60, 62)]
+        self.assertEqual(lanes, want)
+
+    # ── 打包成一顆 ──────────────────────────────────────────────
+    def test_packing_makes_exactly_one_note(self):
+        made = self.view.insert_pattern('trill_note', C_MAJOR, 60, 12, 1,
+                                        0.0, 0.125, 0)
+        self.assertEqual(made, 1)
+        self.assertEqual(len(self.model.notes_tree), 1)
+        self.assertEqual(len(self.trill().sub_elems), 12, '12 顆都成了 sub_note')
+
+    def test_the_zone_is_twice_the_key_width(self):
+        self.view.insert_pattern('trill_note', C_MAJOR, 60, 4, 1, 0.0, 0.25, 0)
+        t = self.trill()
+        self.assertEqual(t.max_key - t.min_key + 1, 6, '鍵寬 3 → 區寬 6')
+
+    def test_the_cells_are_the_two_halves_of_the_zone(self):
+        """官方顫音的 cell 預設是區寬的一半（`trill_sub_cells` 的 cell_frac），
+        所以兩塊相鄰的鍵道打包起來正好是左右兩半，不必再去修 cell 的鍵道。"""
+        self.view.insert_pattern('trill_note', C_MAJOR, 60, 4, 1, 0.0, 0.25, 0)
+        cells = trill_sub_cells(self.trill())
+        self.assertEqual(len(cells), 4)
+        self.assertEqual({round(c[1], 3) for c in cells}, {0.5}, 'cell 寬＝半個區')
+        xs = sorted({round(c[0], 3) for c in cells})
+        self.assertEqual(xs, [0.0, 0.5], '左右兩半，不重疊')
+
+    def test_the_packed_trill_covers_the_whole_run(self):
+        self.view.insert_pattern('trill_note', C_MAJOR, 60, 8, 1, 1000.0, 0.25, 0)
+        t = self.trill()
+        self.assertAlmostEqual(t.start, 1000, delta=2)
+        # 120bpm 的 16 分是 125ms：第 8 顆起在 +875，長度是間隔的 0.9
+        self.assertAlmostEqual(t.end, 1000 + 875 + 112, delta=6)
+        self.assertEqual(t.gate, t.end - t.start)
+
+    def test_unpacking_gives_the_run_back(self):
+        """sub_note 裡不能留顫音旗標，否則解開之後是一堆沒有 sub_note 的假顫音。"""
+        self.view.insert_pattern('trill_note', C_MAJOR, 60, 4, 1, 0.0, 0.25, 0)
+        back = explode_trill(self.trill())
+        self.assertEqual([n.pitch for n in back], [60, 62, 60, 62])
+        self.assertEqual({int(n.note_type) for n in back}, {0})
+        self.assertEqual(len({(n.min_key, n.max_key) for n in back}), 2)
+
+    def test_the_packed_trill_is_what_gets_selected(self):
+        self.view.insert_pattern('trill_note', C_MAJOR, 60, 6, 1, 0.0, 0.25, 0)
+        sel = [n for n in self.model.notes_tree if n.idx in self.view.selected]
+        self.assertEqual(len(sel), 1)
+        self.assertTrue(note_is_trill(sel[0].note_type))
+
+    def test_one_note_is_not_packed(self):
+        """只有一顆的時候沒有來回可言。"""
+        made = self.view.insert_pattern('trill_note', C_MAJOR, 60, 1, 1,
+                                        0.0, 0.25, 0)
+        self.assertEqual(made, 1)
+        self.assertFalse(note_is_trill(self.model.notes_tree[-1].note_type))
+
+    def test_the_type_combo_route_also_packs(self):
+        """放置類型停在 Trill 的時候，顫音音型也要收成一顆。
+
+        開「音階輔助」時放置模式會關掉、類型下拉整組隱藏
+        （`_refresh_toolbar_groups`），那個值是看不見的；做出一串各自
+        `note_type=64`、卻一個 sub_note 都沒有的單音不是任何人要的東西。
+        """
+        made = self.view.insert_pattern('trill', C_MAJOR, 60, 6, 1, 0.0, 0.25, 0,
+                                        note_type=TRILL_NOTE_TYPE)
+        self.assertEqual(made, 1)
+        self.assertEqual(len(self.trill().sub_elems), 6)
+
+    def test_only_the_trill_kinds_pack(self):
+        made = self.view.insert_pattern('scale', C_MAJOR, 60, 6, 1, 0.0, 0.25, 0,
+                                        note_type=TRILL_NOTE_TYPE)
+        self.assertEqual(made, 6, '音階不會被收成一顆')
+
+    # ── 狀態列 ──────────────────────────────────────────────────
+    def test_the_status_line_says_how_many_strokes(self):
+        """打包之後「插入 1 顆」看起來像壞掉，要講清楚那一顆裡有幾下。"""
+        made = self.view.insert_pattern('trill_note', C_MAJOR, 60, 8, 1,
+                                        0.0, 0.25, 0)
+        msg = self.view._pattern_made_status(made, C_MAJOR)
+        self.assertIn('Trill', msg)
+        self.assertIn('8', msg)
+
+    def test_a_plain_run_still_counts_notes(self):
+        made = self.view.insert_pattern('trill', C_MAJOR, 60, 8, 1, 0.0, 0.25, 0)
+        self.assertEqual(self.view._pattern_last_subs, 0)
+        self.assertIn('8 顆', self.view._pattern_made_status(made, C_MAJOR))
 
 
 if __name__ == '__main__':

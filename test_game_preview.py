@@ -27,6 +27,58 @@ def note(start, end=None, *, hand=0, nt=0, lo=10, hi=12, hidden=False):
     return n
 
 
+class TheTwoPreviewsAgreeTests(unittest.TestCase):
+    """譜面的預覽模式和這個小視窗要照同一條規則。
+
+    看不到的有兩種：隱藏音符（只貢獻 keysound）和**無主音**（`hand=2`，本家
+    當成自動演奏、不計分，畫面上不會出現）。兩種都存得下來，只是預覽要照遊戲
+    的樣子來。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def view(self):
+        from qt_editor.chart_view import ChartView
+        from qt_editor.models import NoteModel
+        v = ChartView()
+        v.resize(600, 400)
+        m = NoteModel.create_new('t', 120.0, 30.0, 4)
+        m.notes_tree = [note(200), note(400, hand=2), note(600, hidden=True)]
+        for i, n in enumerate(m.notes_tree):
+            n.idx = i
+        m.rebuild_display_cache()
+        v.load_model(m)
+        v.rebuild_mapper()
+        return v
+
+    def concealed(self, v):
+        return sorted(int(n.hand) for n in v.model.notes_tree
+                      if v._note_is_concealed(n))
+
+    def test_preview_hides_the_unassigned_and_the_hidden(self):
+        v = self.view()
+        v.toggle_preview_mode(True)
+        self.assertEqual(self.concealed(v), [0, 2])
+
+    def test_editing_still_shows_the_unassigned_one(self):
+        """編輯模式要看得到（綠色），不然選不起來、指不了左右手。"""
+        v = self.view()
+        v.toggle_preview_mode(False)
+        v.set_view_mode('measure')
+        self.assertEqual(self.concealed(v), [0])        # 只有那顆隱藏的
+        v.set_view_mode('pitch')
+        self.assertEqual(self.concealed(v), [])
+
+    def test_the_two_renderers_pick_the_same_notes(self):
+        v = self.view()
+        v.toggle_preview_mode(True)
+        drawn = [n for n in v.model.notes if not v._note_is_concealed(n)]
+        self.assertEqual([id(n) for n in drawn],
+                         [id(n) for n in GP._playable(v.model.notes)])
+
+
 class _CanvasCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -100,7 +152,7 @@ class WhatIsVisibleTests(_CanvasCase):
         c = self.canvas([note(1000), note(1000, hidden=True)])
         self.assertEqual(len(c.notes), 1)
 
-    def test_set_notes_filters_them_too(self):
+    def test_set_notes_filters_hidden_too(self):
         c = self.canvas()
         c.set_notes([note(0), note(300, hidden=True), note(600)])
         self.assertEqual(len(c.notes), 2)
@@ -118,6 +170,25 @@ class WhatIsVisibleTests(_CanvasCase):
 
     def test_all_hidden_leaves_an_empty_field(self):
         c = self.canvas([note(0, hidden=True), note(300, hidden=True)])
+        self.assertEqual(c.notes, [])
+        self.assertEqual(c._held_lanes(), set())
+
+    # ── 無主音（hand=2）──────────────────────────────────
+    # 本家把 hand=2 當成自動演奏、不計分，畫面上不會有這類音符（比對過
+    # nostalgia.dll）。它可以存在、也照常存檔，只是預覽要照遊戲的樣子來。
+
+    def test_unassigned_notes_never_show_up(self):
+        c = self.canvas([note(1000), note(1000, hand=2)])
+        self.assertEqual(len(c.notes), 1)
+        self.assertEqual(int(c.notes[0].hand), 0)
+
+    def test_set_notes_filters_them_too(self):
+        c = self.canvas()
+        c.set_notes([note(0), note(300, hand=2), note(600, hand=1)])
+        self.assertEqual([int(n.hand) for n in c.notes], [0, 1])
+
+    def test_an_unassigned_note_lights_no_key(self):
+        c = self.canvas([note(0, hand=2)])
         self.assertEqual(c.notes, [])
         self.assertEqual(c._held_lanes(), set())
 

@@ -197,8 +197,11 @@ class BuildTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def build(self, song, index=0):
+    def build(self, song, index=0, stock=False):
+        # 這個類別測的是**改過的** importer 才收的那一套（REAL 半級、顫音 64），
+        # 所以預設把相容模式關掉。預設開著的那一套在 StockCompatibleTests。
         plans, _ = H.plan_song_folder(song)
+        plans[index].stock_compatible = stock
         return H.build_package(plans[index], self.out, version=7, renderer=fake_renderer)
 
     def unzip(self, result):
@@ -369,11 +372,14 @@ class ChartModeSongJsonTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def export(self, slot, level, title='Conflict (VILA Remix)'):
+    def export(self, slot, level, title='Conflict (VILA Remix)', stock=False):
         from qt_editor.hiraeth_export_dialog import HiraethExportDialog
         dlg = HiraethExportDialog(None, None, self.root, self.model)
         dlg.title_edit.setText(title)
         dlg.artist_edit.setText('siromaru + cranky')
+        # 相容模式的 REAL 只有 1／2／3，要測半級得先關掉（順序有意義：
+        # 關掉會重設等級框的範圍，之後填的值才不會被 3 夾掉）
+        dlg.stock_check.setChecked(stock)
         dlg.slot_combo.setCurrentText(slot)
         dlg.level_spin.setValue(level)
         plans, _ = dlg.plans()
@@ -404,6 +410,7 @@ class ChartModeSongJsonTests(unittest.TestCase):
     def test_switching_slots_keeps_the_typed_level(self):
         from qt_editor.hiraeth_export_dialog import HiraethExportDialog
         dlg = HiraethExportDialog(None, None, self.root, self.model)
+        dlg.stock_check.setChecked(False)          # 半級只有改過的 importer 收
         dlg.slot_combo.setCurrentText('expert')
         dlg.level_spin.setValue(12)
         dlg.slot_combo.setCurrentText('real')
@@ -524,6 +531,7 @@ class CurrentChartTests(unittest.TestCase):
             dlg = HiraethExportDialog(None, None, root, model, audio_path='')
             self.assertEqual(dlg.mode(), MODE_CHART)
             dlg.title_edit.setText('我的譜')
+            dlg.stock_check.setChecked(False)      # 半級只有改過的 importer 收
             dlg.slot_combo.setCurrentText('real')
             self.assertEqual(dlg.level_spin.maximum(), 3.5)
             dlg.level_spin.setValue(2.5)
@@ -766,8 +774,12 @@ class HoldTailOptionTests(unittest.TestCase):
         self.assertEqual(result.error, '')
         with zipfile.ZipFile(result.zip_path) as archive:
             root = ET.fromstring(archive.read('real.xml'))
+        # 只看這個測試自己放的那條長條（4000ms 起）：底稿裡那顆顫音在相容模式
+        # 下也會變成長押（1000ms 起），不濾掉的話這裡會多一筆 800
         holds = [(int(n.findtext('end_timing_msec')) - int(n.findtext('start_timing_msec')))
-                 for n in root.iter('note') if n.findtext('note_type') == '2']
+                 for n in root.iter('note')
+                 if n.findtext('note_type') == '2'
+                 and int(n.findtext('start_timing_msec')) >= 4000]
         return result, holds
 
     # 長押照畫面上的長度輸出，只有下一顆音符要求的間距會裁到它（以前這裡還會
@@ -945,6 +957,9 @@ class KeysoundExportTests(unittest.TestCase):
     def build(self, **kwargs):
         plans, _ = H.plan_song_folder(make_song(self.root))
         plan = plans[0]
+        # 按鍵音本來就要改過的 importer（原版第 74 行硬擋 velocity≠0），
+        # 和「相容原版」互斥——見 StockCompatibleTests
+        plan.stock_compatible = not kwargs.get('keysound', False)
         for key, value in kwargs.items():
             setattr(plan, key, value)
         result = H.build_package(plan, os.path.join(self.root, 'o'),
@@ -982,7 +997,9 @@ class KeysoundExportTests(unittest.TestCase):
         plans, _ = H.plan_song_folder(make_song(self.root))
         plan = plans[0]
         plan.keysound = True
+        plan.stock_compatible = False
         result = H.build_package(plan, folder, renderer=fake_renderer)
+        self.assertEqual(result.error, '')
         work = os.path.join(folder, 'unz')
         os.makedirs(work)
         with zipfile.ZipFile(result.zip_path) as archive:
@@ -999,6 +1016,7 @@ class KeysoundExportTests(unittest.TestCase):
         plans, _ = H.plan_song_folder(make_song(self.root, no_bgm=True))
         plan = plans[0]
         plan.keysound = True
+        plan.stock_compatible = False
         result = H.build_package(plan, os.path.join(self.root, 'o2'),
                                  renderer=fake_renderer)
         self.assertEqual(result.error, '')
@@ -1094,12 +1112,188 @@ class KeysoundCheckboxTests(unittest.TestCase):
 
     def test_the_plans_carry_the_flag(self):
         dlg = self.dialog()
+        dlg.stock_check.setChecked(False)          # 原版 importer 不收按鍵音
         dlg.keysound_check.setChecked(True)
         plans, _skipped = dlg.plans()
         self.assertTrue(plans)
         for plan in plans:
             self.assertTrue(plan.keysound)
             self.assertFalse(plan.mix_piano, '按鍵音模式不該再混鋼琴軌')
+
+
+class StockCompatibleTests(unittest.TestCase):
+    """包預設要能在**沒改過的** Hiraeth 上匯入。
+
+    2026-11-14 使用者回報別人匯入我們的包被退件：
+
+        REAL display level must be 1/2/3; game levels must be 1..15
+
+    原因是 REAL 的半級（2.5／3.5）只有我們這台改過的 importer 收
+    （`REAL_LEVELS={1:10,1.5:11,2:12,2.5:13,3:14,3.5:15}` 是本機修改，
+    原版是 `range(1,4)` 配 `{1:10,2:12,3:14}`）。量當時 hiraeth_zips 裡的
+    96 包：**50 包**的 REAL 是半級——超過一半，除了我們自己沒人匯得進去。
+
+    顫音（note_type 64）同理，原版只收 0／2／4。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.out = os.path.join(self.root, 'out')
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def build(self, stock=True, index=0):
+        plans, _ = H.plan_song_folder(make_song(self.root))
+        plans[index].stock_compatible = stock
+        return H.build_package(plans[index], self.out, version=7, renderer=fake_renderer)
+
+    def unzip(self, result):
+        folder = os.path.join(self.root, 'unzipped')
+        shutil.rmtree(folder, ignore_errors=True)
+        with zipfile.ZipFile(result.zip_path) as archive:
+            archive.extractall(folder)
+        return folder
+
+    def test_the_default_is_compatible(self):
+        self.assertTrue(H.PackagePlan('id', 't', 'a', []).stock_compatible,
+                        '包預設是要給別人匯入的')
+
+    def test_the_real_level_is_one_of_the_three(self):
+        result = self.build()
+        self.assertEqual(result.error, '')
+        folder = self.unzip(result)
+        with open(os.path.join(folder, 'song.json'), encoding='utf-8') as fh:
+            spec = json.load(fh)
+        self.assertEqual(spec['charts']['real'], 3)        # Master Lv15 → REAL 3
+        self.assertIn(spec['charts']['real'], H.STOCK_REAL_LEVELS)
+
+    def test_the_scale_has_three_steps(self):
+        """原版那張表只有 {1:10, 2:12, 3:14}，clone 的 Lv 要收進這三格。"""
+        self.assertEqual([H.real_level(lv, stock=True) for lv in range(8, 19)],
+                         [1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3])
+
+    def test_a_half_level_rounds_down_on_a_tie(self):
+        """2.5 離 2 和 3 一樣遠：標低一點，玩家不會因為數字就先跳過。"""
+        self.assertEqual(H.to_stock_real(2.5), 2)
+        self.assertEqual(H.to_stock_real(3.5), 3)
+        self.assertEqual(H.to_stock_real(1.5), 1)
+        for level in H.STOCK_REAL_LEVELS:
+            self.assertEqual(H.to_stock_real(level), level, '本來就合格的不要動')
+
+    def test_no_trills_in_the_xml(self):
+        folder = self.unzip(self.build())
+        for name in ('normal.xml', 'real.xml'):
+            types = {n.findtext('note_type')
+                     for n in ET.parse(os.path.join(folder, name)).getroot().iter('note')}
+            self.assertNotIn('64', types, '原版 importer 不收 note_type 64')
+            self.assertTrue(types <= {str(t) for t in H.STOCK_NOTE_TYPES}, types)
+
+    def test_a_trill_becomes_a_hold_not_a_tap(self):
+        """對話框寫的是「手寫的顫音變長押」，那就要真的是長押。
+
+        `nt &= ~0x40` 對 `note_type` 剛好是 0x40 的顫音（右鍵打包和「顫音
+        （套上的）」生成出來的就是這個值）會留下 0 ＝**點擊**：一整段顫音塌成
+        一次按鍵。原版 importer 0 和 2 都收，所以匯入不會報錯，只會悄悄掉難度。
+        """
+        folder = self.unzip(self.build())
+        for name in ('normal.xml', 'real.xml'):
+            root = ET.parse(os.path.join(folder, name)).getroot()
+            holds = [n for n in root.iter('note') if n.findtext('note_type') == '2']
+            self.assertEqual(len(holds), 1, '%s：那顆顫音要變成長押' % name)
+            # 測試譜裡唯一有長度的就是那顆顫音（1000~1800ms）
+            self.assertGreater(int(holds[0].findtext('gate_time_msec')), 100,
+                              '長度要留著，不然等於變點擊')
+
+    def test_the_result_says_the_level_was_flattened(self):
+        """壓掉等級不可以**無聲**——不然使用者只會覺得難度標錯了。"""
+        result = self.build()
+        self.assertTrue(any('原版 importer 的 REAL 只有 1／2／3' in n for n in result.notes),
+                        result.notes)
+
+    def test_turning_it_off_brings_the_half_levels_back(self):
+        folder = self.unzip(self.build(stock=False))
+        with open(os.path.join(folder, 'song.json'), encoding='utf-8') as fh:
+            self.assertEqual(json.load(fh)['charts']['real'], 3.5)
+
+    def test_our_validator_catches_what_the_stock_importer_rejects(self):
+        """自己先驗得出來，使用者才不會是在對方的錯誤訊息裡第一次知道。"""
+        folder = self.unzip(self.build(stock=False))      # 半級 + 顫音
+        self.assertEqual(H.validate_package(folder), [], '改過的 importer 收得下')
+        problems = H.validate_package(folder, stock=True)
+        self.assertTrue(any('等級' in p for p in problems), problems)
+        self.assertTrue(any('音符類型' in p for p in problems), problems)
+
+    def test_keysound_needs_the_patched_importer_too(self):
+        plans, _ = H.plan_song_folder(make_song(self.root))
+        plans[0].keysound = True                          # 相容模式沒關掉就會互相矛盾
+        self.assertTrue(H.build_package(plans[0], self.out, renderer=fake_renderer).error,
+                        '原版 importer 硬擋 velocity≠0，這種組合不該默默輸出')
+
+
+class StockCompatibleDialogTests(unittest.TestCase):
+    """對話框那一格：預設勾著，而且要和按鍵音、REAL 等級框連動。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.song = make_song(self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def dialog(self):
+        from qt_editor.hiraeth_export_dialog import HiraethExportDialog
+        model = NoteModel.create_new('t', 120.0, 10.0, 4)
+        dlg = HiraethExportDialog(None, self.song, self.root, model)
+        dlg.stock_check.setChecked(True)
+        return dlg
+
+    def test_it_is_on_by_default(self):
+        from qt_editor.hiraeth_export_dialog import HiraethExportDialog
+        model = NoteModel.create_new('t', 120.0, 10.0, 4)
+        self.assertTrue(HiraethExportDialog(None, self.song, self.root, model)
+                        .stock_check.isChecked())
+
+    def test_the_plans_carry_the_flag(self):
+        plans, _skipped = self.dialog().plans()
+        self.assertTrue(plans)
+        self.assertTrue(all(p.stock_compatible for p in plans))
+
+    def test_it_turns_keysound_off(self):
+        dlg = self.dialog()
+        dlg.stock_check.setChecked(False)
+        dlg.keysound_check.setChecked(True)
+        dlg.stock_check.setChecked(True)
+        self.assertFalse(dlg.keysound_check.isChecked(), '原版 importer 不收按鍵音')
+        self.assertFalse(dlg.keysound_check.isEnabled(), '勾不起來的就要是灰的')
+
+    def test_the_real_spin_only_offers_whole_numbers(self):
+        dlg = self.dialog()
+        dlg.slot_combo.setCurrentText('real')
+        self.assertEqual((dlg.level_spin.minimum(), dlg.level_spin.maximum()), (1, 3))
+        self.assertEqual(dlg.level_spin.decimals(), 0)
+        dlg.stock_check.setChecked(False)
+        self.assertEqual(dlg.level_spin.maximum(), 3.5, '關掉就回到半級')
+
+    def test_turning_it_off_says_so_on_screen(self):
+        """使用者早先就說過：關不掉的選項、沒寫原因的選項，人家不知道是什麼。
+
+        這一格關掉的後果特別容易漏——包照樣輸出成功、自己也匯得進去，
+        要等到**別人**匯入失敗才會發現。
+        """
+        dlg = self.dialog()
+        self.assertEqual(dlg.stock_warn.text(), '')
+        dlg.stock_check.setChecked(False)
+        self.assertIn('退件', dlg.stock_warn.text())
+        dlg.stock_check.setChecked(True)
+        self.assertEqual(dlg.stock_warn.text(), '')
+
+    def test_the_layout_label_says_what_the_level_becomes(self):
+        dlg = self.dialog()
+        dlg.song_edit.setText(self.song)
+        dlg._update_layout_label()
+        self.assertIn('REAL 3', dlg.layout_label.text())
+        self.assertNotIn('REAL 3.5', dlg.layout_label.text())
 
 
 class LevelFlatteningTests(unittest.TestCase):

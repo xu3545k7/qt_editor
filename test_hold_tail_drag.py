@@ -12,7 +12,7 @@ from PyQt5.QtGui import QMouseEvent, QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication
 
 from qt_editor.chart_view import ChartView
-from qt_editor.models import GNote, NoteModel
+from qt_editor.models import GNote, NoteModel, note_is_long
 
 _app = QApplication.instance() or QApplication([])
 
@@ -688,3 +688,156 @@ class MeasuresBpmRadioTests(unittest.TestCase):
             rb['keep'].click()
             return rb['adjust'].isVisible(), rb['keep'].isVisible()
         self.assertEqual(self.run_in_dialog(check), (True, True))
+
+
+class MultiSelectTailDragTests(HoldTailDragTests):
+    """多選著拉長押的尾巴 ＝ 把**同一刻**的那一組一起拉長，順便轉成長押。
+
+    使用者指定：「多選時如果拉動 hold 終端，要做兩件事：把選擇的 note 改
+    hold、把結束時間改成游標拉到的地方。但只抓 start 一樣的。」
+
+    同一刻的那一組就是一個和弦——同時按下去、同時放開，尾巴本來就該一起走。
+    不同刻的不碰：起點不同，套同一個結束時間會得到各不相同的長度。
+    """
+
+    def chord(self, extra=None):
+        """同一刻四顆：一條長押（要抓的）＋三顆 tap，外加 `extra`。"""
+        notes = [make(0, 2000, 4000, pitch=60, centre=5),
+                 make(1, 2000, 2000, pitch=64, note_type=0, centre=11),
+                 make(2, 2000, 2000, pitch=67, note_type=0, centre=17),
+                 make(3, 2000, 2000, pitch=72, note_type=0, centre=23)]
+        notes.extend(extra or [])
+        self.build(notes)
+        self.view.selected = {n.idx for n in notes}
+        return notes
+
+    def test_the_whole_instant_follows_the_tail(self):
+        notes = self.chord()
+        self.drag_tail(notes[0], -60)
+        for n in notes:
+            self.assertEqual(n.end, notes[0].end, '同一刻的尾巴要對齊')
+            self.assertEqual(n.gate, n.end - n.start)
+
+    def test_a_tap_in_the_group_becomes_a_hold(self):
+        notes = self.chord()
+        self.drag_tail(notes[0], -60)
+        for n in notes[1:]:
+            self.assertTrue(note_is_long(int(n.note_type)),
+                            '選到的 tap 要變成長押')
+
+    def test_a_different_instant_is_left_alone(self):
+        other = make(9, 3000, 3000, pitch=62, note_type=0, centre=11)
+        notes = self.chord([other])
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(other.end, 3000, '別刻的音符不該被套上同一個結束時間')
+        self.assertEqual(int(other.note_type), 0)
+
+    def test_an_unselected_note_at_the_same_instant_is_left_alone(self):
+        notes = self.chord()
+        loose = make(9, 2000, 2000, pitch=55, note_type=0, centre=27)
+        self.model.notes_tree.append(loose)
+        self.model.rebuild_display_cache()
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(loose.end, 2000)
+        self.assertEqual(int(loose.note_type), 0)
+
+    def test_the_head_of_every_note_stays(self):
+        notes = self.chord()
+        self.drag_tail(notes[0], -60)
+        for n in notes:
+            self.assertEqual(n.start, 2000)
+
+    # ── 型別轉換的細節 ──────────────────────────────────────────
+    def test_the_skin_bit_survives(self):
+        """skin（0x08）是純外觀位元，轉長押不該把它洗掉。"""
+        notes = self.chord()
+        notes[1].note_type = 8
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(int(notes[1].note_type), 10)
+
+    def test_soft_does_not_turn_into_staccato(self):
+        """soft(1) | LONG_BIT(2) = 3，而 3 是 staccato——不能用 or 硬加。"""
+        notes = self.chord()
+        notes[1].note_type = 1
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(int(notes[1].note_type), 2)
+
+    def test_staccato_in_the_selection_becomes_a_hold(self):
+        notes = self.chord()
+        notes[1].note_type = 3
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(int(notes[1].note_type), 2)
+
+    def test_a_trill_is_not_touched(self):
+        """顫音的 sub_note 是一下一下的敲擊，改型別等於把它拆掉。"""
+        notes = self.chord()
+        notes[1].note_type = 64
+        end_before = notes[1].end
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(int(notes[1].note_type), 64)
+        self.assertEqual(notes[1].end, end_before)
+
+    def test_a_slide_is_not_touched(self):
+        notes = self.chord()
+        notes[1].note_type = 4
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(int(notes[1].note_type), 4)
+
+    def test_a_hidden_note_is_not_touched(self):
+        """隱藏音符畫面上看不到，改了也看不出來。"""
+        notes = self.chord()
+        notes[1].hidden = True
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(int(notes[1].note_type), 0)
+        self.assertEqual(notes[1].end, 2000)
+
+    # ── 和單選的老行為並存 ──────────────────────────────────────
+    def test_one_selected_note_behaves_as_before(self):
+        notes = self.chord()
+        self.view.selected = {notes[0].idx}
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(notes[1].end, 2000, '沒有多選就只動抓到的那一條')
+
+    def test_grabbing_outside_the_selection_collapses_it(self):
+        """抓的那條不在選取裡 ＝ 和手上的選取無關，照舊只動那一條。"""
+        notes = self.chord()
+        self.view.selected = {notes[1].idx, notes[2].idx}
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(self.view.selected, {notes[0].idx})
+        self.assertEqual(notes[1].end, 2000)
+
+    def test_the_selection_survives_the_drag(self):
+        """有夥伴時不要收選取：剛框好的那一片不該在按下去的瞬間消失。"""
+        notes = self.chord()
+        want = {n.idx for n in notes}
+        self.drag_tail(notes[0], -60)
+        self.assertEqual(self.view.selected, want)
+
+    # ── 復原 ────────────────────────────────────────────────────
+    def test_one_undo_puts_the_whole_group_back(self):
+        notes = self.chord()
+        self.drag_tail(notes[0], -60)
+        self.model.undo()
+        back = {n.idx: n for n in self.model.notes_tree}
+        self.assertEqual(back[1].end, 2000)
+        self.assertEqual(int(back[1].note_type), 0)
+        self.assertEqual(back[0].gate, 2000)
+
+    def test_a_click_without_dragging_changes_nothing(self):
+        notes = self.chord()
+        depth = len(self.model.undo_stack)
+        pt = self.tail_point(notes[0])
+        self.press(pt)
+        self.release(pt)
+        self.assertEqual(len(self.model.undo_stack), depth)
+        self.assertEqual(int(notes[1].note_type), 0)
+
+    # ── 狀態列 ──────────────────────────────────────────────────
+    def test_the_status_says_how_many_moved(self):
+        notes = self.chord()
+        seen = []
+        self.view.status_changed.connect(seen.append)
+        self.drag_tail(notes[0], -60)
+        said = ' '.join(seen)
+        self.assertIn('同一刻 4 顆', said)
+        self.assertIn('3 顆轉成長押', said)

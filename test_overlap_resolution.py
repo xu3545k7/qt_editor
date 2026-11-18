@@ -1,7 +1,10 @@
 import unittest
 
 from qt_editor import smart_chart as SC
-from qt_editor.models import GNote, NoteModel
+from qt_editor.models import (
+    GNote, NoteModel, OVERLAP_CHORD, OVERLAP_HOLD, OVERLAP_TAIL,
+    overlapping_pairs,
+)
 
 
 def make_note(start, end, min_key, max_key, note_type=0, idx=0, hand=0,
@@ -247,6 +250,88 @@ class OverlapResolutionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FindingOverlapsTests(unittest.TestCase):
+    """只找不動的那一支（`overlapping_pairs`），畫面標記和報告都走它。
+
+    判準是「編輯器畫出來的兩個方塊有沒有相交」，所以**非長押**也算——
+    `chart_view._note_rect` 連 tap 都是從 start 畫到 end。
+    """
+
+    def test_two_notes_on_the_same_lane_at_the_same_time(self):
+        a = make_note(0, 200, 4, 6)
+        b = make_note(10, 200, 6, 8, idx=1)
+        got = overlapping_pairs([a, b])
+        self.assertEqual([(k, x.idx, y.idx) for k, x, y in got],
+                         [(OVERLAP_CHORD, 0, 1)])
+
+    def test_apart_in_lanes_is_not_an_overlap(self):
+        a = make_note(0, 200, 4, 6)
+        b = make_note(0, 200, 7, 9, idx=1)
+        self.assertEqual(overlapping_pairs([a, b]), [])
+
+    def test_touching_lanes_is_an_overlap(self):
+        # max_key 和 min_key 同一格 ＝ 共用那個按鍵
+        a = make_note(0, 200, 4, 6)
+        b = make_note(0, 200, 6, 9, idx=1)
+        self.assertEqual(len(overlapping_pairs([a, b])), 1)
+
+    def test_a_note_inside_a_hold_corridor(self):
+        hold = make_note(0, 1000, 4, 6, note_type=2)
+        later = make_note(400, 500, 5, 7, idx=1)
+        got = overlapping_pairs([hold, later])
+        self.assertEqual([k for k, _a, _b in got], [OVERLAP_HOLD])
+
+    def test_a_trill_also_has_a_corridor(self):
+        trill = make_note(0, 1000, 4, 6, note_type=0x40)
+        later = make_note(400, 500, 5, 7, idx=1)
+        self.assertEqual([k for k, _a, _b in overlapping_pairs([trill, later])],
+                         [OVERLAP_HOLD])
+
+    def test_only_the_sounding_length_runs_over(self):
+        # 兩顆都是 tap，前一顆的音長還沒走完：方塊疊在一起，但只差在時值。
+        a = make_note(0, 300, 4, 6)
+        b = make_note(200, 400, 5, 7, idx=1)
+        self.assertEqual([k for k, _a, _b in overlapping_pairs([a, b])],
+                         [OVERLAP_TAIL])
+
+    def test_end_to_start_is_not_an_overlap(self):
+        a = make_note(0, 200, 4, 6)
+        b = make_note(200, 400, 5, 7, idx=1)
+        self.assertEqual(overlapping_pairs([a, b]), [])
+
+    def test_a_kind_can_be_left_out(self):
+        a = make_note(0, 300, 4, 6)
+        b = make_note(200, 400, 5, 7, idx=1)
+        self.assertEqual(
+            overlapping_pairs([a, b], kinds=(OVERLAP_CHORD, OVERLAP_HOLD)), [])
+
+    def test_the_pairs_come_back_in_time_order(self):
+        notes = [make_note(0, 300, 4, 6, idx=0),
+                 make_note(200, 500, 5, 7, idx=1),
+                 make_note(400, 600, 5, 7, idx=2)]
+        got = overlapping_pairs(notes)
+        self.assertEqual([y.idx for _k, _x, y in got], [1, 2])
+
+    def test_one_long_note_can_hit_several(self):
+        hold = make_note(0, 1000, 4, 6, note_type=2)
+        got = overlapping_pairs([hold,
+                                 make_note(200, 300, 5, 7, idx=1),
+                                 make_note(600, 700, 5, 7, idx=2)])
+        self.assertEqual(len(got), 2)
+
+    def test_it_agrees_with_the_tool_that_moves_them(self):
+        """偵測和「處理左右重疊」看到的是同一批，不是兩套語意。"""
+        notes = [make_note(0, 200, 4, 6, idx=0),
+                 make_note(10, 200, 6, 8, idx=1),
+                 make_note(600, 1600, 10, 12, note_type=2, idx=2),
+                 make_note(900, 1000, 11, 13, idx=3)]
+        model = NoteModel()
+        model.notes_tree = list(notes)
+        found = overlapping_pairs(notes, onset_ms=30)
+        report = model.resolve_horizontal_overlaps_report(30, time_overlap=True)
+        self.assertEqual(len(found), report['conflicts'])
 
 
 class BrokenChordTests(unittest.TestCase):

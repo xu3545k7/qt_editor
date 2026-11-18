@@ -61,9 +61,16 @@ def _backdrop() -> Image.Image:
     return Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), 'RGB').convert('RGBA')
 
 
-#: 斷奏紋章（遊戲裡浮在音符上方、面向鏡頭的箭頭）：寬＝一個鍵道 × 0.9 × 1.5（Note.prefab 的
-#: staccatoIndicatorScale 與 NoteController.StaccatoMarkWiden）。
-MARK_WIDTH_LANES = 0.9 * 1.5
+#: 斷奏紋章（遊戲裡浮在音符上方、面向鏡頭的箭頭）的寬度。
+#:
+#: 跟著 NoteController.StaccatoMarkWidthShare —— 遊戲裡是「音符寬度 × 0.65」。
+#: 這裡乘的是**一個鍵道**的寬度，所以只有單鍵道的音符會完全對上；教學封面畫的
+#: 都是單鍵道，夠用。
+#:
+#: 原本寫的是 0.9 × 1.5 = 1.35（差了兩倍多），而且註解引用的兩個來源現在都不存在：
+#: Note.prefab 的 staccatoIndicatorScale 是一個沒人讀的欄位（已刪），
+#: NoteController.StaccatoMarkWiden 那個 1.5 的加寬早就移掉了。
+MARK_WIDTH_LANES = 0.65
 
 
 def _flat_track(notes, t0: float, t1: float, marks: list = None) -> Image.Image:

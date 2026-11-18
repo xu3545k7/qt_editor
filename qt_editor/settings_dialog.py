@@ -2,7 +2,7 @@
 settings_dialog.py
 ==================
 偏好設定對話框。
-- 語言選擇：繁體中文 / 簡體中文 / English
+- 語言選擇：ui_text.LANGUAGES 有幾種就列幾種
 - 滾輪方向：正向 / 反向
 """
 
@@ -21,6 +21,7 @@ from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QCheckBox
 
 from .i18n import t, set_lang
+from .ui_text import LANGUAGES
 
 
 def _has(key: str) -> bool:
@@ -30,11 +31,9 @@ from .theme import apply_theme
 from .settings import settings
 
 # 語言選項：(顯示名稱, 代碼)
-_LANG_OPTIONS = [
-    ('繁體中文', 'zh_tw'),
-    ('简体中文', 'zh_cn'),
-    ('English',  'en'),
-]
+# 顯示用的 (名稱, 代碼)。清單只有一份，在 ui_text.LANGUAGES —— 這裡本來
+# 自己抄了一份，加日文時這個下拉選單就會是唯一沒跟上的地方。
+_LANG_OPTIONS = [(name, code) for code, name in LANGUAGES]
 
 
 class KeyCaptureDialog(QDialog):
@@ -624,6 +623,8 @@ class SettingsDialog(QDialog):
             # 就地套用新語言，不重啟。舊版是 os.execv 重啟，但打包成 exe 之後
             # `sys.executable -m qt_editor.app` 是不存在的命令，等於關掉就回不來。
             set_lang(lang_code)
+            from .ui_font import apply_ui_font
+            apply_ui_font()
             win = self.parent()
             while win is not None and not hasattr(win, 'retranslate_ui'):
                 win = win.parent()

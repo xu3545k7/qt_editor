@@ -69,6 +69,29 @@ def importer_accepts_keysound(root: str) -> Optional[bool]:
     return KEYSOUND_PATCH in text
 
 
+#: 顫音（note_type 64）和 REAL 半級（2.5／3.5）也是本機修改——原版只收
+#: 0／2／4 和 1／2／3。沒有這兩個記號就表示這份 importer 是原版，包要照
+#: 原版的規則輸出（`PackagePlan.stock_compatible`），否則**整包**退件。
+TRILL_PATCH = '[0,2,4,64]'
+REAL_HALF_PATCH = 'REAL_LEVELS='
+
+
+def importer_accepts_extras(root: str) -> Optional[bool]:
+    """這份 importer 收不收顫音和 REAL 半級？讀不到檔案回 None。
+
+    原版的兩句退件訊息（使用者 2026-11-14 回報的就是後面那句）：
+    `Unsupported note type/hand/key kind`、
+    `REAL display level must be 1/2/3; game levels must be 1..15`。
+    """
+    path = os.path.join(root or '', IMPORTER)
+    try:
+        with io.open(path, encoding='utf-8', errors='replace') as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    return TRILL_PATCH in text and REAL_HALF_PATCH in text
+
+
 def apply_keysound_patch(root: str) -> str:
     """把按鍵音修補套到這份 Hiraeth 的 importer 上，回傳做了什麼。
 

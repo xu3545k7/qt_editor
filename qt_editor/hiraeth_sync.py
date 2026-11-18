@@ -227,6 +227,10 @@ def sync(library_root: str, hiraeth_root: str, force: bool = False,
             # 本來就是從 Hiraeth 搬回來的：沿用它那邊的 package_id，改動才是「更新」
             mapped, _mark = _mark_for(plan, state, by_folder)
             plan.package_id = mapped
+            # 同步是裝進**這台**的 Hiraeth，所以照它的 importer 決定：改過就用
+            # 完整的（REAL 半級、顫音），沒改過就照原版規則輸出，不然每一包都
+            # 會被自己的 importer 退件。讀不到也當成原版（往安全的那邊倒）。
+            plan.stock_compatible = T.importer_accepts_extras(hiraeth_root) is not True
             plan.keysound = keysound
             plan.mix_piano = mix_piano and not keysound
             plan.lead_in_bars = lead_in_bars

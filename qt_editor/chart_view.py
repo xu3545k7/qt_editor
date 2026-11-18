@@ -58,9 +58,10 @@ from __future__ import annotations
 import io
 import math
 import os
+import time
 from bisect import bisect_left, bisect_right
 from collections import deque
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from statistics import median
 
@@ -73,14 +74,19 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import QDialog, QInputDialog, QWidget
 
 from .models import (
-    GNote, NoteModel, TOTAL_GAME_KEYS, LONG_BIT, lane_range_to_external, lane_to_external,
+    GNote, NoteModel, TOTAL_GAME_KEYS, LONG_BIT, SKIN_BIT,
+    lane_range_to_external, lane_to_external,
     build_slide_index_map, slide_next_note, midi_to_official_piano_index,
     note_is_long, note_is_slide, note_is_trill,
     hold_fix_candidate, classify_hold_length,
     trill_sub_cells, trill_fallback_cells,
     make_trill_from_notes, explode_trill, chain_slide_notes,
     move_trill_cell, shift_trill_cells, refit_trill_cells,
+    OVERLAP_CHORD, OVERLAP_HOLD, OVERLAP_TAIL, OVERLAP_KINDS, OVERLAP_NAMES,
+    overlapping_pairs,
 )
+from . import melody_line as ML
+from . import melody_phrase as MP
 from .time_mapper import TimeMapper
 from .property_dialog import NotePropertyDialog
 from .i18n import t
@@ -242,6 +248,27 @@ SEL_OUTLINE      = QColor(255, 230,   0)   # 黃色外框
 RUBBER_COLOR     = QColor(255, 255,   0)
 JUDGELINE_COLOR  = QColor(  0, 200, 255)
 ALLOC_COLOR      = QColor(255,  60,  60)
+# 旋律線輔助：冠音／低音的連線。紅＝右手、藍＝左手，和音符本身的紅藍同一套
+# （見 note_colors）；破線的警示用橘色，才不會和選取的黃框混在一起。
+MELODY_TOP_R     = QColor(255, 120, 120, 210)
+MELODY_TOP_L     = QColor(120, 190, 255, 210)
+MELODY_BOT_R     = QColor(190,  90,  90, 150)
+MELODY_BOT_L     = QColor( 90, 140, 190, 150)
+MELODY_BREAK     = QColor(255, 140,  20)        # 方向破
+MELODY_REPEAT    = QColor(255, 200,  90)        # 同音不同格
+MELODY_SLOPE     = QColor(190, 120, 255)        # 步伐差太多
+#: 步伐基準最多隔這麼久重算一次（秒）。見 `_melody_curve`。
+CURVE_MAX_AGE_S  = 0.5
+# 樂句：同一句又來了。綠＝守住（整句的位置跟著音高移了）、洋紅＝移了調位置卻
+# 沒跟著移；裝飾音（比本體多出來的那幾顆）用米黃，和上面幾種警示都分得開。
+# 洋紅不是桃紅：右手音符本身就是粉紅的，桃紅的緞帶疊上去看不出來（實測）。
+PHRASE_ECHO      = QColor(110, 230, 170)
+PHRASE_ECHO_BAD  = QColor(255,  60, 235)
+PHRASE_SOURCE    = QColor(110, 230, 170, 90)    # 本體（淡）
+PHRASE_ORNAMENT  = QColor(255, 235, 140)
+# 重疊：真的擺錯的那兩種用紅，音長交疊（很常見、只是長度沒修）用琥珀色
+OVERLAP_BAD      = QColor(255,  70,  70)
+OVERLAP_MILD     = QColor(255, 190,  70)
 
 PITCH_TEXT       = QColor(  0,   0,   0)
 KEY_LABEL        = QColor(190, 190, 200)
@@ -598,6 +625,7 @@ class ChartView(QWidget):
         self._font_time  = QFont('Consolas', 7)
         self._font_pitch = QFont('Consolas', 7, QFont.Bold)
         self._font_vel   = QFont('Consolas', 7)
+        self._font_mark  = QFont('Consolas', 8)   # 輔助標記的小字
 
         # 狀態列輔助文字
         self._drag_status: str = ''
@@ -619,8 +647,21 @@ class ChartView(QWidget):
         #: 拖曳小節線時音符要不要跟著走。由「鎖定音符」開關決定（鎖住＝不跟），
         #: 拖的途中按住 Alt 可以臨時反轉，提示文字即時跟著變。
         self._barline_drag_moves_notes: bool = False
-        #: 吸附到的那顆音符終點（拖曳中用來畫提示）；沒吸到就是 None
+        #: 吸附到的位置（拖曳中用來畫提示）；沒吸到就是 None
         self._barline_snap_ms: Optional[int] = None
+        #: 吸到的是哪一種點（'音符尾' / '起音' / '拍線'），用來講給使用者看
+        self._barline_snap_kind: str = ''
+        #: 拖曳小節線時要不要吸附。使用者：「如果鎖定音符應該是可以開吸附
+        #: 拍點」，而且「兩種都吸，取最近的」——候選是音符終點、音符起音點、
+        #: 存檔裡的拍線三者的聯集。只在「鎖定音符」開著時有意義：那時候音符
+        #: 是基準、格線去遷就它們。不鎖定音符時一律不吸（使用者定案）。
+        self.barline_snap_enabled: bool = True
+        #: 拖完之後小節**內**的拍點怎麼重排。
+        #: True ＝ 保留原來的相對位置等比例縮放（預設，不動到存檔裡的細分）；
+        #: False ＝ 依拍號均分（舊行為，會把手動挪過的拍線拉回規則格上）。
+        #: 以前這條路寫死均分，而「修改小節 BPM」對話框卻是看**檢視模式**
+        #: （`time_uniform`）決定——同一件事兩種結果，所以拆成自己的開關。
+        self.barline_scale_beats: bool = True
         #: 「鎖定音符」：進入「只調整小節線時間」的狀態。預設關。
         #: 開著的時候拖小節線不會動到音符，而且會自動吸附到音符終點。
         self.notes_locked: bool = False
@@ -648,6 +689,8 @@ class ChartView(QWidget):
         self._pattern_step_beats:  float           = 0.5
         self._pattern_key_override = None    # None = 自動偵測
         self._pattern_drag:        Optional[dict]  = None
+        # 上一次生成有沒有套成一顆顫音：0＝沒有，否則是裡面有幾下（給狀態列）
+        self._pattern_last_subs:   int             = 0
         self._note_duration_beats: float           = 1.0    # 四分音符
         self._note_input_hand:     int             = 0      # 0=右手
         # 放置模式預設：寬度與音符類型
@@ -668,6 +711,8 @@ class ChartView(QWidget):
         # 二分搜尋用的 start 陣列與最長時值，都綁 model.notes 這個 list 的身分
         self._note_start_cache:    Optional[tuple] = None
         self._max_span_cache:      Optional[tuple] = None
+        self._melody_curve_cache:  Optional[tuple] = None
+        self._phrase_cache:        Optional[tuple] = None
         # 這些快取存的都是「掃全譜算出來的東西」，不快取就是每幀 O(N)。
         # 任何可 undo 的修改都會發 note_edited，掛在那裡一次失效全部。
         self.note_edited.connect(self._invalidate_chart_caches)
@@ -678,6 +723,9 @@ class ChartView(QWidget):
         self._hold_tail_note:  Optional[GNote] = None   # 正在拉長度的長條
         self._hold_tail_moved: bool = False
         self._hold_tail_hover: bool = False
+        #: 跟著一起拉的那幾顆（多選時 start 和它一樣的），見 `_tail_drag_partners`
+        self._hold_tail_group: List[GNote] = []
+        self._hold_tail_turned: int = 0          # 這次拉會把幾顆 tap 轉成長押
         self._pedal_edge_moved: bool = False                     # 這次拉邊有沒有真的動到
         self._dyn_drag: Optional[int] = None                     # 強弱欄拖曳中的 hand
         self._dyn_last_mark: Optional[float] = None              # 拖曳中上一顆記號的 ms
@@ -867,6 +915,11 @@ class ChartView(QWidget):
         self._judge_ms = None
         self._last_window_sig = None   # 換譜後重新開始比對視窗變動
         self._invalidate_chart_caches()
+        # 換的是**另一份譜**：掃全譜的那兩個快取要整個丟掉，不能像編輯那樣
+        # 留著舊結果——音符顆數剛好一樣的話，0.5 秒的時間閘會把上一份譜的
+        # 樂句畫到這一份上。
+        self._melody_curve_cache = None
+        self._phrase_cache = None
         self._note_input_mode = False
         self._note_input_hover = None
         self._input_drag_note = None
@@ -1038,6 +1091,282 @@ class ChartView(QWidget):
         self.selected = {n.idx for n in self.model.notes if not self._is_ghost(n)}
         self.update()
         self.selection_changed.emit(len(self.selected))
+
+    # ── 旋律線：冠音、低音、破掉的地方 ────────────────────────────
+
+    def _melody_span(self) -> Optional[Tuple[int, int]]:
+        """有選取就回它的時間範圍，沒有就回 None（代表整份譜）。"""
+        times = [int(n.start) for n in self.model.notes_tree
+                 if n.idx in self.selected]
+        return (min(times), max(times)) if times else None
+
+    def _melody_keep(self, found, span) -> List[GNote]:
+        if span:
+            lo, hi = span
+            found = [n for n in found if lo <= int(n.start) <= hi]
+        # 幽靈音符（手別篩選時的另一手）選不到，和 select_all 同一條規則
+        return [n for n in found if not self._is_ghost(n)]
+
+    def _melody_select(self, found, what: str, span) -> None:
+        self.selected = {n.idx for n in found}
+        self._sel_cells.clear()
+        self.update()
+        self.selection_changed.emit(len(self.selected))
+        self.status_changed.emit(
+            '%s：選取 %d 顆%s' % (what, len(found),
+                                '（限剛才選取的那一段）' if span else ''))
+
+    def select_melody_voice(self, which: str = 'top') -> None:
+        """選取冠音（或低音）。本來就有選取時，只在那一段的時間範圍裡找。
+
+        聲部一律從**整份譜**算起再篩時間，不是拿選取的音符去算：一個和弦只
+        框到一半的話，那半疊裡最高的那顆並不是這個和弦的冠音。
+        """
+        span = self._melody_span()
+        notes = list(self.model.notes_tree)
+        found = ML.tops(notes) if which == 'top' else ML.bottoms(notes)
+        self._melody_select(self._melody_keep(found, span),
+                            '冠音' if which == 'top' else '低音', span)
+
+    def select_melody_breaks(self, kind: Optional[str] = None) -> None:
+        """選取不守規則的那些冠音——選起來就能用方向鍵一顆一顆挪。"""
+        span = self._melody_span()
+        kinds = (kind,) if kind else (ML.KIND_DIRECTION, ML.KIND_REPEAT)
+        found = ML.breaks(self.model.notes_tree, kinds=kinds)
+        if span:
+            lo, hi = span
+            found = [b for b in found if lo <= b.start <= hi]
+        what = ML.KIND_NAMES.get(kind, '破線') if kind else '破線'
+        self._melody_select(self._melody_keep([b.second for b in found], None),
+                            what, span)
+
+    def goto_next_melody_break(self) -> None:
+        """捲到下一處方向破線並選起來。沒有下一處就繞回第一處。"""
+        found = ML.breaks(self.model.notes_tree, kinds=(ML.KIND_DIRECTION,))
+        if not found:
+            self.status_changed.emit('冠音的方向沒有破的地方。')
+            return
+        centre = self.mapper.unit_to_ms(
+            self.window_start_unit + self.window_size_unit / 2.0)
+        nxt = next((b for b in found if b.start > centre + 1), found[0])
+        self.scroll_to_ms(nxt.start)
+        self.selected = {nxt.second.idx}
+        self._sel_cells.clear()
+        self.update()
+        self.selection_changed.emit(1)
+        self.status_changed.emit(
+            '方向破線 %d 處，這是第 %d 處（%s，該往%s移 %d 格）'
+            % (len(found), found.index(nxt) + 1,
+               ML.HAND_NAMES.get(nxt.hand, '?'),
+               '右' if nxt.suggest > 0 else '左', abs(nxt.suggest)))
+
+    def repair_melody_breaks(self) -> None:
+        """把破掉的冠音方向拉回來。有選取就只動選取的那些音符。"""
+        notes = list(self.model.notes_tree)
+        movable = ({id(n) for n in notes if n.idx in self.selected}
+                   if self.selected else None)
+        before = ML.breaks(notes, kinds=(ML.KIND_DIRECTION,))
+        if not before:
+            self.status_changed.emit('冠音的方向沒有破的地方，沒有要修的。')
+            return
+        self.model.push_history()
+        moved = ML.repair_direction(notes, movable=movable)
+        if not moved:
+            # 什麼都沒改就把這一步還回去，不然 Ctrl+Z 會先按掉一次空的。
+            self.model.discard_last_history()
+            self.status_changed.emit(
+                '方向破線 %d 處，但都挪不動（出界、撞到別的音符，'
+                '或是會拆掉同音同格）。' % len(before))
+            return
+        self.model.rebuild_display_cache()
+        after = ML.breaks(self.model.notes_tree, kinds=(ML.KIND_DIRECTION,))
+        self.update()
+        self.note_edited.emit()
+        self.status_changed.emit(
+            '冠音方向：%d 處 → %d 處，動了 %d 顆。Ctrl+Z 可以復原。'
+            % (len(before), len(after), moved))
+
+    # ── 重疊：選起來、跳過去 ──────────────────────────────────────
+
+    def _overlap_found(self, kind: Optional[str] = None):
+        """整份譜的重疊。濾掉隱藏音符，和畫面標的那一批一致。"""
+        pool = [n for n in self.model.notes_tree
+                if not getattr(n, 'hidden', False)]
+        kinds = (kind,) if kind else OVERLAP_KINDS
+        return overlapping_pairs(pool, kinds=kinds)
+
+    def select_overlaps(self, kind: Optional[str] = None) -> None:
+        """選取重疊的音符（**兩顆都選**）。有選取就只在那一段的時間範圍裡找。
+
+        兩顆都選是故意的：哪一顆「錯」沒有定論，要移的常常是先響的那一顆
+        （例如長條太長），選起來才能一次用方向鍵挪開。
+        """
+        span = self._melody_span()
+        found = self._overlap_found(kind)
+        if span:
+            lo, hi = span
+            found = [p for p in found if lo <= int(p[2].start) <= hi]
+        notes = [n for _k, a, b in found for n in (a, b)]
+        what = OVERLAP_NAMES.get(kind, '重疊') if kind else '重疊'
+        self._melody_select(self._melody_keep(notes, None), what, span)
+
+    def goto_next_overlap(self) -> None:
+        """捲到下一處重疊並選起來。沒有下一處就繞回第一處。"""
+        found = self._overlap_found()
+        if not found:
+            self.status_changed.emit('沒有重疊的音符。')
+            return
+        centre = self.mapper.unit_to_ms(
+            self.window_start_unit + self.window_size_unit / 2.0)
+        nxt = next((p for p in found if int(p[2].start) > centre + 1), found[0])
+        self.scroll_to_ms(int(nxt[2].start))
+        self.selected = {nxt[1].idx, nxt[2].idx}
+        self._sel_cells.clear()
+        self.update()
+        self.selection_changed.emit(len(self.selected))
+        self.status_changed.emit(
+            '重疊 %d 處，這是第 %d 處（%s，第 %d–%d 格）'
+            % (len(found), found.index(nxt) + 1,
+               OVERLAP_NAMES.get(nxt[0], nxt[0]),
+               max(int(nxt[1].min_key), int(nxt[2].min_key)),
+               min(int(nxt[1].max_key), int(nxt[2].max_key))))
+
+    # ── 樂句：選起來、跳過去 ──────────────────────────────────────
+
+    def _phrase_found(self, kind: Optional[str] = None,
+                      bad_only: bool = False) -> List[Any]:
+        """整份譜的回聲。和畫面上標的是**同一份快取**，不會一個有一個沒有。"""
+        found = self._phrase_echoes()
+        if kind:
+            found = [e for e in found if e.kind == kind]
+        if bad_only:
+            found = [e for e in found if e.bad]
+        return found
+
+    def select_echo_notes(self, which: str = 'repeat',
+                          kind: Optional[str] = MP.ECHO_SHIFT,
+                          bad_only: bool = False) -> None:
+        """選取「同一句又來了」的那一句。有選取就只在那一段的時間範圍裡找。
+
+        `which='source'` 選的是本體（前面那一句）——要照本體的排法改回聲時，
+        先看本體擺在哪比較快。
+        """
+        span = self._melody_span()
+        found = self._phrase_found(kind, bad_only)
+        if span:
+            lo, hi = span
+            found = [e for e in found if lo <= e.start <= hi]
+        notes: List[GNote] = []
+        for echo in found:
+            if which in ('repeat', 'both'):
+                notes.extend(echo.notes)        # 含裝飾音
+            if which in ('source', 'both'):
+                notes.extend(echo.source)
+        what = ('位移沒跟上的樂句' if bad_only
+                else MP.ECHO_NAMES.get(kind, '同一句') if kind else '同一句')
+        if which == 'source':
+            what += '（本體）'
+        self._melody_select(self._melody_keep(notes, None), what, span)
+
+    def select_ornaments(self) -> None:
+        """選取裝飾音——「比本體多出來」的那幾顆。"""
+        span = self._melody_span()
+        notes = MP.ornaments(self._phrase_found())
+        self._melody_select(self._melody_keep(notes, span), '裝飾音', span)
+
+    def goto_next_echo(self, bad_only: bool = False) -> None:
+        """捲到下一處回聲並把它選起來。沒有下一處就繞回第一處。"""
+        found = self._phrase_found(None if bad_only else MP.ECHO_SHIFT, bad_only)
+        if not found:
+            self.status_changed.emit(
+                '沒有位移沒跟上的樂句。' if bad_only else '找不到移調重複的樂句。')
+            return
+        centre = self.mapper.unit_to_ms(
+            self.window_start_unit + self.window_size_unit / 2.0)
+        nxt = next((e for e in found if e.start > centre + 1), found[0])
+        self.scroll_to_ms(nxt.start)
+        self.selected = {n.idx for n in self._melody_keep(nxt.notes, None)}
+        self._sel_cells.clear()
+        self.update()
+        self.selection_changed.emit(len(self.selected))
+        tail = ''
+        if nxt.kind == MP.ECHO_SHIFT:
+            tail = ('，整句移了 %+d 格（該 %+d）'
+                    % (int(round(nxt.shift)), int(round(nxt.want))))
+        self.status_changed.emit(
+            '%s %d 處，這是第 %d 處（%s，%s，%d 顆%s）%s'
+            % ('位移沒跟上' if bad_only else '移調重複', len(found),
+               found.index(nxt) + 1, ML.HAND_NAMES.get(nxt.hand, '?'),
+               nxt.label, nxt.length,
+               '、裝飾音 %d 顆' % len(nxt.ornaments) if nxt.ornaments else '',
+               tail))
+
+    def _phrase_apply_kinds(self) -> Tuple[str, ...]:
+        """「照本體排」要排哪幾種——**畫面上標出來的那些**。
+
+        不另開一個開關：選單排的和眼睛看到的是同一批，原樣重複的標記打開就
+        一起排。兩種都關掉時還是排移調重複（那是使用者點名要的那一種）。
+        """
+        echo, same, _orn = self._phrase_flags()
+        kinds = (((MP.ECHO_SHIFT,) if echo else ())
+                 + ((MP.ECHO_SAME,) if same else ()))
+        return kinds or (MP.ECHO_SHIFT,)
+
+    def apply_phrase_shape(self, bad_only: bool = False) -> None:
+        """照本體把回聲排好：每一顆擺到「本體那一顆的位置 ＋ 整句位移」。
+
+        使用者的說法是「套得不像我排的沒問題，我排的不一樣反而算是失誤，除非
+        沒空間」——所以這裡照抄形狀，不去閃避 `melody_phrase.apply_shape` 說明
+        裡那兩條會被賠掉的規則，只把賠掉多少寫在狀態列上。
+
+        有選取就只排那一段裡的句子。限範圍用的是**時間**不是 `movable`：選取的
+        是冠音，同一組的和弦內音不在選取裡，拿 movable 去限會讓整組都動不了。
+        """
+        span = self._melody_span()
+        kinds = self._phrase_apply_kinds()
+        found = [e for e in self._phrase_found(None, bad_only)
+                 if e.kind in kinds]
+        if span:
+            lo, hi = span
+            found = [e for e in found if lo <= e.start <= hi]
+        what = '位移沒跟上的樂句' if bad_only else '、'.join(
+            MP.ECHO_NAMES[k] for k in kinds)
+        if not found:
+            self.status_changed.emit(
+                '照本體排：%s一句也沒有%s。'
+                % (what, '（限剛才選取的那一段）' if span else ''))
+            return
+        pool = [n for n in self.model.notes
+                if n.pitch is not None and not getattr(n, 'hidden', False)]
+        before = len(ML.breaks(pool, kinds=(ML.KIND_DIRECTION,)))
+        self.model.push_history()
+        got = MP.apply_shape(pool, found)
+        if not got.moved:
+            # 什麼都沒改就把這一步還回去，不然 Ctrl+Z 會先按掉一次空的。
+            self.model.discard_last_history()
+            self.status_changed.emit(
+                '照本體排：%s %d 句，但每一顆本來就在本體的形狀上。'
+                % (what, len(found)))
+            return
+        self.model.rebuild_display_cache()
+        # 鍵道變了，整句的位移和步伐基準都得重算——這兩份快取的時間閘會讓
+        # 連按的第二下拿到舊的 `shift`，等於再搬一次。
+        self._phrase_cache = None
+        self._melody_curve_cache = None
+        after = len(ML.breaks(
+            [n for n in self.model.notes
+             if n.pitch is not None and not getattr(n, 'hidden', False)],
+            kinds=(ML.KIND_DIRECTION,)))
+        self.update()
+        self.note_edited.emit()
+        tail = ''
+        if got.nudged or got.blocked:
+            tail = '；%d 組擠不下讓開了、%d 組沒空間留著原樣' % (
+                got.nudged, got.blocked)
+        self.status_changed.emit(
+            '照本體排：%s %d 句、動了 %d 顆%s。方向破線 %d → %d 處。'
+            'Ctrl+Z 可以復原。'
+            % (what, got.phrases, got.moved, tail, before, after))
 
     def deselect_all(self) -> None:
         self.selected.clear()
@@ -2816,6 +3145,18 @@ class ChartView(QWidget):
         self._chan_color_key = None
         self._note_start_cache = None
         self._max_span_cache = None
+        # 步伐基準和樂句都一樣：留著舊結果、只拔掉身分，讓 0.5 秒的時間閘
+        # 擋住連續的編輯。整份掃一次是 9ms（基準）＋55ms（樂句），方向鍵一下
+        # 一次的話兩個加起來就是一幀 64ms。
+        if self._melody_curve_cache is not None:
+            self._melody_curve_cache = (
+                (None,) + tuple(self._melody_curve_cache[1:]))
+        if self._phrase_cache is not None:
+            # 樂句偵測整份要 55ms（最密的那份），而方向鍵挪一格就會走到這裡，
+            # 直接丟掉等於每按一下卡一幀。改成**只拔掉身分、留著結果**：
+            # `_phrase_echoes` 的 0.5 秒時間閘擋得住連按，而顆數一變（刪除、
+            # 貼上）那裡仍然會立刻重算。
+            self._phrase_cache = (None,) + tuple(self._phrase_cache[1:])
 
     def _pitch_column_mode(self) -> str:
         """音高模式的欄位分色："blackwhite"（黑白鍵）或 "scale"（調性）。
@@ -3175,6 +3516,48 @@ class ChartView(QWidget):
             out.append(int(pitch))
         return out
 
+    def _pattern_lane_ranges(self, kind: str, pitches: Sequence[int],
+                             width: int) -> List[Tuple[int, int]]:
+        """生成出來的每一顆要占哪幾格。預覽和真正插入共用這一份。
+
+        一般音型照音高換算（和一顆一顆放同一條路）。**顫音例外**：兩個音只差
+        一級，照音高換算會落在同一格上——28 格要分 88 鍵，一級通常換不到一格。
+        那畫出來是同一個鍵連敲、不是兩個鍵來回；打包成 Trill 之後整個區只剩
+        一格寬、兩個 cell 完全重疊，mesh 上看不出來回。
+
+        所以顫音改成兩塊**相鄰、不重疊**的鍵道：低音在左、高音在右，整區剛好
+        兩倍鍵寬。這同時對上了官方顫音的形狀——`trill_sub_cells` 的 cell 預設
+        就是區寬的一半（`cell_frac=0.5`），所以打包出來的兩個 cell 正好是左右
+        兩半，不必再去修 cell 的鍵道。
+        """
+        from .music_theory import TRILL_KINDS
+
+        width = max(1, min(TOTAL_GAME_KEYS, int(width)))
+        pair = sorted({int(p) for p in pitches})
+        if (str(kind) not in TRILL_KINDS or len(pair) != 2
+                or width * 2 > TOTAL_GAME_KEYS):
+            return [self._center_to_lane_range(self._pitch_to_lane_center(p), width)
+                    for p in pitches]
+        centre = sum(self._pitch_to_lane_center(p) for p in pair) / 2.0
+        first = int(round(centre - (width * 2 - 1) / 2.0))
+        first = max(0, min(TOTAL_GAME_KEYS - width * 2, first))
+        low = (first, first + width - 1)
+        high = (first + width, first + width * 2 - 1)
+        return [low if int(p) == pair[0] else high for p in pitches]
+
+    def _pattern_packs_trill(self, kind: str, note_type: int) -> bool:
+        """這次生成要不要收成一顆遊戲顫音（note_type=64）。
+
+        兩條都算：音型直接選了「打包成 Trill」，或者音型是顫音、而放置類型剛好
+        就停在 Trill——後者本來只會做出一串各自 type=64 的單音，而單獨一顆
+        type=64 沒有 sub_note 可言，那不是任何人想要的東西。
+        """
+        from .music_theory import TRILL_KINDS
+
+        if str(kind) == 'trill_note':
+            return True
+        return str(kind) in TRILL_KINDS and note_is_trill(int(note_type))
+
     def _pattern_preview_pitches(self) -> List[int]:
         from .music_theory import build_pattern
 
@@ -3216,6 +3599,10 @@ class ChartView(QWidget):
                            int(drag['start_pitch']))
         self._drag_status = '%s ・ %s ・ %d 音' % (
             used.name(), self._pattern_kind_label(), len(pitches))
+        if self._pattern_packs_trill(self._pattern_kind,
+                                     self._note_input_note_type):
+            # 放手之後會變成一顆，不是一串——先講，不然放手才發現「只插入 1 顆」
+            self._drag_status += ' → 一顆 Trill'
         self._emit_status()
         self.update()
 
@@ -3233,10 +3620,18 @@ class ChartView(QWidget):
             int(drag['count']), self._pattern_direction,
             drag['start_ms'], self._pattern_step_beats,
             self._note_input_hand, note_type=self._note_input_note_type)
-        self._drag_status = ('插入 %d 顆（%s）' % (made, drag['key'].name())
-                             if made else '')
+        self._drag_status = self._pattern_made_status(made, drag['key'])
         self._emit_status()
         self.update()
+
+    def _pattern_made_status(self, made: int, key) -> str:
+        """插入完的訊息。打包成顫音時「插入 1 顆」會看起來像壞掉，要講打幾下。"""
+        if not made:
+            return ''
+        if self._pattern_last_subs:
+            return '插入 1 顆 Trill（%d 下交替，%s）' % (
+                self._pattern_last_subs, key.name())
+        return '插入 %d 顆（%s）' % (made, key.name())
 
     def _draw_pattern_preview(self, qp: QPainter) -> None:
         """拖曳中的預覽：音符實際會落在哪裡就畫在哪裡。"""
@@ -3248,6 +3643,8 @@ class ChartView(QWidget):
             return
         start_unit = float(drag['start_unit'])
         step_units = self._pattern_step_beats * self._beat_in_units_at(start_unit)
+        lanes = self._pattern_lane_ranges(self._pattern_kind, pitches,
+                                          self._note_input_width)
         qp.setRenderHint(QPainter.Antialiasing, True)
         for i, pitch in enumerate(pitches):
             unit = start_unit + step_units * i
@@ -3256,8 +3653,7 @@ class ChartView(QWidget):
             if self.pitch_mode:
                 x1, x2 = self._key_span(self._pitch_to_slot(pitch))
             else:
-                center = self._pitch_to_lane_center(pitch)
-                lo, hi = self._center_to_lane_range(center, self._note_input_width)
+                lo, hi = lanes[i]
                 x1, _ = self._key_span(lo)
                 _, x2 = self._key_span(hi)
             rect = QRectF(x1, y_top, max(2.0, x2 - x1), max(2.0, y_bot - y_top))
@@ -3283,10 +3679,13 @@ class ChartView(QWidget):
                        direction: int, start_ms: float, step_beats: float,
                        hand: int, note_type: int = 0,
                        gate_ratio: float = 0.9) -> int:
-        """一次放下一組音階／琶音，音高照 `key` 的音階走。回傳放了幾顆。
+        """一次放下一組音階／琶音／顫音，音高照 `key` 的音階走。回傳放了幾顆。
 
         每顆的時間間隔是 `step_beats` 拍（吃該處的變速），長度是間隔的
         `gate_ratio`，留一點縫才不會黏成一條。
+
+        顫音打包成一顆遊戲音符時（`_pattern_packs_trill`）回傳的是 1——真的只
+        多了一顆音符。那一顆裡有幾下記在 `_pattern_last_subs`，給狀態列用。
         """
         from .music_theory import build_pattern
 
@@ -3297,6 +3696,8 @@ class ChartView(QWidget):
             build_pattern(kind, key, int(start_pitch), int(count), int(direction)))
         if not pitches:
             return 0
+        pack = self._pattern_packs_trill(kind, note_type) and len(pitches) >= 2
+        lanes = self._pattern_lane_ranges(kind, pitches, self._note_input_width)
 
         self.model.push_history()
         start_unit = self.mapper.ms_to_unit(float(start_ms))
@@ -3311,11 +3712,12 @@ class ChartView(QWidget):
             n.end = max(n.start + 1, int(round(off_ms)))
             n.gate = n.end - n.start
             n.pitch = max(0, min(127, int(pitch)))
-            n.note_type = int(note_type)
+            # 要打包的話每一顆都是 sub_note，自己不能再帶顫音旗標：
+            # `make_trill_from_notes` 會把它抄進 src_note_type，解開之後就變成
+            # 一堆沒有 sub_note 的 type=64 單音。
+            n.note_type = 0 if pack else int(note_type)
             n.hand = int(hand)
-            center = self._pitch_to_lane_center(n.pitch)
-            n.min_key, n.max_key = self._center_to_lane_range(
-                center, self._note_input_width)
+            n.min_key, n.max_key = lanes[i]
             # 每顆各自查自己那個時間點的鄰居，整串跨過漸強漸弱時力度才會跟著走
             n.velocity = self.model.velocity_near(n.start, n.hand)
             if self.model.is_midi_mode():
@@ -3323,6 +3725,13 @@ class ChartView(QWidget):
                 n.channel = self.model._default_midi_channel_for_track(n.track)
                 n.off_velocity = self.model._default_midi_off_velocity_for_track(n.track)
             made.append(n)
+
+        self._pattern_last_subs = 0
+        if pack:
+            trill = make_trill_from_notes(made, int(hand))
+            if trill is not None:
+                self._pattern_last_subs = len(made)
+                made = [trill]
 
         self.model.notes_tree.extend(made)
         self.model.rebuild_display_cache()
@@ -3947,6 +4356,10 @@ class ChartView(QWidget):
                 self._draw_note_input_cursor(qp)
         else:
             self._draw_notes(qp)
+            self._draw_overlap_marks(qp)
+            # 樂句的緞帶畫在旋律線**底下**：兩者走同一串點，蓋上去會把線吃掉
+            self._draw_phrase_marks(qp)
+            self._draw_melody_line(qp)
             self._draw_alloc_overlay(qp)
             self._draw_rubber(qp)
             if self._is_drag_copy:
@@ -3986,7 +4399,8 @@ class ChartView(QWidget):
                 if self._barline_drag_start_ms is not None:
                     cur_ms = self.mapper.unit_to_ms(self._py_to_unit_abs(self._barline_drag_py))
                     start_ms = float(self._barline_drag_start_ms)
-                    new_bpm, rounded = self._barline_bpm(start_ms, cur_ms)
+                    new_bpm, rounded = self._barline_bpm(
+                        start_ms, cur_ms, self._barline_drag_measure)
                     qp.setPen(TIME_LABEL)
                     mode = ('連音符一起拖' if self._barline_drag_moves_notes
                             else '只動小節線')
@@ -3994,7 +4408,8 @@ class ChartView(QWidget):
                     if rounded:
                         bits.append('整數')
                     if self._barline_snap_ms is not None:
-                        bits.append('吸到音符尾 %d ms' % self._barline_snap_ms)
+                        bits.append('吸到%s %d ms' % (self._barline_snap_kind or '',
+                                                     self._barline_snap_ms))
                     bits.append('%s（Alt 切換）' % mode)
                     qp.drawText(6, int(self._barline_drag_py) - 6, '　'.join(bits))
             except Exception:
@@ -4365,91 +4780,109 @@ class ChartView(QWidget):
                 unit += step
 
     def _draw_beat_lines(self, qp: QPainter) -> None:
+        """格線：拍線在下、小節線在上。
+
+        **小節線是從「小節邊界」畫出來的，不是從拍點裡挑。** 以前的做法是走
+        `get_beat_entries()`、再看 `get_measure_at_ms` 有沒有換小節——那等於
+        假設「每一個小節邊界上一定有一筆拍點」。不成立的時候（分割出來的片段、
+        或少了邊界那一筆的譜，hanei 就少了好幾個）邊界上畫不出線，而線和它的
+        標籤會跑到邊界後的第一個拍點上去，看起來就是「小節線歪了」。
+
+        小節線後畫，所以和拍點重合時蓋在拍線上面。
+        """
         w = self.width()
-        start_b = math.floor(self.window_start_unit)
-        end_b   = math.ceil(self.window_start_unit + self.window_size_unit) + 1
         qp.setFont(self._font_time)
+        ws_ms, we_ms = self.mapper.window_ms_range(
+            self.window_start_unit, self.window_size_unit)
 
-        # If time_uniform is enabled, draw based on actual ms beat timings
-        if self.time_uniform:
-            ws_ms, we_ms = self.mapper.window_ms_range(self.window_start_unit, self.window_size_unit)
-            beats = self.model.get_beat_entries()
-            if beats:
-                prev_measure = None
-                # draw beat lines for beats falling within visible ms range
-                for idx, bms in beats:
-                    if bms < ws_ms - 1 or bms > we_ms + 1:
-                        continue
-                    unit = self.mapper.ms_to_unit(float(bms)) - self.window_start_unit
-                    py = int(self._unit_to_py(unit))
-                    if not (-2 <= py <= self.height() + 2):
-                        continue
-                    # determine if this beat is a bar start
-                    measure_idx = self.model.get_measure_at_ms(bms)
-                    bar_no = measure_idx + 1
-                    is_bar = (prev_measure is None) or (measure_idx != prev_measure)
-                    prev_measure = measure_idx
-                    if is_bar:
-                        # time signature at current bar start
-                        ts_num = self.model.get_beats_per_bar_at_ms(float(bms))
-                        ts_den = self.model._denominator_at_ms(float(bms))
-                        qp.setPen(QPen(BARLINE_COLOR, 1))
-                        qp.drawLine(0, py, w, py)
-                        tot_s = bms / 1000.0
-                        m = int(tot_s // 60)
-                        s = tot_s - m * 60
-                        try:
-                            bar_bpm = self.model.get_measure_bpm(bar_no - 1)
-                            bpm_str = f'  {bar_bpm:.1f}BPM'
-                        except Exception:
-                            bpm_str = ''
-                        qp.setPen(TIME_LABEL)
-                        qp.drawText(2, py - 2, f'{m}:{s:05.2f}  {ts_num}/{ts_den}{bpm_str}')
-                        qp.setPen(QPen(BARLINE_COLOR, 1))
-                        qp.drawText(w - 30, py - 2, str(bar_no))
-                    else:
-                        qp.setPen(QPen(BEATLINE_COLOR, 1))
-                        qp.drawLine(0, py, w, py)
+        def py_of(ms: float):
+            unit = self.mapper.ms_to_unit(float(ms)) - self.window_start_unit
+            py = int(self._unit_to_py(unit))
+            return py if -2 <= py <= self.height() + 2 else None
+
+        bars = self._visible_bar_lines(ws_ms, we_ms)
+        bar_ms = {ms for ms, _no in bars}
+
+        # ① 拍線
+        qp.setPen(QPen(BEATLINE_COLOR, 1))
+        for _idx, bms in (self.model.get_beat_entries() or ()):
+            if bms < ws_ms - 1 or bms > we_ms + 1 or int(bms) in bar_ms:
+                continue
+            py = py_of(bms)
+            if py is not None:
+                qp.drawLine(0, py, w, py)
+
+        # ② 小節線
+        for ms, bar_no in bars:
+            py = py_of(ms)
+            if py is not None:
+                self._draw_bar_line(qp, py, w, int(ms), bar_no)
+
+    def _visible_bar_lines(self, ws_ms: float, we_ms: float):
+        """視窗範圍內的小節線 `[(毫秒, 小節編號)]`，編號 1 起算。"""
+        try:
+            bounds = self.model._get_precise_measure_boundaries()
+        except Exception:                                   # noqa: BLE001
+            bounds = []
+        if bounds:
+            return [(int(start_ms), i + 1)
+                    for i, (_su, start_ms, _eu, _em) in enumerate(bounds)
+                    if ws_ms - 1 <= start_ms <= we_ms + 1]
+
+        # 退路：算不出精確邊界的譜（拍點太少之類）照舊從拍點推。
+        out, prev = [], None
+        for _idx, bms in (self.model.get_beat_entries() or ()):
+            measure_idx = self.model.get_measure_at_ms(bms)
+            if prev is None or measure_idx != prev:
+                if ws_ms - 1 <= bms <= we_ms + 1:
+                    out.append((int(bms), measure_idx + 1))
+            prev = measure_idx
+        return out
+
+    def _draw_bar_line(self, qp: QPainter, py: int, w: int,
+                       bms: int, bar_no: int) -> None:
+        """一條小節線＋它的標籤（時間、拍號、BPM、小節編號）。
+
+        **分割出來的片段畫成虛線。** 使用者要的是「類似小節線的線」而不是
+        一模一樣的線：它在資料上確實是一個小節邊界（右鍵、改 BPM、拖曳都認
+        它），但它是人為切出來的，看起來要分得出來。拍號只對完整的小節有
+        意義，所以片段不標拍號，改標「佔幾拍」。
+
+        BPM 一律標上去——使用者：「要標註從這邊開始 bpm 是多少」。那個數字
+        來自 `get_measure_bpm`，而它現在是用這一段自己的拍單位數算的，所以
+        片段報的是它真正的速度。
+        """
+        measure_idx = bar_no - 1
+        try:
+            split = self.model.measure_is_split_segment(measure_idx)
+        except Exception:                                   # noqa: BLE001
+            split = False
+        pen = QPen(BARLINE_COLOR, 1)
+        if split:
+            pen.setStyle(Qt.DashLine)
+        qp.setPen(pen)
+        qp.drawLine(0, py, w, py)
+
+        tot_s = bms / 1000.0
+        mm = int(tot_s // 60)
+        ss = tot_s - mm * 60
+        try:
+            bpm_str = '  %.1fBPM' % self.model.get_measure_bpm(measure_idx)
+        except Exception:                                   # noqa: BLE001
+            bpm_str = ''
+        if split:
+            try:
+                meter = '  %.2g拍' % self.model.measure_quarter_notes(measure_idx)
+            except Exception:                               # noqa: BLE001
+                meter = ''
         else:
-            # In measure-uniform mode, also derive lines from beat timings + measure changes
-            # to avoid missing labels under variable time signatures.
-            ws_ms, we_ms = self.mapper.window_ms_range(self.window_start_unit, self.window_size_unit)
-            beats = self.model.get_beat_entries()
-            if beats:
-                prev_measure = None
-                for _idx, bms in beats:
-                    if bms < ws_ms - 1 or bms > we_ms + 1:
-                        continue
-                    unit = self.mapper.ms_to_unit(float(bms)) - self.window_start_unit
-                    py = int(self._unit_to_py(unit))
-                    if not (-2 <= py <= self.height() + 2):
-                        continue
-
-                    measure_idx = self.model.get_measure_at_ms(bms)
-                    bar_no = measure_idx + 1
-                    is_bar = (prev_measure is None) or (measure_idx != prev_measure)
-                    prev_measure = measure_idx
-
-                    if is_bar:
-                        ts_num = self.model.get_beats_per_bar_at_ms(float(bms))
-                        ts_den = self.model._denominator_at_ms(float(bms))
-                        qp.setPen(QPen(BARLINE_COLOR, 1))
-                        qp.drawLine(0, py, w, py)
-                        tot_s = bms / 1000.0
-                        m = int(tot_s // 60)
-                        s = tot_s - m * 60
-                        try:
-                            bar_bpm = self.model.get_measure_bpm(bar_no - 1)
-                            bpm_str = f'  {bar_bpm:.1f}BPM'
-                        except Exception:
-                            bpm_str = ''
-                        qp.setPen(TIME_LABEL)
-                        qp.drawText(2, py - 2, f'{m}:{s:05.2f}  {ts_num}/{ts_den}{bpm_str}')
-                        qp.setPen(QPen(BARLINE_COLOR, 1))
-                        qp.drawText(w - 30, py - 2, str(bar_no))
-                    else:
-                        qp.setPen(QPen(BEATLINE_COLOR, 1))
-                        qp.drawLine(0, py, w, py)
+            ts_num = self.model.get_beats_per_bar_at_ms(float(bms))
+            ts_den = self.model._denominator_at_ms(float(bms))
+            meter = '  %s/%s' % (ts_num, ts_den)
+        qp.setPen(TIME_LABEL)
+        qp.drawText(2, py - 2, '%d:%05.2f%s%s' % (mm, ss, meter, bpm_str))
+        qp.setPen(QPen(BARLINE_COLOR, 1))
+        qp.drawText(w - 30, py - 2, str(bar_no))
 
     def _build_channel_color_map(self) -> dict:
         """把實際用到的 channel 依出現順序(rank)對應到『對比優先』的顏色。
@@ -4983,6 +5416,370 @@ class ChartView(QWidget):
         qp.setPen(VELOCITY_TEXT)
         qp.drawText(rect, Qt.AlignCenter, text)
 
+    # ── 旋律線輔助 ────────────────────────────────────────────────
+
+    def _melody_flags(self) -> Tuple[bool, bool, bool, bool, bool]:
+        """(冠音線, 低音線, 標方向破, 標同音破, 標步伐差太多)。一幀讀一次就好。"""
+        try:
+            from .settings import settings as _st
+            return (bool(_st.get('melody_top_line', True)),
+                    bool(_st.get('melody_bottom_line', False)),
+                    bool(_st.get('melody_break_marks', True)),
+                    bool(_st.get('melody_repeat_marks', False)),
+                    bool(_st.get('melody_slope_marks', True)))
+        except Exception:                       # noqa: BLE001
+            return (True, False, True, False, True)
+
+    def _melody_curve(self) -> Dict[int, float]:
+        """「這個音程該走幾格」——從**整份譜**量這一份自己的習慣。
+
+        不能拿視窗裡那幾十顆去量：`learn_steps` 樣本少於兩個的音程會退回預設
+        表，捲動時標記就會自己閃動。和 `_max_span_cache` 綁同一個 list 身分，
+        內容改了由 `_invalidate_chart_caches` 丟掉。
+        """
+        notes = self.model.notes
+        cached = self._melody_curve_cache
+        if cached is not None and cached[0] is notes:
+            return cached[1]
+        if cached is not None and time.monotonic() - cached[2] < CURVE_MAX_AGE_S:
+            # 改過時間的編輯每一次都指派一張新 list（見 `_note_start_index`），
+            # 拖曳途中就是每一幀都 miss，而整份量一次在最密的譜（5896 顆）要
+            # 9ms。基準是「這份譜的習慣」，慢半秒跟上完全看不出來。
+            return cached[1]
+        pool = [n for n in notes
+                if n.pitch is not None and not getattr(n, 'hidden', False)]
+        self._melody_curve_cache = (notes, ML.learn_steps(pool),
+                                    time.monotonic())
+        return self._melody_curve_cache[1]
+
+    def _melody_point(self, note: GNote, edge: str) -> QPointF:
+        """旋律線在這顆音符上的落點。
+
+        冠音取**右緣**、低音取左緣——規則看的就是那一邊。畫在中心的話，寬度
+        一變線就跟著跳，看起來像走了一步、其實鍵道沒動。
+
+        時間取**起音**，不是音符方塊的正中央（使用者：「不應該從音符中間，
+        而是開始才對，畢竟按下去不會是中間做的事情」）。判定發生在 `start`
+        ——和遊戲端同一個錨點，見 [[note-time-anchor]]——而方塊是從 start 畫到
+        end 的，取中點等於把長押的那一顆往後挪半個音長，長押愈長偏愈多，
+        線的斜率就跟著假掉。
+        """
+        start_u = self.mapper.ms_to_unit(float(note.start)) - self.window_start_unit
+        y = self._unit_to_py(start_u)
+        x1, x2 = self._note_display_x_range(note)
+        if self.pitch_mode:
+            # 音高模式下每顆音符都是同寬的一條窄柱，「右緣」不再代表什麼，
+            # 走中線線才會落在音符上。
+            return QPointF((x1 + x2) / 2.0, y)
+        return QPointF(x2 if edge == 'top' else x1, y)
+
+    def _melody_pool(self, repeat: bool):
+        """算旋律線要看的那一段音符：視窗再往外留一條線的長度。
+
+        不往外留的話，視窗上下緣那一步會沒有「上一顆」可比，捲動時標記就會
+        自己閃掉——而那正是使用者在看的地方。
+        """
+        ws_ms, we_ms = self._window_ms()
+        span = ML.REPEAT_MS if repeat else ML.WINDOW_MS
+        return list(self._notes_in_window(
+            ws_ms - span - self._max_note_span_ms(), we_ms + span))
+
+    def _draw_melody_line(self, qp: QPainter) -> None:
+        """冠音／低音的旋律線，以及不守規則的地方。
+
+        **音高模式只畫線、不畫破線記號**（2026-11-17 使用者：「音高模式也要畫，
+        讓寫譜的參考」）。線在那裡畫的是這首曲子的旋律輪廓，寫譜時當底稿看；
+        但三個記號講的都是**鍵道**——方向是「右緣往哪邊走」、同音同格是「放回
+        同一格」、步伐針更是直接指著「該走到的那一格」——而那個模式的橫軸是
+        音高，針指過去會指到另一個音，是錯的訊息，不是看不懂而已。
+
+        每幀的成本（最密的譜 5137 顆、兩個小節的視窗，整張 render）：
+        關著 2.57ms、冠音線 3.78ms、四個全開 4.72ms。不做快取就夠便宜了，
+        因為算的只有視窗裡那幾十顆。
+        """
+        top_on, bottom_on, mark_dir, mark_rep, mark_slope = \
+            self._melody_flags()
+        if not (top_on or bottom_on):
+            return
+        pool = self._melody_pool(mark_rep and top_on)
+        if len(pool) < 2:
+            return
+        qp.save()
+        qp.setRenderHint(QPainter.Antialiasing, True)
+        qp.setBrush(Qt.NoBrush)
+        for hand, series in ML.events(pool).items():
+            for on, edge, colours, style in (
+                    (top_on, 'top', (MELODY_TOP_R, MELODY_TOP_L), Qt.SolidLine),
+                    (bottom_on, 'bottom', (MELODY_BOT_R, MELODY_BOT_L), Qt.DotLine)):
+                if not on:
+                    continue
+                colour = colours[1] if hand else colours[0]
+                qp.setPen(QPen(colour, 1.6 if edge == 'top' else 1.0, style))
+                for chain in ML.chains(series):
+                    pts = [self._melody_point(
+                        e.top if edge == 'top' else e.bottom, edge) for e in chain]
+                    if len(pts) >= 2:
+                        qp.drawPolyline(QPolygonF(pts))
+                    qp.setBrush(colour)
+                    for point in pts:
+                        qp.drawEllipse(point, 2.2, 2.2)
+                    qp.setBrush(Qt.NoBrush)
+        if top_on and not self.pitch_mode and (mark_dir or mark_rep or mark_slope):
+            kinds = tuple(k for k, on in ((ML.KIND_DIRECTION, mark_dir),
+                                          (ML.KIND_REPEAT, mark_rep),
+                                          (ML.KIND_SLOPE, mark_slope)) if on)
+            for item in ML.breaks(pool, kinds=kinds,
+                                  curve=self._melody_curve()):
+                b = self._melody_point(item.second, 'top')
+                if item.kind == ML.KIND_SLOPE:
+                    self._draw_slope_spike(qp, b, item)
+                    continue            # 針自己就帶箭頭了
+                if item.kind == ML.KIND_DIRECTION:
+                    qp.setPen(QPen(MELODY_BREAK, 2))
+                    qp.drawLine(self._melody_point(item.first, 'top'), b)
+                    colour = MELODY_BREAK
+                else:
+                    # 同音的兩顆可以差 4 秒，連起來是一條貫穿畫面的斜線、另一頭
+                    # 還常常在畫面外。改成只在這一顆旁邊畫一個圈。
+                    colour = MELODY_REPEAT
+                    qp.setPen(QPen(colour, 1.4))
+                    qp.drawEllipse(b, 5.0, 5.0)
+                # 該往哪邊走，就在那顆音符旁邊點一個箭頭——只標「這裡錯了」的話
+                # 還要自己回頭想往哪移。
+                self._draw_melody_arrow(qp, b, item.suggest, colour)
+        qp.restore()
+
+    def _draw_slope_spike(self, qp: QPainter, at: QPointF, item) -> None:
+        """從這顆冠音拉一條針，指到「照這個音程該走到的那一格」。
+
+        針的長度就是差距本身（差幾格就幾格寬），所以差太多的會整條飆出去，
+        看一眼就知道哪一步離譜——使用者要的是這個，不是一個固定大小的記號。
+        線粗也跟著差距長（上限 3.4px），密集段落裡才看得出輕重。
+        """
+        lanes = -item.excess if item.pitch_delta > 0 else item.excess
+        x1, x2 = self._key_span(0)
+        tip = QPointF(at.x() + (x2 - x1) * lanes, at.y())
+        thick = min(3.4, 1.4 + abs(item.excess) / float(ML.SLOPE_TOLERANCE))
+        qp.setPen(QPen(MELODY_SLOPE, thick))
+        qp.drawLine(at, tip)
+        # 起點不再畫點：冠音線已經在每一顆冠音上畫了一個圓。
+        # 箭頭畫在**針尖**：那裡才是「該走到的那一格」
+        way = 1.0 if lanes >= 0 else -1.0
+        self._draw_melody_arrow(
+            qp, QPointF(tip.x() - way * 9.0, tip.y()),
+            item.suggest, MELODY_SLOPE)
+
+    @staticmethod
+    def _draw_melody_arrow(qp: QPainter, at: QPointF, suggest: int,
+                           colour: QColor) -> None:
+        if not suggest:
+            return
+        way = 1.0 if suggest > 0 else -1.0
+        tip = QPointF(at.x() + way * 9.0, at.y())
+        qp.setBrush(colour)
+        qp.drawPolygon(QPolygonF([
+            tip,
+            QPointF(tip.x() - way * 5.0, at.y() - 3.5),
+            QPointF(tip.x() - way * 5.0, at.y() + 3.5)]))
+        qp.setBrush(Qt.NoBrush)
+
+    # ── 樂句：同一句又來了 ────────────────────────────────────────
+
+    def _phrase_flags(self) -> Tuple[bool, bool, bool]:
+        """(標移調重複, 標原樣重複, 標裝飾音)。一幀讀一次就好。
+
+        原樣重複**預設關**：使用者點名要的是「位移往高或低音但同旋律」，而原樣
+        重複在他的譜裡比移調的還多（1203 比 1033），兩種都畫就太吵。它仍然要
+        算出來——裝飾音是「比本體多出來的那幾顆」，而大半的裝飾音出現在原樣
+        重複的句子裡。
+        """
+        try:
+            from .settings import settings as _st
+            return (bool(_st.get('phrase_echo_marks', True)),
+                    bool(_st.get('phrase_same_marks', False)),
+                    bool(_st.get('phrase_ornament_marks', True)))
+        except Exception:                       # noqa: BLE001
+            return (True, False, True)
+
+    def _phrase_echoes(self) -> List[Any]:
+        """整份譜的回聲（快取）。
+
+        **不能只算視窗**：本體可能在視窗外面十秒，只算視窗的話同一處回聲會
+        隨著捲動自己出現又消失。整份算一次平均 9.3ms、最慢 79ms，所以綁
+        `model.notes` 的身分，外加和 `_melody_curve` 一樣的 0.5 秒時間閘
+        （改時間的編輯每幀都會指派一張新 list）。
+
+        顆數變了就一定重算：刪掉的音符還被舊結果抓著的話，畫面上會留下一條
+        指著空處的緞帶。
+        """
+        notes = self.model.notes
+        cached = self._phrase_cache
+        if cached is not None and cached[0] is notes:
+            return cached[1]
+        if (cached is not None and cached[3] == len(notes)
+                and time.monotonic() - cached[2] < CURVE_MAX_AGE_S):
+            return cached[1]
+        pool = [n for n in notes
+                if n.pitch is not None and not getattr(n, 'hidden', False)]
+        found = MP.echoes(pool, curve=self._melody_curve())
+        self._phrase_cache = (notes, found, time.monotonic(), len(notes))
+        return found
+
+    def _draw_phrase_marks(self, qp: QPainter) -> None:
+        """同一句又來了：本體一條淡緞帶、回聲一條亮的，加上多出來的裝飾音。
+
+        畫在冠音線**底下**（`paintEvent` 的順序），因為兩者走的是同一串點：
+        緞帶在上面會把線和點整條吃掉。
+
+        **音高模式照畫**，而且在那裡最好看：回聲是整句移了調，兩條緞帶就是
+        同一個形狀往旁邊平移，一眼看得出「這一句又來了」。只有「該再移 N 格」
+        那個提示會收起來——它講的是鍵道（見 `_draw_phrase_label`）。
+        """
+        echo_on, same_on, orn_on = self._phrase_flags()
+        if not (echo_on or same_on or orn_on):
+            return
+        found = self._phrase_echoes()
+        if not found:
+            return
+        ws, we = self._window_ms()
+        qp.save()
+        qp.setRenderHint(QPainter.Antialiasing, True)
+        qp.setFont(self._font_mark)
+        qp.setBrush(Qt.NoBrush)
+        for echo in found:
+            on = echo_on if echo.kind == MP.ECHO_SHIFT else same_on
+            if not on and not (orn_on and echo.ornaments):
+                continue
+            if on:
+                colour = PHRASE_ECHO_BAD if echo.bad else PHRASE_ECHO
+                # 本體畫成點線、回聲畫實線：兩句常常是前後相接的，都畫實線
+                # 的話在畫面上就是一條，看不出「這裡是第二次」。
+                self._draw_phrase_ribbon(qp, echo.source, PHRASE_SOURCE, 4.0,
+                                         ws, we, Qt.DotLine)
+                faint = QColor(colour)
+                faint.setAlpha(150)
+                if self._draw_phrase_ribbon(qp, echo.repeat, faint, 6.0, ws, we):
+                    self._draw_phrase_label(qp, echo, colour)
+            if orn_on:
+                for note in echo.ornaments:
+                    if not (ws <= int(note.start) <= we):
+                        continue
+                    self._draw_ornament_mark(qp, note)
+        qp.restore()
+
+    def _draw_phrase_ribbon(self, qp: QPainter, notes: Sequence[GNote],
+                            colour: QColor, thick: float,
+                            ws: float, we: float,
+                            style=Qt.SolidLine) -> bool:
+        """沿著這一句的冠音畫一條粗緞帶。整句都在畫面外就不畫，回傳畫了沒。"""
+        if not notes or int(notes[-1].start) < ws or int(notes[0].start) > we:
+            return False
+        pts = [self._melody_point(n, 'top') for n in notes]
+        if len(pts) < 2:
+            return False
+        qp.setPen(QPen(colour, thick, style, Qt.RoundCap, Qt.RoundJoin))
+        qp.drawPolyline(QPolygonF(pts))
+        return True
+
+    def _draw_phrase_label(self, qp: QPainter, echo: Any,
+                           colour: QColor) -> None:
+        """在回聲的第一顆旁邊寫「同句 +12」，位移沒跟上的再寫該移幾格。
+
+        文字畫在音符**右邊**，太靠右就翻到左邊——鍵道 28 格的右半邊常常就是
+        冠音待的地方，不翻的話字會被切掉。
+
+        音高模式下只寫「同句 ±N 半音」：該移幾格、箭頭往哪邊，講的都是鍵道，
+        在橫軸是音高的畫面上指過去會指到另一個音。顏色照留（洋紅就是位移沒
+        跟上），那是一句話的事實，不是這個畫面的幾何。
+        """
+        at = self._melody_point(echo.repeat[0], 'top')
+        text = echo.label
+        hint = bool(echo.bad) and not self.pitch_mode
+        if hint:
+            text += '｜該再移 %+d 格' % echo.suggest
+        width = qp.fontMetrics().width(text)
+        x = at.x() + 10.0
+        if x + width > self.width() - 4:
+            x = max(2.0, at.x() - 10.0 - width)
+        qp.setPen(QPen(colour, 1.0))
+        qp.drawText(QPointF(x, at.y() - 4.0), text)
+        if hint and echo.suggest:
+            self._draw_melody_arrow(qp, at, echo.suggest, colour)
+
+    def _draw_ornament_mark(self, qp: QPainter, note: GNote) -> None:
+        """裝飾音：在它的冠音落點上畫一個小菱形。
+
+        菱形而不是圓——圓已經是「同音不同格」在用的記號了（`MELODY_REPEAT`），
+        同一個畫面上兩種意思不能共用一個形狀。
+        """
+        at = self._melody_point(note, 'top')
+        qp.setPen(QPen(PHRASE_ORNAMENT, 1.4))
+        qp.drawPolygon(QPolygonF([
+            QPointF(at.x(), at.y() - 5.0), QPointF(at.x() + 5.0, at.y()),
+            QPointF(at.x(), at.y() + 5.0), QPointF(at.x() - 5.0, at.y())]))
+
+    # ── 重疊的標記 ────────────────────────────────────────────────
+
+    def _overlap_flags(self) -> Tuple[bool, bool]:
+        """(標重疊, 連音長交疊也標)。一幀讀一次就好。"""
+        try:
+            from .settings import settings as _st
+            return (bool(_st.get('overlap_marks', True)),
+                    bool(_st.get('overlap_tail_marks', True)))
+        except Exception:                       # noqa: BLE001
+            return (True, True)
+
+    def _overlap_pool(self) -> List[GNote]:
+        """重疊要看的那一段音符。
+
+        往前多留一個最長時值：一顆音符的**頭**在畫面上方外面、身體還垂進來
+        的時候，它造成的重疊就在畫面裡（見 `_draw_notes` 的 Pass 1）。
+        隱藏音符濾掉——它不佔按鍵，算成重疊只會冤枉寄主。
+        """
+        ws_ms, we_ms = self._window_ms()
+        return [n for n in self._notes_in_window(
+            ws_ms - self._max_note_span_ms(), we_ms)
+            if not getattr(n, 'hidden', False) and not self._is_ghost(n)]
+
+    def _draw_overlap_marks(self, qp: QPainter) -> None:
+        """把兩顆音符疊在一起的那塊**交集**圈出來。
+
+        音高模式不畫：那個模式的橫軸是音高不是鍵道，兩顆音符在畫面上疊不疊
+        和它們佔不佔同一個按鍵是兩件事。
+
+        標的就是交集矩形本身，不是在旁邊放一個記號——重疊有多嚴重（疊掉幾格、
+        疊了多久）用眼睛直接看得出來。
+        """
+        on, tail_on = self._overlap_flags()
+        if self.pitch_mode or not on:
+            return
+        kinds = OVERLAP_KINDS if tail_on else (
+            OVERLAP_CHORD, OVERLAP_HOLD)
+        pool = self._overlap_pool()
+        if len(pool) < 2:
+            return
+        qp.save()
+        qp.setRenderHint(QPainter.Antialiasing, False)
+        for kind, earlier, later in overlapping_pairs(pool, kinds=kinds):
+            ra, rb = self._note_rect(earlier), self._note_rect(later)
+            if ra is None or rb is None:
+                continue
+            hit = ra.intersected(rb)
+            if hit.isEmpty():
+                continue
+            if kind == OVERLAP_TAIL:
+                # 很常見（使用者的譜平均一份 36 處），只是前一顆的音長還沒走
+                # 完：虛線框一下就好，不然整面都是色塊。
+                qp.setPen(QPen(OVERLAP_MILD, 1, Qt.DashLine))
+                qp.setBrush(Qt.NoBrush)
+            else:
+                qp.setPen(QPen(OVERLAP_BAD, 2))
+                fill = QColor(OVERLAP_BAD)
+                fill.setAlpha(70)
+                qp.setBrush(QBrush(fill))
+            qp.drawRect(hit)
+        qp.restore()
+
     def _draw_alloc_overlay(self, qp: QPainter) -> None:
         if not self.alloc_active:
             return
@@ -5305,12 +6102,50 @@ class ChartView(QWidget):
                 best, best_dist = note, dist
         return best
 
+    def _tail_drag_partners(self, note: GNote) -> List[GNote]:
+        """拉這條尾巴時要一起拉的那幾顆：**選取裡 start 和它一樣**的音符。
+
+        使用者指定的規則：「多選時如果拉動 hold 終端，要做兩件事：把選擇的
+        note 改 hold、把結束時間改成游標拉到的地方。但只抓 start 一樣的。」
+
+        為什麼限在同一刻：和絃是同時按下去、同時放開的，那一組的尾巴本來就
+        該一起走。選取跨好幾刻時，別刻的音符起點不同，套同一個結束時間等於
+        把長度改成各不相同的怪數字——那是「尾端對齊」那個功能在做的事。
+
+        抓的那顆自己不在選取裡時回空的：那種情況使用者是直接去抓一條線的
+        尾巴，和手上的選取無關，照舊只動那一顆。
+
+        跳過顫音和滑鍵（改掉型別會拆掉它們的串鏈／敲擊），也跳過隱藏音符
+        （畫面上看不到，改了也看不出來）。
+        """
+        if len(self.selected) < 2 or note.idx not in self.selected:
+            return []
+        when = int(note.start)
+        out: List[GNote] = []
+        for n in self.model.notes_tree:
+            if n is note or n.idx not in self.selected:
+                continue
+            if int(n.start) != when or getattr(n, 'hidden', False):
+                continue
+            nt = int(getattr(n, 'note_type', 0))
+            if note_is_trill(nt) or note_is_slide(nt):
+                continue
+            out.append(n)
+        return out
+
     def _begin_hold_tail_drag(self, note: GNote) -> None:
         self._hold_tail_note = note
         self._hold_tail_moved = False
         self.model.push_history()
-        self.selected = {note.idx}
-        self.selection_changed.emit(len(self.selected))
+        self._hold_tail_group = self._tail_drag_partners(note)
+        self._hold_tail_turned = sum(
+            1 for n in self._hold_tail_group
+            if not note_is_long(int(getattr(n, 'note_type', 0))))
+        if not self._hold_tail_group:
+            # 一顆一顆拉的老行為：抓到誰就只選誰。有夥伴時**不要**動選取，
+            # 不然使用者剛框好的那一片會在按下去的瞬間消失。
+            self.selected = {note.idx}
+            self.selection_changed.emit(len(self.selected))
         self.update()
 
     def _hold_tail_steps(self, note: GNote, py: float) -> int:
@@ -5326,11 +6161,28 @@ class ChartView(QWidget):
         raw_unit = self._py_to_unit_abs(float(py))
         return max(1, int(round((raw_unit - start_unit) / step_units)))
 
+    @staticmethod
+    def _make_long(note: GNote) -> bool:
+        """把一顆音符改成長押。已經是長押就回 False。
+
+        只動 `LONG_BIT`，而且**保留 skin 那個位元**（純外觀，和判定無關）。
+        不能寫成 `nt | LONG_BIT`：soft(1) 會變成 3，而 3 是 staccato——編輯器
+        專用的純量值，不是位元組合，等於把一顆音符改成另一種短音符。
+        """
+        nt = int(getattr(note, 'note_type', 0))
+        if note_is_long(nt):
+            return False
+        note.note_type = (nt & SKIN_BIT) | LONG_BIT
+        return True
+
     def _drag_hold_tail(self, pos) -> None:
-        """把長押的尾端拉到游標處。
+        """把長押的尾端拉到游標處，多選時連同**同一刻**的那幾顆一起。
 
         長度吸附在「放置時值」的整數倍上（工具列那個下拉），但實際存的是毫秒
         ——變速段落裡同樣是「四分音符」，毫秒數本來就不一樣。
+
+        夥伴（`_tail_drag_partners`）和它同 start，所以直接套同一個 `end_ms`，
+        不是套同一個長度；本來是 tap 的就順手轉成長押。
         """
         note = self._hold_tail_note
         if note is None:
@@ -5345,11 +6197,23 @@ class ChartView(QWidget):
             return
         note.end = end_ms
         note.gate = max(1, end_ms - int(note.start))
+        for mate in self._hold_tail_group:
+            mate.end = end_ms
+            mate.gate = max(1, end_ms - int(mate.start))
+            self._make_long(mate)
         self._hold_tail_moved = True
         self.model.rebuild_display_cache()
         self._update_unit_bounds()
         self._drag_status = '長條長度 %d ms（%g × %s）' % (
             note.gate, steps, self._note_value_label(step_beats))
+        if self._hold_tail_group:
+            # 一起動了幾顆要講出來：使用者按下去的時候畫面上只有一條線在動，
+            # 看不出同一刻的其它音符也跟著走。
+            self._drag_status += '，同一刻 %d 顆' % (len(self._hold_tail_group) + 1)
+            if self._hold_tail_turned:
+                # 這個數字在按下去那一刻就算好了，不是每次移動重算——重算的話
+                # 第一次移動之後它們都已經是長押，訊息會自己消失。
+                self._drag_status += '（%d 顆轉成長押）' % self._hold_tail_turned
         self.update()
         self._emit_status()
 
@@ -5372,6 +6236,8 @@ class ChartView(QWidget):
     def _finish_hold_tail_drag(self) -> None:
         note = self._hold_tail_note
         self._hold_tail_note = None
+        self._hold_tail_group = []
+        self._hold_tail_turned = 0
         if note is None:
             return
         if not self._hold_tail_moved:
@@ -6208,22 +7074,24 @@ class ChartView(QWidget):
             # 重排，和「能不能拖小節線」是兩件事。
             if self.barline_drag_enabled:
                 ws_ms, we_ms = self.mapper.window_ms_range(self.window_start_unit, self.window_size_unit)
-                beats = self.model.get_beat_entries()
-                if beats:
+                # 命中判定走**小節線**，不走拍點。兩個理由：
+                # ① 分割出來的小節線不是一筆拍點，走拍點就抓不到它，而使用者
+                #    要的正是「也可以對它做和小節線一樣的事情」。
+                # ② 以前是走全部拍點，所以抓到小節中間的拍線也會開始拖，然後
+                #    去改**前一小節**的 BPM——抓到的線和改到的東西對不起來。
+                bars = self._visible_bar_lines(ws_ms, we_ms)
+                if bars:
                     thr = 6  # pixel threshold
                     closest = None
-                    for idx, bms in beats:
-                        # 找 bar start
-                        measure_idx = self.model.get_measure_at_ms(bms)
-                        # bar start 的 y
+                    for bms, bar_no in bars:
                         unit = self.mapper.ms_to_unit(float(bms)) - self.window_start_unit
                         py = int(self._unit_to_py(unit))
                         if abs(py - pos.y()) <= thr:
-                            # 找到最靠近的 barline，記得不是第一個（需要前一小節可調整）
-                            closest = (measure_idx, py, bms)
+                            closest = (bar_no - 1, py, bms)
                             break
                     if closest is not None:
                         measure_idx, py, bms = closest
+                        # 第一條小節線前面沒有小節可以調整
                         if measure_idx > 0:
                             prev_idx = measure_idx - 1
                             start_ms, end_ms = self.model.get_measure_time_range(prev_idx)
@@ -6235,6 +7103,7 @@ class ChartView(QWidget):
                                     self.notes_locked
                                     == bool(event.modifiers() & Qt.AltModifier))
                                 self._barline_snap_ms = None
+                                self._barline_snap_kind = ''
                                 self._barline_drag_measure = prev_idx
                                 self._barline_drag_start_ms = start_ms
                                 self._barline_drag_orig_end_ms = end_ms
@@ -6364,15 +7233,14 @@ class ChartView(QWidget):
                     pos = QPoint(pos.x(), int(self._unit_to_py(unit)))
             except Exception:                               # noqa: BLE001
                 self._barline_snap_ms = None
+                self._barline_snap_kind = ''
             self._barline_drag_py = pos.y()
             # 計算暫時 BPM 並更新狀態欄
             try:
                 start_ms = int(self._barline_drag_start_ms or 0)
                 cur_ms = int(round(self.mapper.unit_to_ms(self._py_to_unit_abs(pos.y()))))
-                new_dur = max(1, cur_ms - start_ms)
-                num = self.model.get_beats_per_bar_at_ms(start_ms)
-                den = self.model.time_sig_denominator
-                new_bpm = num * 4.0 * 60000.0 / (den * float(new_dur))
+                new_bpm, _r = self._barline_bpm(
+                    start_ms, cur_ms, self._barline_drag_measure)
                 self._drag_status = f'目標 BPM: {new_bpm:.2f}'
             except Exception:
                 self._drag_status = ''
@@ -6487,12 +7355,17 @@ class ChartView(QWidget):
                 raw_ms = self.mapper.unit_to_ms(self._py_to_unit_abs(event.pos().y()))
                 # 吸到音符終點，再盡量讓 BPM 落在整數上（兩件事使用者一起要的）
                 cur_ms, _hit = self._barline_snap(raw_ms)
-                new_bpm, _rounded = self._barline_bpm(start_ms, cur_ms)
+                new_bpm, _rounded = self._barline_bpm(
+                    start_ms, cur_ms, target_idx)
                 # 推入歷史並套用
                 self.model.push_history()
                 grid_end_before = self.model.grid_end_ms()
+                # uniform=True ＝ 把小節內的拍點依拍號均分；False ＝ 保留它們
+                # 原來的相對位置等比例縮放。預設走縮放（不動到存檔裡的細分），
+                # 由「縮放小節內的拍點」那顆開關決定。
                 self.model.set_measure_bpm(
-                    target_idx, float(new_bpm), uniform=True,
+                    target_idx, float(new_bpm),
+                    uniform=not self.barline_scale_beats,
                     adjust_notes=self._barline_drag_moves_notes)
                 if not self._barline_drag_moves_notes:
                     # 只動格線時小節線會往前擠而音符沒動，尾端就空出一段沒有
@@ -6506,6 +7379,7 @@ class ChartView(QWidget):
                 self._barline_drag_start_ms = None
                 self._barline_drag_orig_end_ms = None
                 self._barline_snap_ms = None
+                self._barline_snap_kind = ''
                 self._drag_status = ''
                 self._emit_status()
                 self.note_edited.emit()
@@ -6548,47 +7422,89 @@ class ChartView(QWidget):
     BPM_ROUND_TOLERANCE = 0.1
 
     def _barline_snap_targets(self):
-        """可以吸附的位置：**音符的終點**（尾拍）。排序好的 list。
+        """可以吸附的位置，`[(毫秒, 這是什麼)]`，照時間排好。
 
-        只在「鎖定音符」開著時用——那時候音符是基準、格線去遷就它們，所以
-        拿音符的邊界當吸附點才有意義。
+        只在「鎖定音符」開著時有東西——那時候音符是基準、格線去遷就它們，
+        拿音符和拍線當吸附點才有意義。不鎖定音符時音符會跟著縮放，吸附沒有
+        意義（使用者定案：那個模式不做任何吸附）。
+
+        三種候選，**取最近的那一個**（使用者：「兩種都吸，取最近的」）：
+
+        * 音符終點 —— 原本唯一的候選。對上尾拍。
+        * 音符起音點 —— 想讓小節線落在某顆音「之前」時要的。
+        * 拍線 —— 存檔裡的 `beat_timings`，含小節內的細分。想讓小節線落在
+          既有的細分格上時要的。
+
+        同一個毫秒出現在好幾種裡面時留**音符終點**：那是原本的行為，而且
+        「對上尾拍」比「對上一條線」更具體。
         """
-        if not self.notes_locked:
+        if not self.notes_locked or not self.barline_snap_enabled:
             return []
+        # 拍線會跟著編輯變，所以簽章要含它——只看音符數量的話，改過 BPM 之後
+        # 還會吸到舊的拍線位置。
+        try:
+            beat_sig = self.model._beat_sig()
+        except Exception:                                   # noqa: BLE001
+            beat_sig = None
+        sig = (len(self.model.notes_tree), id(self.model), beat_sig)
         cache = getattr(self, '_snap_targets_cache', None)
-        sig = (len(self.model.notes_tree), id(self.model))
         if cache is not None and cache[0] == sig:
             return cache[1]
-        ends = sorted({int(n.end) for n in self.model.notes_tree})
-        self._snap_targets_cache = (sig, ends)
-        return ends
+
+        kinds = {}
+        for _idx, bms in (self.model.get_beat_entries() or ()):
+            kinds[int(bms)] = '拍線'
+        for n in self.model.notes_tree:
+            kinds[int(n.start)] = '起音'
+        for n in self.model.notes_tree:          # 終點最後寫，所以它贏
+            kinds[int(n.end)] = '音符尾'
+        targets = sorted(kinds.items())
+        self._snap_targets_cache = (sig, targets)
+        return targets
 
     def _barline_snap(self, ms: float):
-        """把拖到的時間吸到最近的音符終點。回傳 (時間, 吸到的那一顆或 None)。"""
+        """把拖到的時間吸到最近的候選點。回傳 (時間, 吸到的毫秒或 None)。
+
+        吸到的是哪一種記在 `_barline_snap_kind`，給提示文字用。
+        """
         targets = self._barline_snap_targets()
+        self._barline_snap_kind = ''
         if not targets:
             return float(ms), None
-        i = bisect_left(targets, ms)
-        best, dist = None, None
-        for j in (i - 1, i):
+        i = bisect_left(targets, (int(ms), ''))
+        best, kind, dist = None, '', None
+        for j in (i - 1, i, i + 1):
             if 0 <= j < len(targets):
-                d = abs(targets[j] - ms)
+                d = abs(targets[j][0] - ms)
                 if dist is None or d < dist:
-                    best, dist = targets[j], d
+                    best, kind, dist = targets[j][0], targets[j][1], d
         if best is not None and dist <= self.BARLINE_SNAP_MS:
+            self._barline_snap_kind = kind
             return float(best), int(best)
         return float(ms), None
 
-    def _barline_bpm(self, start_ms: float, end_ms: float):
+    def _barline_bpm(self, start_ms: float, end_ms: float, measure_idx=None):
         """小節頭尾 → BPM。差整數不到 `BPM_ROUND_TOLERANCE` 就取整數。
 
         回傳 (bpm, 有沒有被取整)。取整之後小節線會離吸附點差一點點（150 BPM
         的 1600ms 小節上，0.1 BPM 大約是 1ms），那是刻意的取捨。
+
+        `measure_idx` 給了就用那一段**自己**佔幾個四分音符來算。完整的一小節
+        等於 num*4/den，結果和以前一樣；分割出來的片段不是完整一小節，照拍號
+        算會在拖曳時顯示錯的 BPM（而那個數字就是使用者照著拖的依據）。
         """
         dur = max(1.0, float(end_ms) - float(start_ms))
-        num = self.model.get_beats_per_bar_at_ms(int(start_ms))
-        den = self.model.time_sig_denominator
-        bpm = num * 4.0 * 60000.0 / (den * dur)
+        units = None
+        if measure_idx is not None:
+            try:
+                units = float(self.model.measure_quarter_notes(int(measure_idx)))
+            except Exception:                               # noqa: BLE001
+                units = None
+        if units is None or units <= 1e-6:
+            num = self.model.get_beats_per_bar_at_ms(int(start_ms))
+            den = self.model.time_sig_denominator
+            units = num * 4.0 / max(1, den)
+        bpm = units * 60000.0 / dur
         rounded = round(bpm)
         if rounded >= 1 and abs(bpm - rounded) <= self.BPM_ROUND_TOLERANCE:
             return float(rounded), True
@@ -7081,6 +7997,18 @@ class ChartView(QWidget):
             self.note_edited.emit()
 
     def _ctx_note_bpm_dialog(self, hit: GNote) -> None:
+        """在這顆音符前面切一條小節線，並問它之後那一段要多快。
+
+        **舊版做的是另一件事**，而且做得不好：它只在音符處插一筆 beat entry、
+        然後把小節的尾段縮放。那一筆是普通的拍線，不是小節邊界——所以畫出來
+        是細線不是小節線（而且線會跑到下一個拍點上）、`get_measure_at_ms` 還
+        是回報原來那一小節，右鍵選小節也算不到它。
+
+        使用者：「我是希望它可以生成一個類似小節線的線在 note 前面……也可以對
+        它做和小節線一樣的事情……要標註從這邊開始 bpm 是多少……總之有點類似
+        分割小節的功能。」所以現在是真的把小節切開（`add_measure_split`），
+        切完之後拖曳、改 BPM、右鍵選小節全部照小節線那一套走。
+        """
         from PyQt5.QtWidgets import QMessageBox
 
         if hit in self.model.notes_tree:
@@ -7091,24 +8019,66 @@ class ChartView(QWidget):
             QMessageBox.warning(self, '缺少拍點資料',
                                 '目前譜面沒有可編輯的 beat_data / beat_timings。')
             return
-        current_bpm = self.model.get_measure_bpm(
-            self.model.get_measure_at_ms(auth.start))
-        bpm, ok = QInputDialog.getDouble(
-            self, '從此音符開始變拍',
-            f'從 {int(auth.start)} ms 開始的新 BPM：',
-            float(current_bpm), 1.0, 9999.0, 2,
-        )
-        if not ok:
-            return
+
+        when = int(auth.start)
+        self.model.push_history()
         try:
-            self.model.push_history()
-            self.model.set_note_bpm(int(auth.start), float(bpm))
+            split = self.model.add_measure_split(when)
+            if not split and when not in self.model.measure_splits:
+                QMessageBox.information(
+                    self, '分割小節',
+                    '這顆音符剛好在小節線上，不用分割。' + (chr(10) * 2)
+                    + '想改這一小節的速度的話用「小節 → 修改小節 BPM」。')
+                self.model.undo()
+                return
+            idx = self.model.get_measure_at_ms(when)
+            current = self.model.get_measure_bpm(idx)
+            bpm, ok = QInputDialog.getDouble(
+                self, '分割小節',
+                '從 %d ms 開始的新 BPM（目前 %.2f）：' % (when, current),
+                float(current), 1.0, 9999.0, 2)
+            if ok and abs(float(bpm) - float(current)) > 1e-6:
+                self.model.set_measure_bpm(
+                    idx, float(bpm), uniform=not self.barline_scale_beats,
+                    adjust_notes=not self.notes_locked)
             self.rebuild_mapper()
             self._update_unit_bounds()
             self.update()
             self.note_edited.emit()
-        except Exception as exc:
-            QMessageBox.critical(self, '變拍失敗', str(exc))
+            self.status_changed.emit(
+                '已在 %d ms 分割小節（第 %d 小節，%.2f BPM）'
+                % (when, idx + 1, self.model.get_measure_bpm(idx)))
+        except Exception as exc:                            # noqa: BLE001
+            self.model.undo()
+            QMessageBox.critical(self, '分割小節失敗', str(exc))
+
+    def _ctx_remove_measure_split(self, click_ms: float) -> None:
+        """把點到的那條分割線拿掉，小節合回去。"""
+        splits = self.model.measure_splits
+        if not splits:
+            return
+        nearest = min(splits, key=lambda s: abs(s - float(click_ms)))
+        self.model.push_history()
+        if not self.model.remove_measure_split(nearest, tolerance_ms=10 ** 9):
+            self.model.undo()
+            return
+        self.rebuild_mapper()
+        self._update_unit_bounds()
+        self.update()
+        self.note_edited.emit()
+        self.status_changed.emit('已移除 %d ms 的分割線（小節合回去了）' % nearest)
+
+    def _ctx_clear_measure_splits(self) -> None:
+        self.model.push_history()
+        count = self.model.clear_measure_splits()
+        if not count:
+            self.model.undo()
+            return
+        self.rebuild_mapper()
+        self._update_unit_bounds()
+        self.update()
+        self.note_edited.emit()
+        self.status_changed.emit('已移除 %d 條分割線' % count)
 
     def _note_is_concealed(self, note: 'GNote') -> bool:
         """這顆音符在目前的模式下不該畫出來。
@@ -7119,9 +8089,15 @@ class ChartView(QWidget):
 
         以前只寫「非音高模式就不畫」，音高模式開著再切到預覽，隱藏音就跟著留
         在畫面上了。
+
+        **無主音（`hand=2`）預覽也不畫**：本家把它當自動演奏、不計分，畫面上
+        不會有這顆音符（見 [[note-type-bitmask]] 的 nostalgia.dll 比對）。它
+        可以存在、也照常存檔，只是預覽要照遊戲的樣子來。編輯模式照畫（綠色），
+        不然就選不起來、沒辦法指定左右手。
         """
-        return (getattr(note, 'hidden', False)
-                and (self.preview_mode or not self.pitch_mode))
+        if getattr(note, 'hidden', False):
+            return self.preview_mode or not self.pitch_mode
+        return self.preview_mode and int(getattr(note, 'hand', 0) or 0) == 2
 
     def _hidden_host(self, note: 'GNote'):
         """隱藏音符要掛在哪顆可見音符上（音高最近）。
@@ -7739,6 +8715,104 @@ class ChartView(QWidget):
                     lambda checked=False, _t=target, _v=bounds[key_max]:
                     self.align_selected_edge(_t, _v))
 
+    def _ctx_build_melody_menu(self, menu, has_sel: bool) -> None:
+        """旋律線：找冠音、找破線、把破線拉回來。
+
+        每一項都是「有選取就只在那一段裡做，沒選取就整份譜」——框一段起來再
+        按，才不會在一份 5000 顆的譜上一次選出兩千顆。
+        """
+        menu.setToolTipsVisible(True)
+        scope = '（限選取的那一段）' if has_sel else '（整份譜）'
+        a = menu.addAction('選取冠音' + scope)
+        a.setToolTip('每一組同時起音裡最高的那顆，左右手各自算。')
+        a.triggered.connect(lambda checked=False: self.select_melody_voice('top'))
+        a = menu.addAction('選取低音' + scope)
+        a.setToolTip('每一組同時起音裡最低的那顆。')
+        a.triggered.connect(lambda checked=False: self.select_melody_voice('bottom'))
+        menu.addSeparator()
+
+        a = menu.addAction('選取方向破掉的冠音' + scope)
+        a.setToolTip('音高往上走、鍵道卻停在原地或往回走的那些。\n'
+                     '選起來之後用方向鍵就能一次挪。')
+        a.triggered.connect(
+            lambda checked=False: self.select_melody_breaks(ML.KIND_DIRECTION))
+        a = menu.addAction('選取同音不同格的冠音' + scope)
+        a.setToolTip('同一個音高在 4 秒內被放到別的鍵道。')
+        a.triggered.connect(
+            lambda checked=False: self.select_melody_breaks(ML.KIND_REPEAT))
+        a = menu.addAction('選取步伐差太多的冠音' + scope)
+        a.setToolTip('走對邊了，但走的格數和這個音程該走的差 %g 格以上。\n'
+                     '基準是這份譜自己的習慣（每個音程取中位數）。'
+                     % ML.SLOPE_TOLERANCE)
+        a.triggered.connect(
+            lambda checked=False: self.select_melody_breaks(ML.KIND_SLOPE))
+        a = menu.addAction('跳到下一處方向破線')
+        a.setToolTip('捲過去並選起來，到底了會繞回第一處。')
+        a.triggered.connect(lambda checked=False: self.goto_next_melody_break())
+        menu.addSeparator()
+
+        a = menu.addAction('把破掉的方向拉回來' + scope)
+        a.setEnabled(not self.alloc_active)
+        a.setToolTip('整組剛體平移，和絃內部不動；出界、撞到別的音符、'
+                     '或是會拆掉同音同格的就不動。可以 Ctrl+Z。')
+        a.triggered.connect(lambda checked=False: self.repair_melody_breaks())
+
+    def _ctx_build_overlap_menu(self, menu, has_sel: bool) -> None:
+        """重疊：選起來、跳過去。整理的工具在「工具 → 處理左右重疊」。"""
+        menu.setToolTipsVisible(True)
+        scope = '（限選取的那一段）' if has_sel else '（整份譜）'
+        a = menu.addAction('選取重疊的音符' + scope)
+        a.setToolTip('兩顆都選，因為要移開的常常是先響的那一顆。')
+        a.triggered.connect(lambda checked=False: self.select_overlaps())
+        a = menu.addAction('只選同時起音疊在一起的' + scope)
+        a.setToolTip('同一個落點上疊了兩顆——這種幾乎都是真的擺錯。\n'
+                     '你的曲庫裡 86% 的譜一處都沒有。')
+        a.triggered.connect(
+            lambda checked=False: self.select_overlaps(OVERLAP_CHORD))
+        a = menu.addAction('跳到下一處重疊')
+        a.setToolTip('捲過去並選起來，到底了會繞回第一處。')
+        a.triggered.connect(lambda checked=False: self.goto_next_overlap())
+
+    def _ctx_build_phrase_menu(self, menu, has_sel: bool) -> None:
+        """樂句：同一句又來了（移了調／插了裝飾音）。"""
+        menu.setToolTipsVisible(True)
+        scope = '（限選取的那一段）' if has_sel else '（整份譜）'
+        a = menu.addAction('選取移調重複的那一句' + scope)
+        a.setToolTip('同一條旋律整句搬去別的音高。選的是後面那一句（含裝飾音）。')
+        a.triggered.connect(lambda checked=False: self.select_echo_notes())
+        a = menu.addAction('選取它的本體（前面那一句）' + scope)
+        a.setToolTip('要照本體的排法改回聲時，先看本體擺在哪比較快。')
+        a.triggered.connect(
+            lambda checked=False: self.select_echo_notes('source'))
+        a = menu.addAction('只選位移沒跟上的那幾句' + scope)
+        a.setToolTip('整句移了調，鍵道卻沒跟著移（或移反了、差超過 3 格）。\n'
+                     '你的譜裡這是移調回聲的 7.5%，一份約 1.3 處。')
+        a.triggered.connect(
+            lambda checked=False: self.select_echo_notes(bad_only=True))
+        a = menu.addAction('選取中間插的裝飾音' + scope)
+        a.setToolTip('「比本體多出來」的那幾顆，不是猜哪顆音太短。')
+        a.triggered.connect(lambda checked=False: self.select_ornaments())
+        a = menu.addAction('跳到下一處移調重複')
+        a.setToolTip('捲過去並選起來，到底了會繞回第一處。')
+        a.triggered.connect(lambda checked=False: self.goto_next_echo())
+        menu.addSeparator()
+
+        a = menu.addAction('照本體排這一句' + scope)
+        a.setEnabled(not self.alloc_active)
+        a.setToolTip('把回聲的每一顆擺到「本體那一顆的位置 ＋ 整句位移」。\n'
+                     '排的是畫面上標出來的那幾種（原樣重複的標記打開就一起排）。\n'
+                     '整組剛體平移；撞到別的音符或出界就往旁邊讓最多 2 格，\n'
+                     '讓不出來就留著原樣。可以 Ctrl+Z。\n'
+                     '句內形狀會從 16% 對變成 88% 對，方向破線會多一成六——\n'
+                     '不順的話按完再用「把破掉的方向拉回來」收回去。')
+        a.triggered.connect(lambda checked=False: self.apply_phrase_shape())
+        a = menu.addAction('只排位移沒跟上的那幾句' + scope)
+        a.setEnabled(not self.alloc_active)
+        a.setToolTip('只動標成洋紅的那幾句（整句位移補到該有的量，形狀也照本體排）。\n'
+                     '不想一次動到一半的回聲時用這個。')
+        a.triggered.connect(
+            lambda checked=False: self.apply_phrase_shape(bad_only=True))
+
     def _ctx_build_structure_menu(self, menu, has_sel: bool, multi_sel: bool) -> None:
         """結構：滑鍵 / 顫音 / Alloc Section。"""
         has_slide_sel = any(
@@ -7954,10 +9028,10 @@ class ChartView(QWidget):
             p['start_ms'], p['step_beats'], p['hand'],
             note_type=self._note_input_note_type)
         if made:
-            self.status_changed.emit(
-                '插入 %d 顆（%s）' % (made, p['key'].name()))
+            self.status_changed.emit(self._pattern_made_status(made, p['key']))
         else:
-            QMessageBox.information(self, '插入音階 / 琶音', '沒有產生任何音符。')
+            QMessageBox.information(self, '插入音階 / 琶音 / 顫音',
+                                    '沒有產生任何音符。')
 
     def _ctx_build_dynamics_menu(self, menu, click_ms: float) -> None:
         """強弱記號：像樂譜的 p / f / cresc.，左右手各一條曲線。"""
@@ -8286,9 +9360,26 @@ class ChartView(QWidget):
             cur_den = self.model.time_sig_denominator
         a = menu.addAction(
             f'修改第 {m_idx + 1} 小節 拍號（目前 {cur_num}/{cur_den}）…')
+        a.setEnabled(not self.model.measure_is_split_segment(m_idx))
+        if not a.isEnabled():
+            # 片段不是完整的一小節，拍號對它沒有意義——會寫到整個母小節上。
+            a.setToolTip('這是分割出來的片段，先把分割線移除才能改拍號。')
         a.triggered.connect(
             lambda _checked=False, _idx=m_idx:
             self.set_measure_time_sig_requested.emit(_idx))
+
+        # 分割線：切出來的片段才給「移除」。切割本身在音符的右鍵上——那裡才
+        # 知道要切在哪一顆音符前面。
+        if self.model.measure_is_split_segment(m_idx):
+            menu.addSeparator()
+            a = menu.addAction('移除這條分割線（小節合回去）')
+            a.triggered.connect(
+                lambda _checked=False, _ms=click_ms:
+                self._ctx_remove_measure_split(_ms))
+        if len(self.model.measure_splits) > 1:
+            a = menu.addAction('移除全部 %d 條分割線'
+                               % len(self.model.measure_splits))
+            a.triggered.connect(self._ctx_clear_measure_splits)
 
     # ==================================================================
     # 右鍵選單（contextMenuEvent）
@@ -8326,7 +9417,7 @@ class ChartView(QWidget):
             a = menu.addAction('編輯屬性…')
             a.triggered.connect(
                 lambda checked=False, _h=hit: self._ctx_note_property_dialog(_h))
-            a = menu.addAction('從此音符開始變拍…')
+            a = menu.addAction('在這顆音符前面分割小節…')
             a.triggered.connect(
                 lambda checked=False, _h=hit: self._ctx_note_bpm_dialog(_h))
             menu.addSeparator()
@@ -8343,10 +9434,14 @@ class ChartView(QWidget):
             self._ctx_build_dynamics_menu(
                 menu, max(0.0, self._py_to_ms(pos.y())))
         self._ctx_build_structure_menu(menu.addMenu('結構 / 連接'), has_sel, multi_sel)
+        self._ctx_build_melody_menu(menu.addMenu('旋律線（冠音）'), has_sel)
+        self._ctx_build_phrase_menu(menu.addMenu('樂句（同一句又來了）'), has_sel)
+        self._ctx_build_overlap_menu(menu.addMenu('重疊'), has_sel)
 
-        # 輔助組合音符：音階、琶音一次放一組（不必進放置模式一顆一顆點）
-        a = menu.addAction('插入音階 / 琶音…')
-        a.setToolTip('照譜面偵測到的調性一次放下一組音，起點取右鍵的位置。')
+        # 輔助組合音符：音階、琶音、顫音一次放一組（不必進放置模式一顆一顆點）
+        a = menu.addAction('插入音階 / 琶音 / 顫音…')
+        a.setToolTip('照譜面偵測到的調性一次放下一組音，起點取右鍵的位置。\n'
+                     '顫音分「分開的」（一串音符）和「套上的」（一顆 Trill）。')
         a.triggered.connect(
             lambda checked=False, _p=QPoint(pos): self._ctx_insert_pattern(_p))
 

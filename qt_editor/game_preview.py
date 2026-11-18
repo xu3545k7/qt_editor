@@ -90,8 +90,16 @@ TRILL_TAP = {0: QColor(230, 70, 70), 1: QColor(70, 120, 230)}
 
 
 def _playable(notes: Sequence[GNote]) -> List[GNote]:
-    """隱藏音符只發聲、玩家看不到，預覽也不該畫（和 `preview_window` 同一個理由）。"""
-    return [n for n in notes if not getattr(n, 'hidden', False)]
+    """玩家在遊戲裡**看得到**的那些音符。
+
+    兩種看不到：隱藏音符（只貢獻 keysound）和**無主音**（`hand=2`，本家當成
+    自動演奏、不計分，畫面上不會出現）。兩種都存得下來、也照常發聲，只是這個
+    視窗問的是「這段進遊戲長怎樣」，畫出來就是騙人。譜面的預覽模式走的是
+    `ChartView._note_is_concealed`，同一條規則。
+    """
+    return [n for n in notes
+            if not getattr(n, 'hidden', False)
+            and int(getattr(n, 'hand', 0) or 0) != 2]
 
 
 def _colors(note: GNote) -> Tuple[QColor, QColor]:

@@ -221,6 +221,18 @@ class SmartChartSettings:
     melody_slope_after_snap: bool = True
     #: 只移一隻手移不動時，改成整組（兩隻手）一起平移
     melody_slope_whole_group: bool = False
+    #: 冠音方向的最後一道收尾（_repair_melody_direction）。0 = 不跑。
+    melody_direction_repair: bool = True
+    #: 「前後相接」的樂句窗：前一組放開到下一組按下去空不到這麼久
+    melody_direction_window_ms: int = 600
+    #: 走對邊的那一格撞到人時，最多往同方向再多讓幾格
+    melody_direction_reach: int = 4
+    #: 最多拆掉幾處「同音同格」來換一處方向（見函式說明的實測表）
+    melody_direction_repeat_budget: int = 1
+    #: 搬過去之後「跨組順序」最多可以多幾處違規（見函式說明的實測表）
+    melody_direction_order_slack: int = 0
+    #: 報告用：步伐差幾格以上才算破線（和 melody_line.SLOPE_TOLERANCE 同值）
+    melody_line_slope_tolerance: float = 3.0
     #: 1~14 個半音的目標格數（鍵道中心的位移）。預設是官方 Real 全語料 424 份
     #: 量的，見 settings_for_style。
     melody_step_top: Tuple[float, ...] = (
@@ -552,6 +564,12 @@ class SmartChartStats:
     chord_reflushed: int = 0
     hand_top_strict_repairs: int = 0
     melody_slope_moves: int = 0
+    #: 冠音方向收尾搬了幾顆
+    melody_direction_repairs: int = 0
+    #: 收尾之後冠音旋律線還破幾處（方向／同音不同格／步伐），只報不修
+    melody_direction_breaks: int = 0
+    melody_repeat_breaks: int = 0
+    melody_slope_breaks: int = 0
 
 
 def _start(note: Any) -> int:
@@ -6232,6 +6250,354 @@ def _repair_small_top_steps(
     return fixed
 
 
+def _melody_voiced(note: Any) -> bool:
+    """這顆音符算不算在冠音的旋律線裡。和 `melody_line.usable` 同一條規則。
+
+    * **沒有音高的排除**：旋律線整套都靠音高定義冠音，而 `_pitch` 對沒音高的
+      音符是拿鍵道中心去湊一個數字（那是給排版通道用的退路），當成音高會讓
+      線整條歪掉。
+    * **隱藏音符排除**：它不佔按鍵，是掛在寄主底下的半透明影子，算成冠音會
+      指到一顆玩家按不到的音。這不是罕見情況——實測一份 1951 顆的譜裡有 924
+      顆是隱藏音（顫音的子音符），不濾掉的話同音錨點全是假的，收尾會被自己
+      的假資料擋到一顆都搬不動。
+    """
+    if getattr(note, "pitch", None) is None:
+        return False
+    return not getattr(note, "hidden", False)
+
+
+def _melody_hand_events(
+    notes: Sequence[Any],
+    groups: Sequence[Sequence[Any]],
+    settings: SmartChartSettings,
+) -> Dict[int, List[Tuple[int, int, List[Any], List[Any], Any]]]:
+    """每隻手照時間排好的事件：(起音, 放開, 鄰居, 搬得動的音, 冠音)。
+
+    「放開」是這隻手在這一組裡最晚放開的時間，給「前後相不相接」用——比的是
+    前一組放開到下一組按下去，不是兩個起音差多遠，和 `melody_line.chains`
+    同一條線。冠音的定義 (音高, 右緣) 最大也和那邊一樣。
+
+    **分組只拿可見音符自己分**（`_melody_voiced`），不是直接吃排譜器的
+    `groups`。排譜器的組含隱藏的子音符，一顆子音符就可能把組界推到別的地方，
+    算出來的冠音和製譜器看到的不是同一批——實測一份譜差 5 處，等於收尾在追
+    假的破線、同時漏掉真的。報告（`_melody_line_breaks`）和修補
+    （`_repair_melody_direction`）都走這裡，兩邊永遠是同一組數字。
+
+    「同刻的鄰居」是**可見音符**的那一組（含另一隻手），給重疊、組內音高順序、
+    兩手交界、和絃間距用。隱藏子音符刻意不算在裡面：它不佔按鍵、是掛在寄主
+    底下的半透明影子，搬過去疊到它不是「打不出來」。算進去的話實測連一顆都
+    搬不動（三份譜 0、0、2 顆），因為顫音密集的譜每一格旁邊都有影子。
+
+    「寄主組」是排譜器自己的那一組，只給長押走廊那兩道查 `activity` 用——
+    那張表是拿 `id(group)` 當鍵的，換成別的清單會查不到、等於悄悄關掉檢查。
+
+    「搬得動的音」只有這隻手的可見音符：隱藏子音符和寄主的起音時間不同、落在
+    不同的組裡，跟著別人走就會脫勾，留在原地沒有任何問題。
+    """
+    owner: Dict[int, Sequence[Any]] = {}
+    for group in groups:
+        for note in group:
+            owner[id(note)] = group
+    events: Dict[int, List[Tuple[int, int, List[Any], Sequence[Any],
+                                 List[Any], Any]]] = {}
+    voiced = [n for n in notes if _melody_voiced(n)]
+    for peers in _clusters_uncached(voiced, settings.onset_tolerance_ms):
+        by_hand: Dict[int, List[Any]] = {}
+        for note in peers:
+            by_hand.setdefault(int(getattr(note, "hand", 0)), []).append(note)
+        for hand, movers in by_hand.items():
+            top = max(movers, key=lambda n: (_pitch(n), int(n.max_key)))
+            events.setdefault(hand, []).append((
+                min(_start(n) for n in movers),
+                max(max(_start(n), int(getattr(n, "end", 0) or 0))
+                    for n in movers),
+                peers, owner.get(id(top), peers), movers, top))
+    for series in events.values():
+        series.sort(key=lambda item: item[0])
+    return events
+
+
+def _melody_movable(note: Any) -> bool:
+    """這顆音符准不准被方向收尾搬。和 `melody_line.repair_direction` 同一條線。
+
+    顫音的鍵道還連著它每一格子音符，要搬得整顆一起搬，所以整組都不動。
+
+    隱藏的子音符則是**不列入搬動名單**（見 `_repair_melody_direction` 的
+    movers），不是把整組擋掉：它和寄主的起音時間不同、落在不同的組裡，跟著
+    別人走就會和寄主脫勾，但留在原地沒有任何問題。這條差別很要緊——實測的
+    三份譜裡隱藏子音符佔 47%、47%、75%，整組擋掉的話這一道等於沒跑
+    （搬 0、0、2 顆）。它們還是會參與重疊檢查，所以搬過去撞到子音符一樣會
+    被擋下來。
+    """
+    return not int(getattr(note, "note_type", 0) or 0) & 0x40
+
+
+def _repair_melody_direction(
+    notes: Sequence[Any],
+    groups: Sequence[Sequence[Any]],
+    settings: SmartChartSettings,
+) -> int:
+    """最後一道：音高動了、冠音右緣沒跟著動的地方，把後面那一組平移回去。
+
+    這是製譜器那個「冠音的旋律線」檢查（`melody_line`）的第一條規則，接回排譜
+    流程裡。方向本來就有人守（`_repair_hand_top_edge_strict`），但它看的是
+    「兩手合計的最高音」在 `top_edge_window_ms`（2.5 秒）內的順序；**每隻手自己
+    那條線**在 600ms 的樂句範圍內還是會留下破洞。
+
+    為什麼需要：拿使用者 24 份手排譜（28413 顆）當答案重排一次，方向這一項
+    **平均打平、個別在賭**——
+
+        エンドマークに希望と涙を添えて   9 →  48 處
+        anima                       34 →  62
+        Rrharil（Rrhar'il）          21 →  30
+        La_Campanella               95 →  28
+        Hemisphere                  14 →   4
+        合計                       744 → 683（守方向 96.5% → 96.8%）
+
+    同一批的另外兩項：步伐破線 1269 → 428（排譜器贏三倍），同音不同格
+    2511 → 3958（24 份裡 22 份變差，這是它唯一系統性輸的一項）。
+
+    加了這一道之後（同一批 24 份，時間保險 0 次所以可重現）：
+
+                   方向破   同音不同格   步伐破   跨組錯序   守方向
+        他手排的      744      2511      1269     37108    96.5%
+        不加          683      3958       428      4065    96.8%
+        加了          277      4033       441      3998    98.7%
+
+    **方向破線降 59%，而且 24 份每一份都降、沒有一份上升**；那幾份原本比他差
+    五倍的也收掉了（anima 62 → 26、エンドマーク 48 → 14、天ノ弱 35 → 4、
+    六兆年 27 → 3、Flight of the Bamboo Cutter 47 → 11）。跨組錯序**跟著降**，
+    代價是同音不同格多 75 處（+1.9%）、步伐多 13 處。搬動 465 顆／28413（1.6%）。
+
+    兩個額度（12 份譜、15694 顆。**排譜時這一道關著**，之後才從同一個起點各試
+    一次——量這種收尾一定要這樣，不然基準線裡已經含了它自己跑過一次的結果，
+    表上看到的是增量，會得出「額度 0 等於不跑」這種假結論）：
+
+        同音額度  順序讓步   方向破   同音不同格   跨組錯序   ≤1 格    搬
+          關著      —        317      2267       2298     66.1%     0
+          0         0        218      2230       2287     66.2%   124
+          0         1        192      2224       2310     66.3%   164
+        → 1         0        147      2295       2282     66.2%   206
+          1         1        110      2309       2311     66.2%   267
+          2         0        116      2354       2278     66.1%   249
+          2         1         75      2389       2302     66.1%   322
+
+    **額度 0 是免費的**：方向降 31%，同音不同格和跨組錯序**也一起降**
+    （2267 → 2230、2298 → 2287），一欄都沒有變差。再往上才開始付錢。
+
+    取 **同音額度 1、順序讓步 0**：方向降 54%（317 → 147），花掉 28 處同音不同格
+    （+1.2%），跨組錯序仍然是降的（2298 → 2282）。依據是使用者自己講的優先
+    順序——方向是他講出口的規則（「官方寫譜會遵守冠音的旋律線」），而同音同格
+    他 2026-11-16 講明「沒必要，形狀比較重要」。額度 2 再多花 59 處只換到 31 處，
+    邊際報酬掉得很快。
+
+    **和他排的像不像完全沒變**（≤1 格 66.1~66.3%，六種設定全在同一檔）。所以
+    這一道不是在「排得更像他」，是在收掉它自己破的規則。
+
+    順序讓步放到 1 每一檔都能多修 30~40 處方向，但那是唯一會讓跨組錯序回升的
+    旋鈕（2282 → 2311），所以留 0。
+
+    試過但不採用的兩道（8 份譜；那一輪的基準線偏高，因為當時有三支量測並行
+    跑。組內的相對比較不受影響）：
+
+        收尾             方向破   同音不同格   跨組錯序   撞長押   ≤1 格
+        排完不動          185      1520        657       0       68.4%
+        照本體排樂句       287      1705        657       4       67.7%
+        冠音帶頭           349       550       1059      30       67.5%
+
+    * **照本體排樂句**（`melody_phrase.apply_shape`）在製譜器裡是把**使用者
+      手排**的形狀抄到回聲上，價值來自那個人排的本體；排譜器的本體自己就是猜
+      的，抄過去只是把同一個猜測複製一遍（La_Campanella 方向破線 29 → 121）。
+    * **冠音帶頭**（`melody_line.lead_by_top`）治得了同音同格（1520 → 550，
+      那是排譜器唯一系統性輸給使用者的一項），但它改寫 61% 的譜、方向破線
+      翻倍、跨組錯序 +61%、開始撞長押走廊，而且更不像他排的。它在
+      `arrange_by_example` 裡有效是因為那裡有使用者自己排好的前半段當參考
+      （±1 格 64.6% → 68.6%），排譜器沒有那個東西。要把它接進來的話得先照
+      排譜器的合法性檢查重寫一遍（長押走廊、跨組順序），那是另一件工程。
+
+    也查過「長押之後那一步」是不是漏洞：`_repair_melody_slope` 的確只看起音差，
+    長押跨過 600ms 的那些步它一律當成不相鄰（12 份譜裡佔 5.8% 的步）。但方向
+    不是只靠它在守，實測排譜器在那一段的破線率 **13.0%、比使用者自己的 16.0%
+    還低**，反而是「看得到的那一段」4.0% 輸給他的 2.9%。所以這一道修的是後者，
+    不是去補那個盲區。
+
+    搬法和這一支模組其他收尾一致：**整隻手在該組的音符剛體平移**，和絃內部幾何
+    一格都不動。不准的事也一樣（出界、組內重疊、組內音高順序、兩手交界、和絃
+    間距、長押走廊），另外加一條「跨組順序不准變差」——方向和跨組順序都是看右
+    緣，不驗的話修好一邊會弄壞另一邊。
+    """
+    if not groups or not settings.melody_direction_repair:
+        return 0
+    activity = _build_hold_activity(groups, settings)
+    dependents = _build_hold_dependents(groups, activity)
+    window = max(1, int(settings.melody_direction_window_ms))
+    reach = max(1, int(settings.melody_direction_reach))
+    budget = int(settings.melody_direction_repeat_budget)
+    slack = max(0, int(settings.melody_direction_order_slack))
+    repeat_window = max(1, int(settings.snap_repeat_window_ms))
+    neighbours = _build_sequence_neighbours(notes, settings)
+
+    # 同音錨點：(手, 音高) 在 repeat_window 內前後相鄰的那一顆。和
+    # `melody_line.repair_direction` 的 `repeat_cost` 同一個算法。
+    mates: Dict[int, List[Any]] = {}
+    by_pitch: Dict[Tuple[int, int], List[Any]] = {}
+    for note in sorted((n for n in notes if _melody_voiced(n)), key=_start):
+        by_pitch.setdefault(
+            (int(getattr(note, "hand", 0)), _pitch(note)), []).append(note)
+    for items in by_pitch.values():
+        for first, second in zip(items, items[1:]):
+            if _start(second) - _start(first) <= repeat_window:
+                mates.setdefault(id(first), []).append(second)
+                mates.setdefault(id(second), []).append(first)
+
+    def repeat_cost(movers: Sequence[Any], delta: int) -> int:
+        """這個位移會多拆掉幾處同音同格（負數＝反而對齊了幾處）。"""
+        inside = {id(n) for n in movers}
+        cost = 0
+        for note in movers:
+            for mate in mates.get(id(note), ()):
+                if id(mate) in inside:
+                    continue
+                was = int(note.max_key) == int(mate.max_key)
+                now = int(note.max_key) + delta == int(mate.max_key)
+                if was and not now:
+                    cost += 1
+                elif now and not was:
+                    cost -= 1
+        return cost
+
+    def shift(movers: Sequence[Any], delta: int) -> None:
+        for note in movers:
+            note.min_key = int(note.min_key) + delta
+            note.max_key = int(note.max_key) + delta
+
+    def legal(peers: Sequence[Any], holder: Sequence[Any],
+              movers: Sequence[Any], deficit: float, spacing: float,
+              order: int) -> bool:
+        if any(int(n.min_key) < 0 or int(n.max_key) >= settings.total_lanes
+               for n in movers):
+            return False
+        if _group_overlaps(peers) or _pitch_order_violations(peers):
+            return False
+        if _cross_hand_deficit(peers, settings) > deficit + settings.cross_hand_slack_lanes:
+            return False
+        if _chord_spacing_deficit(peers, settings) > spacing:
+            return False
+        if _neighbour_order_cost(movers, neighbours) > order + slack:
+            return False
+        if not _hold_corridor_clear(notes, activity, dependents, movers):
+            return False
+        return all(
+            _range_avoids_hold(notes, holder, note, activity,
+                               int(note.min_key), int(note.max_key))
+            for note in movers
+        )
+
+    moved = 0
+    for series in _melody_hand_events(notes, groups, settings).values():
+        for index in range(len(series) - 1):
+            _t0, release, _p0, _h0, _m0, first = series[index]
+            start, _r1, peers, holder, movers, second = series[index + 1]
+            if start - release > window:
+                continue            # 樂句斷了，沒有「上一步」可言
+            delta_pitch = _pitch(second) - _pitch(first)
+            if delta_pitch == 0:
+                continue            # 同音高沒有方向，那是同音同格那條規則在管
+            edge = int(second.max_key) - int(first.max_key)
+            if edge != 0 and edge * delta_pitch > 0:
+                continue            # 已經走對邊了
+            # 剛好走對邊的那一格起跳，撞到人就往同方向再多讓一格
+            if not all(_melody_movable(n) for n in peers):
+                continue
+            want = 1 if delta_pitch > 0 else -1
+            need = int(first.max_key) + want - int(second.max_key)
+            deficit = _cross_hand_deficit(peers, settings)
+            spacing = _chord_spacing_deficit(peers, settings)
+            order = _neighbour_order_cost(movers, neighbours)
+            for extra in range(reach):
+                delta = need + want * extra
+                if abs(delta) > reach:
+                    # 和 `melody_line.repair_direction` 的 max_shift 一樣：走對邊
+                    # 要搬超過這麼多格的話，那顆的問題不是方向，是位置本來就擺
+                    # 錯了，硬拉過去只會把整段的比例弄歪。
+                    break
+                if delta == 0:
+                    continue
+                if repeat_cost(movers, delta) > budget:
+                    # 怎麼挪都會拆掉比 budget 更多處同音同格：寧可留著這一處
+                    # 方向破線。兩條規則使用者都在守。
+                    continue
+                shift(movers, delta)
+                if legal(peers, holder, movers, deficit, spacing, order):
+                    moved += len(movers)
+                    break
+                shift(movers, -delta)
+    return moved
+
+
+def _melody_line_breaks(
+    notes: Sequence[Any],
+    groups: Sequence[Sequence[Any]],
+    settings: SmartChartSettings,
+) -> Tuple[int, int, int]:
+    """冠音旋律線的三種破線各幾處：(方向, 同音不同格, 步伐)。
+
+    只數不修，給排譜結果報告用。定義和製譜器的 `melody_line.breaks` 一致，
+    所以報出來的數字按下「冠音的旋律線」看到的就是同一個。三種檢查看的距離
+    不一樣是刻意的：方向和步伐只在同一條樂句線（`melody_direction_window_ms`）
+    內比，同音不同格看 `snap_repeat_window_ms`（4 秒）。
+
+    步伐那一項比的是**這個風格自己的**目標曲線（`melody_step_top`），不是
+    `melody_line.DEFAULT_STEPS` 那張固定表。兩者在 eather 風格下是同一組數字；
+    官方風格的目標比較寬，用它自己的表才問得出「照你要的風格排，步伐歪了幾處」。
+
+    分組**自己重算一次**，不吃傳進來的 `groups`：排譜器的組含隱藏子音符，
+    一顆子音符就可能把組界推到別的地方，算出來的冠音和製譜器看到的不是同一
+    批（實測一份譜差 5 處）。報告的價值就在於「按下去看到的就是這個數字」，
+    差一點都不行。
+    """
+    if not groups:
+        return 0, 0, 0
+
+    window = max(1, int(settings.melody_direction_window_ms))
+    repeat_window = max(1, int(settings.snap_repeat_window_ms))
+    table = tuple(float(v) for v in settings.melody_step_top)
+    tolerance = float(settings.melody_line_slope_tolerance)
+    direction = repeat = slope = 0
+    for series in _melody_hand_events(notes, groups, settings).values():
+        seen: Dict[int, Any] = {}
+        for index, (start, _r, _p, _h, _m, top) in enumerate(series):
+            before = seen.get(_pitch(top))
+            if (before is not None
+                    and start - _start(before) <= repeat_window
+                    and int(top.max_key) != int(before.max_key)):
+                repeat += 1
+            seen[_pitch(top)] = top
+            if index == 0:
+                continue
+            _t0, release, _p0, _h0, _m0, first = series[index - 1]
+            if start - release > window:
+                continue
+            delta_pitch = _pitch(top) - _pitch(first)
+            if delta_pitch == 0:
+                continue
+            edge = int(top.max_key) - int(first.max_key)
+            if edge == 0 or edge * delta_pitch < 0:
+                direction += 1
+                continue
+            interval = abs(delta_pitch)
+            if interval <= len(table):
+                want = table[interval - 1]
+            else:
+                # 超出表的範圍（14 個半音以上）用表尾的斜率外插，不是直接
+                # 截斷——和 `melody_line.step_for` 同一條線。
+                tail = table[-1] / float(len(table))
+                want = table[-1] + (interval - len(table)) * tail
+            if abs(abs(edge) - max(0.0, want)) > tolerance:
+                slope += 1
+    return direction, repeat, slope
+
+
 def _repair_hand_top_edge_strict(
     notes: Sequence[Any],
     groups: Sequence[Sequence[Any]],
@@ -6669,6 +7035,17 @@ def arrange_midi_notes(
     stats.width_two_notes = sum(
         int(note.max_key) - int(note.min_key) + 1 == 2 for note in note_list
     )
+    # 冠音方向的最後一道。排在寬度收尾之後是因為那兩道只收左緣、右緣（方向的
+    # 判準）不動，所以這裡看到的右緣就是成品的右緣；反過來先修方向再收寬度也
+    # 不會翻掉結論，但位置報告會對不上。
+    stats.melody_direction_repairs = _repair_melody_direction(
+        note_list, groups, config
+    )
+    (
+        stats.melody_direction_breaks,
+        stats.melody_repeat_breaks,
+        stats.melody_slope_breaks,
+    ) = _melody_line_breaks(note_list, groups, config)
     stats.unresolved_overlaps = sum(_count_group_overlaps(group) for group in groups)
     stats.pitch_order_violations = sum(
         _pitch_order_violations(group) for group in groups

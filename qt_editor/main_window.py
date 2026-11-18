@@ -373,6 +373,8 @@ class MainWindow(QMainWindow):
             # 小節線拖曳的開關是逐格的旗標，但設定是全域的；工具列那顆按鈕
             # 建立時也會讀同一個設定，所以兩邊一開始就一致。
             v.barline_drag_enabled = bool(settings.get('barline_drag_enabled', False))
+            v.barline_snap_enabled = bool(settings.get('barline_snap_enabled', True))
+            v.barline_scale_beats = bool(settings.get('barline_scale_beats', True))
             v.notes_locked = bool(settings.get('notes_locked', False))
             self._panes.append(v)
             self._splitter.addWidget(v)
@@ -578,7 +580,8 @@ class MainWindow(QMainWindow):
     # ── 格式模式：JSON（完整）／XML（PAN 相容）──────────────────────────
 
     #: XML 模式要關掉的工具（PAN 沒有踏板）。用函式名比對，選單和工具列兩邊都抓得到。
-    _PAN_DISABLED_SLOTS = frozenset({'generate_pedal_dialog', 'clear_pedal'})
+    _PAN_DISABLED_SLOTS = frozenset({'generate_pedal_dialog', 'clear_pedal',
+                                    'pedal_from_audio_dialog'})
 
     def _register_pan_gated(self, action, slot=None) -> None:
         name = slot if isinstance(slot, str) else getattr(slot, '__name__', '')
@@ -1196,12 +1199,15 @@ class MainWindow(QMainWindow):
     def apply_language(self, lang: str) -> None:
         """NosMania 啟動器換了語言：記進設定，和目前不同就就地換掉介面文字。"""
         from .i18n import get_lang, set_lang
-        if lang not in ('zh_tw', 'zh_cn', 'en'):
+        from .ui_text import LANGUAGES
+        if lang not in dict(LANGUAGES):
             return
         if settings.get('language', 'zh_tw') != lang:
             settings.set('language', lang)
         if get_lang() != lang:
             set_lang(lang)
+            from .ui_font import apply_ui_font
+            apply_ui_font()
             self.retranslate_ui()
 
     def retranslate_ui(self) -> None:
@@ -1265,6 +1271,8 @@ class MainWindow(QMainWindow):
         # 同一個模型，但停在 MIDI：拿去別的 DAW 用，或先存著以後再排譜
         self._add_action(ai_sub, '只轉成 MIDI 檔（mp3／wav… → .mid）…',
                          self.convert_audio_to_midi)
+        # 只採一段：手寫到一半、某幾小節聽不出來時用
+        self._add_action(ai_sub, '只補一小段到目前的譜面…', self.audio_section_dialog)
         self._add_action(ai_sub, '轉譜環境（安裝／移除）…', self._manage_ai_transcribe)
         file_m.addSeparator()
         self._add_action(file_m, t('action_save'), self.save_file, QKeySequence.Save)
@@ -1474,6 +1482,25 @@ class MainWindow(QMainWindow):
             lambda on: self._set_velocity_display('pitch_scale_lock', on))
         scale_m.addAction(self._act_scale_lock)
 
+        # 輔助標記：旋律線一節、樂句一節、重疊一節。名稱不再寫「鍵道模式」
+        # ——旋律線和樂句緞帶在音高模式也畫（使用者：「音高模式也要畫，讓寫譜
+        # 的參考」），只有指著某一格的那幾個記號還是鍵道模式限定。
+        mark_m = view_m.addMenu('輔助標記')
+        mark_m.setToolTipsVisible(True)
+        self._mark_acts = {}
+        for section, table in (('旋律線（冠音）', self.MELODY_VIEW_OPTIONS),
+                               ('樂句（同一句又來了）', self.PHRASE_VIEW_OPTIONS),
+                               ('重疊', self.OVERLAP_VIEW_OPTIONS)):
+            mark_m.addSection(section)
+            for key, label, default, tip in table:
+                act = QAction(label, self, checkable=True)
+                act.setChecked(bool(settings.get(key, default)))
+                act.setToolTip(tip)
+                act.toggled.connect(
+                    lambda on, _k=key: self._set_velocity_display(_k, on))
+                mark_m.addAction(act)
+                self._mark_acts[key] = act
+
         self._act_ghost = QAction('幽靈音符（另一手畫成影子）', self, checkable=True)
         self._act_ghost.setChecked(bool(settings.get('ghost_other_hand', True)))
         self._act_ghost.setToolTip(
@@ -1572,6 +1599,15 @@ class MainWindow(QMainWindow):
                 ('量化（對齊到格點）…', self.quantize_dialog),
                 ('把音符吸到調內', self.snap_notes_to_key),
             ]),
+            ('曲庫', [
+                ('新增分類…', self.add_library_category),
+            ]),
+            ('鍵道排列', [
+                # 右鍵選單裡的「複製／套用排列分布」是手動一段一段做；這個是
+                # 整份自動跑的版本，比對與套用走同一個 `pattern_transfer`。
+                ('照前面的小節排後面…', self.arrange_by_example_dialog),
+                ('檢查冠音的旋律線…', self.melody_line_report),
+            ]),
             ('音符整理', [
                 (t('action_resolve_hold_tails'), self.resolve_hold_tails_dialog),
                 (t('action_resolve_horizontal_overlaps'), self.resolve_horizontal_overlaps),
@@ -1599,6 +1635,7 @@ class MainWindow(QMainWindow):
                 (t('action_align_reference_midi'), self.align_reference_midi_dialog),
             ]),
             ('延音踏板', [
+                ('以音檔補上踏板…', self.pedal_from_audio_dialog),
                 ('依和聲生成踏板…', self.generate_pedal_dialog),
                 ('清除踏板', self.clear_pedal),
             ]),
@@ -1924,9 +1961,11 @@ class MainWindow(QMainWindow):
         # 不然 `_mirror_combos` 會去碰已經刪掉的 C++ 物件。
         tbs.mirror_combos = {}
 
-        # 唯一一個**釘住**的項目：編輯精度。它不是「按過幾次」長出來的，是使用者
-        # 指定要常駐在這裡的——因為它管格線間隔和拖拉的一格，每個模式下都要動得到
-        # （「請把編輯精度放在常用，使其在放置以外的情況也可以做調整」）。
+        # **釘住**的那一組：編輯精度 ＋ 格線。它們不是「按過幾次」長出來的，是
+        # 使用者指定要常駐在這裡的——精度管格線間隔和拖拉的一格，每個模式下都
+        # 要動得到（「請把編輯精度放在常用，使其在放置以外的情況也可以做調整」）；
+        # 格線跟著它放（「隔線顯示也放在常用，放在精度旁」），因為格線設成
+        # 「跟著編輯精度」時兩者是同一件事的兩半。
         widgets = list(self._common_precision_widgets(tbs))
         pinned = len(widgets)
         tbs.common_acts = {}
@@ -1944,8 +1983,8 @@ class MainWindow(QMainWindow):
             widgets.append(self._tab_button(act))
         self._sync_common_mirrors()
         if len(widgets) == pinned:
-            # 「還是空的」是指**按鈕**還沒長出來；釘住的精度不算，不然這句話
-            # 永遠不會出現，使用者就不知道這一頁會自己長東西。
+            # 「還是空的」是指**按鈕**還沒長出來；釘住的精度和格線不算，不然
+            # 這句話永遠不會出現，使用者就不知道這一頁會自己長東西。
             # 不要 setWordWrap：`_tab_page` 後面接 addStretch，會換行的標籤
             # 會被擠成一條 130px 的窄柱、折成四行（實測）。這一行不長，讓它
             # 佔一整列就好。
@@ -1956,11 +1995,17 @@ class MainWindow(QMainWindow):
         return self._tab_page(widgets)
 
     def _common_precision_widgets(self, tbs: ToolbarSet):
-        """「常用」上那顆編輯精度（＋標籤＋分隔線）。本尊的家在「編輯」分頁。
+        """「常用」上釘住的那組：**編輯精度 ＋ 格線**（＋標籤＋分隔線）。
+        兩個的本尊都在「編輯」分頁。
 
-        這裡是**鏡像**：兩顆下拉連到同一個 `_on_dur_combo_changed`，再由
+        精度這裡是**鏡像**：兩顆下拉連到同一個 `_on_dur_combo_changed`，再由
         `_mirror_combos` 把另一顆的顯示值推上去。所以要登記進
         `tbs.mirror_combos`，不然在這裡改完，「編輯」分頁那顆會停在舊值。
+
+        格線不必登記：`_fill_grid_menu` 每次打開都從設定重建、按下去也只寫
+        設定，所以兩顆按鈕天生同步。使用者指定它要「放在精度旁」——它們本來
+        就是一組（格線設成「跟著編輯精度」時，精度選什麼就畫哪一層），分開放
+        等於要你在兩個分頁之間來回。
         """
         from PyQt5.QtCore import QSize
 
@@ -1974,7 +2019,24 @@ class MainWindow(QMainWindow):
         combo.setToolTip(self._DUR_COMBO_TIP)
         combo.currentIndexChanged.connect(self._bind(tbs, self._on_dur_combo_changed))
         tbs.mirror_combos.setdefault('dur_combo', []).append(combo)
-        return [label, combo, None]
+
+        # 不要覆寫 `tbs.grid_btn`（那是「編輯」分頁那顆的位置）：這一頁每次切
+        # 過來都重建，覆寫過去之後別處拿到的就是已經被回收的 C++ 物件。
+        grid = QToolButton(tbs.root)
+        grid.setText('格線 ▾')
+        grid.setPopupMode(QToolButton.InstantPopup)
+        grid.setToolTip(self._grid_btn_tip())
+        menu = QMenu(grid)                   # 掛在按鈕底下，一起被回收
+        menu.aboutToShow.connect(lambda m=menu: self._fill_grid_menu(m))
+        grid.setMenu(menu)
+        tbs.common_grid_btn = grid
+
+        return [label, combo, grid, None]
+
+    @staticmethod
+    def _grid_btn_tip() -> str:
+        return ('格線配置：跟著編輯精度，或自己搭幾層（例如 4 分＋16 分），'
+                '也可以加自訂 N 分音符')
 
     def _refresh_common_tab(self) -> None:
         """重建「常用」那一頁。切到它的時候才做——每按一次就重建太重。
@@ -2100,8 +2162,7 @@ class MainWindow(QMainWindow):
         tbs.grid_btn = QToolButton(tbs.root)
         tbs.grid_btn.setText('格線 ▾')
         tbs.grid_btn.setPopupMode(QToolButton.InstantPopup)
-        tbs.grid_btn.setToolTip('格線配置：跟著編輯精度，或自己搭幾層（例如 4 分＋16 分），'
-                                '也可以加自訂 N 分音符')
+        tbs.grid_btn.setToolTip(self._grid_btn_tip())
         grid_menu = QMenu(tbs.grid_btn)
         grid_menu.aboutToShow.connect(lambda m=grid_menu: self._fill_grid_menu(m))
         tbs.grid_btn.setMenu(grid_menu)
@@ -2125,19 +2186,23 @@ class MainWindow(QMainWindow):
         tbs.pattern_act = self._tab_action(
             tbs, '♪ 音階輔助', self._on_pattern_toggle,
             tip='開啟後在譜面按住往上拖：拖多遠就放幾個音，放開才寫進譜面。\n'
-                '音高照偵測到的調性走。',
+                '音高照偵測到的調性走（音階、琶音、顫音）。',
             checkable=True)
 
         tbs.pattern_kind_combo = make_combo(
             [label for label, _v in self._pattern_kinds], 152,
             self._pat_kind_idx,
-            '音型：前四項照譜面的調性走，後面是指定音階（半音階、全音階、'
+            '音型：前面幾項照譜面的調性走，後面是指定音階（半音階、全音階、'
             '五聲、藍調、各調式…）。\n'
-            '半音階/全音階/減音階是對稱音階，起點就是你下筆的那個音。',
+            '半音階/全音階/減音階是對稱音階，起點就是你下筆的那個音。\n'
+            '顫音是下筆的音和它的鄰音來回，兩種輸出：\n'
+            '　「分開的」＝一串交替的普通音符，一下一顆、各自判定；\n'
+            '　「套上的」＝整段套成一顆遊戲顫音（note_type=64，要持續接觸）。',
             self._on_pattern_kind_changed)
         tbs.pattern_dir_combo = make_combo(
             [label for label, _v in self._pattern_dirs], 92,
-            self._pat_dir_idx, '方向', self._on_pattern_dir_changed)
+            self._pat_dir_idx,
+            '方向（顫音：鄰音在上還是在下）', self._on_pattern_dir_changed)
         tbs.pattern_step_combo = make_combo(
             [label for label, _v in self._pattern_steps], 92,
             self._pat_step_idx, '每音間隔', self._on_pattern_step_changed)
@@ -2297,11 +2362,11 @@ class MainWindow(QMainWindow):
         widgets.append(None)
         tbs.barline_drag_act = self._tab_action(
             tbs, t('tb_barline_drag'), self._on_barline_drag_toggled,
-            tip=t('tb_barline_drag_tip'), checkable=True)
+            tip=self._barline_drag_tip(), checkable=True)
         tbs.barline_drag_act.blockSignals(True)
         tbs.barline_drag_act.setChecked(self._barline_drag_enabled())
         tbs.barline_drag_act.blockSignals(False)
-        widgets.append(self._tab_button(tbs.barline_drag_act))
+        widgets.append(self._barline_drag_button(tbs))
 
         # 鎖定音符的**家**在這裡（它也是小節線的編輯模式）。常用分頁上那顆
         # 是鏡像，兩邊共用同一個 QAction 的狀態（`_on_notes_locked_toggled`
@@ -2329,8 +2394,10 @@ class MainWindow(QMainWindow):
     def _notes_locked_tip() -> str:
         return chr(10).join([
             '進入「只調整小節線時間」的狀態（預設關）。',
-            '開著時拖曳小節線不會動到音符，而且會自動吸附到最近的音符尾巴，',
+            '開著時拖曳小節線不會動到音符，而且會吸附到最近的音符終點／起音點／拍線，',
             '並盡量讓算出來的 BPM 落在整數上（差不到 0.1 才取整）。',
+            '關著時音符跟著小節一起等比例縮放，而且不做任何吸附。',
+            '吸附可以在「拖曳小節線」的下拉裡關掉。',
             '拖的途中按住 Alt 可以臨時反轉。'])
 
     def _notes_locked(self) -> bool:
@@ -2399,6 +2466,157 @@ class MainWindow(QMainWindow):
             act.blockSignals(True)
             act.setChecked(bool(enabled))
             act.blockSignals(False)
+        self._refresh_barline_options()
+
+    # ── 拖曳小節線的兩個模式 ──────────────────────────────────────────
+    #
+    # 使用者：「拖曳小節線開啟後應該有兩個模式……兩個都要能開關」。兩顆都掛在
+    # 「拖曳小節線」那顆按鈕的下拉裡，而不是攤成兩顆：它們是那個模式的細節，
+    # 而小節分頁本來就已經太擠了。
+    #
+    # **沒開的時候整個箭頭都不出現**（不是把項目變灰）。使用者：「要打開才可以
+    # 開下拉選單，不然還沒開人家不知道下拉選單為啥關不掉那些選項、那些選項代表
+    # 啥」——打得開卻全是灰的選單只會讓人困惑：看得到東西、按不下去、也沒有半句
+    # 話說明為什麼。開啟之後箭頭才長出來，那個「多出來的箭頭」本身就是提示。
+
+    #: (設定鍵, 選單文字, ChartView 的旗標名, 預設值, 說明)
+    #:
+    #: 選單文字要**自己把做什麼說完**。這是選單項目、不是設定頁，沒有人會為了
+    #: 看懂一個選項去把滑鼠停在上面等提示跳出來。
+    BARLINE_OPTIONS = (
+        ('barline_snap_enabled', '吸附到最近的音符或拍線', 'barline_snap_enabled', True,
+         '拖到附近就吸上去，候選有三種、取最近的：\n'
+         '　音符終點、音符起音點、存檔裡的拍線（含小節內的細分）。\n'
+         '只有「鎖定音符」開著時才會吸——音符會跟著縮放的時候吸附沒有意義。'),
+        ('barline_scale_beats', '小節內的拍點等比例縮放（關＝依拍號均分）',
+         'barline_scale_beats', True,
+         '拖完之後小節**內**的拍線怎麼處理。\n'
+         '開著：保留它們原來的相對位置，整體等比例縮放（不動到存檔裡的細分）。\n'
+         '關掉：依拍號重新均分——手動挪過的拍線會被拉回規則格上。'),
+    )
+
+    #: 旋律線輔助的四個開關：(設定鍵, 標籤, 預設, 提示)。
+    #: 「標出同音不同格」預設關著是量出來的：使用者自己的 60 份譜裡同音
+    #: 同格只有 82.6%，全標出來一首會有上百個記號；方向他守到 97.3%，
+    #: 標出來的那十幾處才是真的該看的地方。
+    MELODY_VIEW_OPTIONS = (
+        ('melody_top_line', '冠音的旋律線', True,
+         '每一組同時起音裡最高的那顆，左右手各一條線，連在音符的右緣——方向規則看的就是右緣。'),
+        ('melody_bottom_line', '低音線', False,
+         '每一組最低的那顆，畫成點線、連在左緣。只畫不判：官方譜的低音有 38.6% 是反方向走的。'),
+        ('melody_break_marks', '標出方向破掉的地方', True,
+         '音高往上走、鍵道卻停在原地或往回走：橘線加一個箭頭指出該往哪邊移。'),
+        ('melody_repeat_marks', '標出同音不同格', False,
+         '同一個音高在 4 秒內被放到別的鍵道。這個很常見，預設不標。'),
+        ('melody_slope_marks', '標出步伐差太多', True,
+         '走對邊了、但走的格數和這個音程該走的差 3 格以上：從那顆冠音拉一條針，'
+         '指到「照這個音程該走到的那一格」。差愈多針愈長，差太多的會整條飆出去。'
+         '基準是這份譜自己的習慣（每個音程取中位數），量不到才用全庫量好的表。'),
+    )
+
+    #: 樂句級的標記：同一句又來了（移了調／插了裝飾音）。和上面那張表分開，
+    #: 因為那些看的是相鄰兩顆，這些看的是一整句。
+    PHRASE_VIEW_OPTIONS = (
+        ('phrase_echo_marks', '標出移調重複的樂句', True,
+         '同一條旋律整句搬去別的音高（往高或低音位移）：本體畫一條淡緞帶、'
+         '回聲畫一條亮的，旁邊寫移了幾個半音。你的 60 份譜量到 1033 處。'
+         '桃紅色＝整句移了調、鍵道卻沒跟著移（移調的回聲裡 7.5%，一份約 1.3 處）。'),
+        ('phrase_same_marks', '　原樣重複也標', False,
+         '音高一模一樣的重複句。比移調的還多（1203 比 1033），兩種都畫太吵，'
+         '所以預設只畫移調的。'),
+        ('phrase_ornament_marks', '標出中間插的裝飾音', True,
+         '同一句又來了、但中間多塞了幾顆：多出來的那幾顆畫一個小菱形。'
+         '定義就是「比本體多出來」，不是猜哪顆音太短——你的譜裡 239 處、457 顆'
+         '（佔冠音 0.74%）。'),
+    )
+
+    #: 重疊的標記。和旋律線分開：這是「畫面上疊在一起」，不是旋律的事。
+    OVERLAP_VIEW_OPTIONS = (
+        ('overlap_marks', '標出重疊的音符', True,
+         '兩顆音符畫出來的方塊疊在一起就把交集圈起來。'
+         '紅色＝同時起音疊在一起、或長在長條走廊裡（你的曲庫 86% 的譜一處都'
+         '沒有，出現幾乎都是真的擺錯）；琥珀虛線＝只是前一顆的音長還沒走完。'),
+        ('overlap_tail_marks', '　連音長交疊也標', True,
+         '關掉就只留紅色那兩種。你的譜平均一份有 36 處音長交疊（每千顆 27.9 '
+         '處），那是「長度沒修」的徵狀，該跑 音符整理 →「長條尾端最小間隔」。'),
+    )
+
+    def _barline_drag_tip(self) -> str:
+        return chr(10).join([
+            t('tb_barline_drag_tip'),
+            '',
+            '開啟之後按鈕右邊會多出一個箭頭，點開可以調整吸附與縮放。'])
+
+    def _barline_drag_button(self, tbs: ToolbarSet):
+        """「拖曳小節線」：主體是開關，開啟後箭頭點開是它的兩個模式。"""
+        btn = QToolButton()
+        btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        btn.setDefaultAction(tbs.barline_drag_act)
+        btn.setPopupMode(QToolButton.MenuButtonPopup)
+        menu = QMenu(btn)
+        # 選單最上面先講清楚這一組是在管什麼，項目才有上下文。
+        menu.addSection('拖曳小節線時…')
+        tbs.barline_option_acts = {}
+        for key, label, _flag, default, tip in self.BARLINE_OPTIONS:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setToolTip(tip)
+            act.blockSignals(True)
+            act.setChecked(bool(settings.get(key, default)))
+            act.blockSignals(False)
+            slot = (lambda on, _k=key: self._on_barline_option_toggled(_k, on))
+            self._register_toolbar_item(label, slot, tip, True)
+            act.toggled.connect(slot)
+            act.toggled.connect(
+                lambda _c=False, _l=label: self._count_toolbar_use(_l))
+            tbs.barline_option_acts[key] = act
+        # QToolButton 不持有 menu 的所有權，menu 被 GC 掉箭頭就變成點不開。
+        # 選單本體收在 tbs 上（`_refresh_barline_options` 要拿它掛回去）。
+        tbs.tool_menus.append(menu)
+        tbs.barline_option_menu = menu
+        tbs.barline_drag_btn = btn
+        # 直接套在自己身上，不要靠 `_refresh_barline_options()` 去 `_toolbars`
+        # 裡找——那要求這條工具列**已經**註冊進去了，而這支是在建構途中跑的。
+        on = self._barline_drag_enabled()
+        btn.setMenu(menu if on else None)
+        for act in tbs.barline_option_acts.values():
+            act.setEnabled(bool(on))
+        return btn
+
+    def _on_barline_option_toggled(self, key: str, on: bool) -> None:
+        settings.set(key, bool(on))
+        self._apply_barline_options()
+        # 每一條工具列都有自己那一份選單，漏掉就會看到一邊打勾一邊沒打
+        for tbs in getattr(self, '_toolbars', []) or []:
+            act = (getattr(tbs, 'barline_option_acts', None) or {}).get(key)
+            if act is None or act.isChecked() == bool(on):
+                continue
+            act.blockSignals(True)
+            act.setChecked(bool(on))
+            act.blockSignals(False)
+
+    def _apply_barline_options(self) -> None:
+        """每一格 ChartView 各有自己的旗標，漏掉一格就會像沒生效。"""
+        for key, _label, flag, default, _tip in self.BARLINE_OPTIONS:
+            value = bool(settings.get(key, default))
+            for pane in self._panes:
+                setattr(pane, flag, value)
+
+    def _refresh_barline_options(self) -> None:
+        """拖曳小節線關著時把整個下拉拿掉，開著才掛回去。
+
+        拿掉 menu 之後 Qt 就不畫那個箭頭了（MenuButtonPopup 只有在真的有
+        menu 時才畫），所以關著的時候它就是一顆單純的開關——沒有打得開卻全是
+        灰色的選單可以讓人困惑。項目的 enabled 一起跟著設，當第二道保險。
+        """
+        on = self._barline_drag_enabled()
+        for tbs in getattr(self, '_toolbars', []) or []:
+            menu = getattr(tbs, 'barline_option_menu', None)
+            btn = getattr(tbs, 'barline_drag_btn', None)
+            if btn is not None and menu is not None:
+                btn.setMenu(menu if on else None)
+            for act in (getattr(tbs, 'barline_option_acts', None) or {}).values():
+                act.setEnabled(bool(on))
 
     # ── 分頁：工具 ────────────────────────────────────────────────────
 
@@ -3775,6 +3993,161 @@ class MainWindow(QMainWindow):
         except Exception as exc:                            # noqa: BLE001
             QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
 
+    def arrange_by_example_dialog(self) -> None:
+        """照前面排好的小節，自動排後面相似的部分。細節見 `arrange_by_example`。
+
+        預設的起點是**目前視窗中央那一小節**（和「修改小節 BPM」同一條規則）：
+        那差不多就是「我排到這裡」的位置。
+        """
+        from . import arrange_by_example as ABE
+        from .arrange_by_example_dialog import ArrangeByExampleDialog
+        m = self.view.model
+        if not m.notes_tree:
+            QMessageBox.information(self, '照前面的小節排後面', '這份譜還沒有音符。')
+            return
+        if int(m.count_measures() or 0) < 2:
+            QMessageBox.information(self, '照前面的小節排後面',
+                                    '這份譜分不出兩個以上的小節，沒有「前面」可以參考。')
+            return
+        centre_unit = self.view.window_start_unit + self.view.window_size_unit / 2.0
+        centre_ms = self.view.mapper.unit_to_ms(centre_unit)
+        current = int(m.get_measure_at_ms(centre_ms)) + 1       # 轉成 1-based
+
+        dlg = ArrangeByExampleDialog(self, m, current)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        prepared = dlg.plan()
+        if prepared is None or not prepared.ok:
+            QMessageBox.warning(self, '照前面的小節排後面',
+                                (prepared.reason if prepared else '')
+                                or '沒有可以處理的小節')
+            return
+        try:
+            m.push_history()
+            stats = ABE.apply(m, prepared, **dlg.options())
+            m.rebuild_display_cache()
+            oplog.params(from_measure=prepared.from_measure,
+                         threshold=prepared.threshold,
+                         bars_copied=stats.bars_copied,
+                         bars_remapped=stats.bars_remapped,
+                         notes_changed=stats.notes_changed,
+                         melody_fixed=stats.melody_fixed)
+            self.view.update()
+            self.view.note_edited.emit()
+        except Exception as exc:                            # noqa: BLE001
+            QMessageBox.critical(self, t('dlg_save_fail_title'), str(exc))
+            return
+        if not stats.notes_changed:
+            QMessageBox.information(
+                self, '照前面的小節排後面',
+                '後面的鍵道已經和前面一致了，沒有變更。')
+            return
+        QMessageBox.information(
+            self, '照前面的小節排後面',
+            chr(10).join([
+                '參考第 1~%d 小節。' % (prepared.from_measure - 1),
+                '照抄：%d 個小節、%d 顆音符。'
+                % (stats.bars_copied, stats.notes_copied),
+                '重新排：%d 個小節、%d 顆音符。'
+                % (stats.bars_remapped, stats.notes_remapped),
+                # 這個數字含「只有左右手變了」的音符，所以不能寫成「動到鍵道」
+                '實際動到的：%d 顆（鍵道或左右手）。Ctrl+Z 可以整個復原。'
+                % stats.notes_changed]
+            + (['冠音帶頭：其中 %d 顆照冠音的走法再對了一次位置。'
+                % stats.melody_fixed]
+               if stats.melody_fixed else [])))
+
+    def melody_line_report(self) -> None:
+        """冠音的旋律線現在守得怎麼樣，以及破在哪幾個小節。
+
+        只報告、不動譜；要動的話按對話框上的按鈕。數字的意義與來源見
+        `melody_line` 的模組說明。
+        """
+        from . import melody_line as ML
+        from . import melody_phrase as MP
+        from .models import OVERLAP_CHORD
+        m = self.view.model
+        notes = list(m.notes_tree)
+        if not any(n.pitch is not None for n in notes):
+            QMessageBox.information(
+                self, '冠音的旋律線',
+                '這份譜沒有音高資料，認不出冠音。' + chr(10)
+                + '先用 工具 → 以 MIDI 修復 →「從 MIDI 還原音高與表情」。')
+            return
+        good, total = ML.rate(notes)
+        found = ML.breaks(notes, curve=ML.learn_steps(notes))
+        counts = ML.summary(found)
+        direction = [b for b in found if b.kind == ML.KIND_DIRECTION]
+        overlaps = self.view._overlap_found()
+        chord_ov = sum(1 for k, _a, _b in overlaps if k == OVERLAP_CHORD)
+        # 樂句級的那兩項走畫面在用的同一份快取，報告和標記不會各說一套。
+        echoes = MP.summary(self.view._phrase_found())
+        lines = [
+            '守方向：%d / %d 步（%.1f%%）。你自己的曲庫平均 97.3%%。'
+            % (good, total, (good / total * 100.0) if total else 0.0),
+            '方向破掉：%d 處。同音不同格：%d 處（曲庫平均 17%% 的同音對）。'
+            % (counts[ML.KIND_DIRECTION], counts[ML.KIND_REPEAT]),
+            '步伐差 %g 格以上：%d 處（曲庫平均 2.4%% 的步、一份譜 20 處）。'
+            % (ML.SLOPE_TOLERANCE, counts[ML.KIND_SLOPE]),
+            '重疊：%d 處，其中同時起音疊在一起 %d 處（曲庫 86%% 的譜是 0）。'
+            % (len(overlaps), chord_ov),
+            '同一句又來了：移調 %d 處（位移沒跟上 %d）、原樣 %d 處；'
+            '中間插了裝飾音 %d 處 %d 顆。'
+            % (echoes[MP.ECHO_SHIFT], echoes['bad'], echoes[MP.ECHO_SAME],
+              echoes['ornament'], echoes['ornament_notes']),
+        ]
+        if direction:
+            where = []
+            for item in direction[:8]:
+                bar = int(m.get_measure_at_ms(item.start)) + 1
+                where.append('第 %d 小節（%s，往%s %d 格）'
+                             % (bar, ML.HAND_NAMES.get(item.hand, '?'),
+                                '右' if item.suggest > 0 else '左',
+                                abs(item.suggest)))
+            lines.append('')
+            lines.append('破在這裡：')
+            lines.extend('  ' + w for w in where)
+            if len(direction) > 8:
+                lines.append('  …還有 %d 處' % (len(direction) - 8))
+        else:
+            lines.append('')
+            lines.append('方向一處都沒破。')
+
+        oplog.params(direction_breaks=counts[ML.KIND_DIRECTION],
+                     repeat_breaks=counts[ML.KIND_REPEAT],
+                     slope_breaks=counts[ML.KIND_SLOPE],
+                     overlaps=len(overlaps), chord_overlaps=chord_ov,
+                     echo_shift=echoes[MP.ECHO_SHIFT],
+                     echo_same=echoes[MP.ECHO_SAME],
+                     echo_bad=echoes['bad'],
+                     ornaments=echoes['ornament_notes'],
+                     steps=total, kept=good)
+
+        box = QMessageBox(self)
+        box.setWindowTitle('冠音的旋律線')
+        box.setText(chr(10).join(lines))
+        pick = box.addButton('選取破掉的方向', QMessageBox.AcceptRole)
+        fix = box.addButton('整份拉回來', QMessageBox.ApplyRole)
+        shape = box.addButton('整份照本體排', QMessageBox.ApplyRole)
+        box.addButton('關閉', QMessageBox.RejectRole)
+        for button in (pick, fix):
+            button.setEnabled(bool(direction))
+        shape.setEnabled(bool(echoes[MP.ECHO_SHIFT]))
+        shape.setToolTip(
+            '把移調重複的每一句照本體的形狀排好（整句位移跟著補）。\n'
+            '方向破線會跟著多一些——兩條規則在數學上打架，詳見說明。')
+        box.exec_()
+        if box.clickedButton() is pick:
+            self.view.select_melody_breaks(ML.KIND_DIRECTION)
+        elif box.clickedButton() is fix:
+            # 修補會把「目前選取」當成可以動的範圍，整份拉回來就得先清掉
+            self.view.deselect_all()
+            self.view.repair_melody_breaks()
+        elif box.clickedButton() is shape:
+            # 同理：有選取的話只會排那一段裡的句子
+            self.view.deselect_all()
+            self.view.apply_phrase_shape()
+
     def regenerate_grid_dialog(self) -> None:
         """鎖定音符、重生小節線。細節見 `regenerate_grid_dialog`。"""
         from . import smart_resnap as SR
@@ -5070,6 +5443,393 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, '生成難度', state['error'])
             return
         QMessageBox.information(self, '生成難度', _difficulty_report(state['rows']))
+
+    def pedal_from_audio_dialog(self) -> None:
+        """以音檔補上踏板：AI 轉譜，但只把 CC64 拿到譜面上，其餘都不動。
+
+        使用者：「可以在踏板不合需求或 midi 沒有踏板的情況下，作為一個工具。」
+
+        第三個踏板來源。另外兩個是來源 MIDI 的 CC64（最可信，但曲庫裡 32 份
+        譜面的來源根本沒踩過）和 `generate_pedal` 的和聲猜測（召回 75%／精確
+        64%）。音檔是唯一**真的聽過那場演奏**的來源。
+
+        實測（8 首有真 CC64 的譜面當標準答案，拿同一首的鋼琴分軌轉譜）：
+        踩點召回 71%、精確 87%，而同一批素材上依和聲生成是 37%／49%。
+        覆蓋率也跟著真人走（和聲生成不管哪一首都是 97~99%）。
+
+        細節與那個 120ms 的踩下修正見 `audio_pedal`。
+        """
+        from . import ai_transcribe as AT
+        from . import audio_pedal as AP
+        from .audio_pedal_dialog import AudioPedalDialog
+
+        model = self.view.model
+        if not model.notes_tree:
+            QMessageBox.information(self, '以音檔補上踏板', '這份譜面沒有音符，對不了位。')
+            return
+
+        path = self._pick_transcribe_audio('以音檔補上踏板')
+        if not path:
+            return
+
+        # 轉過就別再轉一次：同一首歌的踏板常常要試幾次參數才滿意。
+        out = AT.default_output_path(path)
+        if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+            box = QMessageBox(self)
+            box.setWindowTitle('以音檔補上踏板')
+            box.setText((chr(10) * 2).join([
+                '這個音檔已經轉過了：', '　' + os.path.basename(out),
+                '要直接用上次的結果，還是重新轉譜？']))
+            use_btn = box.addButton('用上次的', QMessageBox.AcceptRole)
+            box.addButton('重新轉譜', QMessageBox.AcceptRole)
+            box.addButton(t('dlg_cancel'), QMessageBox.RejectRole)
+            box.setDefaultButton(use_btn)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+                return
+            if clicked is not use_btn and not self._run_pedal_transcribe(path, out):
+                return
+        elif not self._run_pedal_transcribe(path, out):
+            return
+
+        try:
+            source_onsets, source_spans = AP.read_midi(out)
+        except Exception as exc:                            # noqa: BLE001
+            QMessageBox.critical(self, '以音檔補上踏板', '讀不出轉譜結果：%s' % exc)
+            return
+        if not source_spans:
+            QMessageBox.information(
+                self, '以音檔補上踏板',
+                '這個音檔裡聽不出任何踏板。' + (chr(10) * 2)
+                + '合成的音源常常沒有延音共鳴，模型就聽不到證據；'
+                  '這種情況可以改用「依和聲生成踏板」。')
+            return
+
+        onsets = [float(n.start) for n in model.notes_tree]
+        end = max(float(n.end) for n in model.notes_tree)
+        dlg = AudioPedalDialog(
+            self, chart_onsets=onsets, chart_end_ms=end,
+            existing=model.pedal_spans, source_onsets=source_onsets,
+            source_spans=source_spans, audio_name=os.path.basename(path),
+            notes=model.notes_tree)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        report = dlg.report()
+        if report is None or not report.spans:
+            return
+
+        before = len(model.pedal_spans)
+        model.push_history()
+        model.pedal_spans = [[float(a), float(b)] for a, b in report.spans]
+        # 從音檔聽出來的也不是譜面作者寫的，要標記：hardcore 模式（音訊跟著
+        # 玩家的腳走）不該拿猜出來的踏板當標準答案。和 `generate_pedal` 的
+        # "auto" 分開記，因為這一份至少聽過真正的演奏。
+        model.json_meta['pedal_origin'] = 'mixed' if dlg.mode() == AP.FILL else 'audio'
+        model.dirty = True
+        self.view.update()
+        self.view.note_edited.emit()
+        self._refresh_title()
+
+        a = report.alignment
+        lines = [
+            '從 %s 補上踏板：' % os.path.basename(path),
+            '',
+            '· 踏板 %d → %d 段，覆蓋全曲 %.0f%%。' % (before, len(report.spans),
+                                                report.coverage * 100),
+            '· 對位：%.0f%% 的音符對得上，時間差 %+.0f ms。' % (a.confidence * 100,
+                                                       a.offset_ms),
+        ]
+        if report.kept_existing:
+            lines.append('· 原有的 %d 段原樣保留，只補了空隙。' % report.kept_existing)
+        lines += ['', '音符、音高、力度、鍵道都沒有動。']
+        QMessageBox.information(self, '以音檔補上踏板', chr(10).join(lines))
+
+    def _run_pedal_transcribe(self, audio_path: str, out_path: str) -> bool:
+        """替「以音檔補上踏板」跑一次轉譜。成功回 True。
+
+        `want_wav=False`：這條路只要 CC64，沒必要在人家的音樂資料夾裡
+        留一份幾十 MB 的 WAV。
+        """
+        from .ai_transcribe_dialog import run_transcribe
+
+        try:
+            result = run_transcribe(self, audio_path, out_path, want_wav=False)
+        except OSError as exc:                              # 音檔旁邊寫不進去之類
+            QMessageBox.critical(self, '以音檔補上踏板', str(exc))
+            return False
+        if not result:
+            return False                                    # 取消或失敗，已經報過了
+        if not result.get('pedals'):
+            # 音符轉出來了但一段踏板都沒有，和「轉譜失敗」是兩回事，要分開講。
+            QMessageBox.information(
+                self, '以音檔補上踏板',
+                '轉出 %d 顆音，但聽不出任何踏板。' % (result.get('notes', 0)))
+            return False
+        return True
+
+    # ── 以音檔補上一小段 ──────────────────────────────────────────────
+
+    #: 這條路上所有對話框的標題
+    _SECTION_TITLE = '以音檔補上一小段'
+
+    #: 對位至少要有這麼多顆音符當證據。再少下去粗對位的直方圖堆不出峰
+    #: （實測見 `audio_section` 模組說明裡的鄰域那一段）。
+    _SECTION_MIN_ONSETS = 8
+
+    def audio_section_dialog(self) -> None:
+        """只採一小段：AI 轉譜，但只把**選定的那一段**的音符搬進目前的譜面。
+
+        使用者：「加入一個 只採某個小部分的音檔生成的 MIDI 部分」。
+
+        原本的 AI 轉譜是全有全無——`transcribe_audio_ai` 轉完整首、設 BPM、吸附
+        小節線，然後開成**一份新譜面**。手寫到一半、某幾小節聽不出來的時候沒有
+        路可以走，只能整首轉成另一份譜再手動複製過來。
+
+        對位、挑段、過濾都在 `audio_section`（不碰 Qt、好測），這裡只負責問清楚
+        然後把它擺進譜面。
+        """
+        from . import ai_transcribe as AT
+        from . import arrange_by_example as ABE
+        from . import audio_section as ASC
+        from .audio_section_dialog import AudioSectionDialog
+
+        model = self.view.model
+        onsets = [float(n.start) for n in model.notes_tree if n.pitch is not None]
+        if len(onsets) < self._SECTION_MIN_ONSETS:
+            QMessageBox.information(self, self._SECTION_TITLE, (chr(10) * 2).join([
+                '這份譜面的音符太少，對不了位。',
+                '要採的那一段通常是空的，所以位移只能靠**範圍外**已經寫好的音符量；'
+                '整份都還空著的話沒有證據可用。',
+                '整首都要的話走「檔案 → AI 轉譜 → 從音檔轉譜」。']))
+            return
+
+        # 沒有小節線就只剩「選取的音符」那條路；兩條都走不通時要說清楚，
+        # 不然小節那兩格的範圍是 1~1、採出來永遠是 0 顆，看不出原因。
+        if self.view.selection_time_range() is None and model.count_measures() < 1:
+            QMessageBox.information(self, self._SECTION_TITLE, (chr(10) * 2).join([
+                '這份譜面還沒有小節線，沒辦法用小節挑範圍。',
+                '先把要補的那一段附近的音符選起來（那也可以當範圍），'
+                '或者先設好 BPM 與拍點。']))
+            return
+
+        path = self._pick_transcribe_audio(self._SECTION_TITLE)
+        if not path:
+            return
+        out = AT.default_output_path(path)
+        if not self._ai_midi_ready(self._SECTION_TITLE, path, out):
+            return
+        try:
+            source = ASC.read_notes(out)
+        except Exception as exc:                            # noqa: BLE001
+            QMessageBox.critical(self, self._SECTION_TITLE, '讀不出轉譜結果：%s' % exc)
+            return
+        if not source:
+            QMessageBox.information(self, self._SECTION_TITLE,
+                                    '這個音檔裡聽不出任何音符。')
+            return
+
+        samples = ABE.learn_lane_model(
+            [n for n in model.notes_tree if ABE.arrangeable(n)]).samples
+        dlg = AudioSectionDialog(
+            self, model=model, source=source,
+            alignment=ASC.align(onsets, source),
+            selection=self.view.selection_time_range(),
+            audio_name=os.path.basename(path), lane_samples=samples)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        got = dlg.picked()
+        if not got.notes:
+            return
+        self._insert_audio_section(got, dlg.range_ms(), replace=dlg.replace(),
+                                   by_example=dlg.by_example(),
+                                   split=dlg.split_hands(),
+                                   audio_name=os.path.basename(path))
+
+    def _ai_midi_ready(self, title: str, audio_path: str, out_path: str) -> bool:
+        """確保 `out_path` 有一份這個音檔的轉譜結果。回傳能不能用。
+
+        轉過就別再轉一次：轉譜是整首在跑，而同一首歌常常要試幾次才滿意。
+        """
+        from .ai_transcribe_dialog import run_transcribe
+
+        if (os.path.isfile(out_path)
+                and os.path.getmtime(out_path) >= os.path.getmtime(audio_path)):
+            box = QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setText((chr(10) * 2).join([
+                '這個音檔已經轉過了：', '　' + os.path.basename(out_path),
+                '要直接用上次的結果，還是重新轉譜？']))
+            use_btn = box.addButton('用上次的', QMessageBox.AcceptRole)
+            box.addButton('重新轉譜', QMessageBox.AcceptRole)
+            box.addButton(t('dlg_cancel'), QMessageBox.RejectRole)
+            box.setDefaultButton(use_btn)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is None or box.buttonRole(clicked) == QMessageBox.RejectRole:
+                return False
+            if clicked is use_btn:
+                return True
+        try:
+            result = run_transcribe(self, audio_path, out_path, want_wav=False)
+        except OSError as exc:                              # 音檔旁邊寫不進去之類
+            QMessageBox.critical(self, title, str(exc))
+            return False
+        if not result:
+            return False                                    # 取消或失敗，已經報過了
+        if not result.get('notes'):
+            QMessageBox.information(self, title,
+                                    '沒有轉出任何音符（音檔裡可能沒有鋼琴聲）。')
+            return False
+        return True
+
+    def _insert_audio_section(self, got, span, *, replace: bool,
+                              by_example: bool, split: bool,
+                              audio_name: str = '') -> None:
+        """把採到的一段擺進譜面。`span` 是 `(起, 迄)` 毫秒。
+
+        鍵道那幾步的順序是量出來的（5 份他的手排譜、6278 顆配對，拿他自己在
+        那一段寫的鍵道當答案）：
+
+                                            完全相同   ±1 格   平均差
+            照音高平鋪（匯入 MIDI 的預設）      9.8%    37.8%   1.91 格
+            ＋照現有排法（學音高→鍵道）        19.2%    61.1%   1.36
+            ＋冠音帶頭（lead_by_top）          20.8%    64.1%   1.23
+            ＋沿用譜面的鍵寬                   30.2%    68.8%   1.22
+
+        **鍵寬是最大的單一改善**，而且原因很實際：他的 Hard 譜整份都是寬 4，
+        寬 4 的中心落在 x.5、寬 3 落在 x.0，寫死寬 3 的話那兩份「完全相同」
+        永遠是 0.0%。見 `audio_section.dominant_width`。
+
+        最後兩步：
+
+        * `audio_section.settle`——採進來的自己閃開他已經寫好的音符。**不能**把
+          他的音符交給 `spread_group` 去推（它不知道誰不准動，實測五份譜有兩份
+          被它把使用者的音符推走 2~3 顆）。
+        * 裁一次踏板殘響（`trim_pedal_sustained_holds`）：AI 的音長是**踏板
+          長度**不是按鍵長度，而範圍外他自己寫的音符正好是「這個長音已經放開
+          了」的證據。`only=` 保證只裁採進來的那些。
+
+        整條路跑完的實測（同樣 5 份譜，把第 33~40 小節刪掉當成「還沒寫」，
+        叫編輯器自己去補，再和他原本寫的比）：
+
+            曲目（難度）        他寫  採進  召回  精確  ±1 格  平均差
+            Abiogenesis(Ex)      84   140   96%   58%  71.6%  1.22
+            Chronomia(Hard)      74   137  100%   54%  85.1%  0.97
+            Marigold(Hard)       81   149   96%   52%  80.8%  0.99
+            Rrhar'il(Ex)        197   252   96%   75%  75.8%  0.91
+            Myosotis(Ex)        166   225   99%   73%  76.4%  1.01
+            合計                602   903   98%   65%  77.2%  1.00
+
+        五份都是：出界 0、跑出範圍 0、**範圍外一顆都沒動**。
+        """
+        from . import arrange_by_example as ABE
+        from . import audio_section as ASC
+        from . import hand_split
+        from . import melody_line as ML
+        from .models import (GNote, TOTAL_GAME_KEYS,
+                             midi_pitch_to_game_lane_index)
+
+        model = self.view.model
+        lo, hi = float(span[0]), float(span[1])
+        model.push_history()
+        kept = list(model.notes_tree)
+        removed = 0
+        if replace:
+            kept = [n for n in kept if not (lo <= n.start < hi)]
+            removed = len(model.notes_tree) - len(kept)
+
+        width = ASC.dominant_width(n for n in kept if n.pitch is not None)
+        made = []
+        for item in got.notes:
+            note = GNote(None, 0)
+            note.start = int(round(item.start))
+            note.end = max(note.start + 1, int(round(item.end)))
+            note.gate = note.end - note.start
+            note.pitch = int(item.pitch)
+            centre = midi_pitch_to_game_lane_index(note.pitch)
+            first = max(0, min(TOTAL_GAME_KEYS - width,
+                               int(round(centre - (width - 1) / 2.0))))
+            note.min_key, note.max_key = first, first + width - 1
+            note.note_type = LONG_BIT if note.gate >= ASC.LONG_MS else 0
+            note.velocity = max(1, min(127, int(item.velocity)))
+            # 分不出手的時候標無主音（hand=2，官方資料本來就有這個值），
+            # 不要默默當成右手——那是假的資訊，而且畫面上看不出來是猜的。
+            note.hand = 0 if split else 2
+            made.append(note)
+        if split:
+            hand_split.assign(made)
+        if model.is_midi_mode():
+            # MIDI 模式下「哪一手」在資料上是音軌說了算（見 hand-vs-track）
+            for note in made:
+                note.track = model._default_midi_track_for_hand(note.hand)
+                note.channel = model._default_midi_channel_for_track(note.track)
+                note.off_velocity = model._default_midi_off_velocity_for_track(
+                    note.track)
+
+        lanes = 0
+        arranged = [n for n in kept if ABE.arrangeable(n)]
+        if by_example:
+            lane_model = ABE.learn_lane_model(arranged)
+            if lane_model.samples:
+                # `fixed` 不給他自己的音符：`spread_group` 不知道誰不准動，會把
+                # 牆推走（見 `audio_section.settle` 的說明）。這一步只讓採進來
+                # 的彼此錯開，和他的音符的衝突留給最後那一步。
+                lanes = ABE.remap_notes(made, lane_model, TOTAL_GAME_KEYS,
+                                        tolerance_ms=ML.ONSET_MS)
+                # 冠音帶頭要和**前面**那一組比才知道這一步該走幾格，所以整份
+                # 一起看；可以動的只有採進來的那些（`lead_by_top` 只搬整組都
+                # 准動的那些組，所以他的音符不會被帶著走）。
+                ML.lead_by_top(sorted(arranged + made, key=lambda n: int(n.start)),
+                               movable={id(n) for n in made},
+                               curve=ML.learn_steps(arranged),
+                               anchor=lane_model.centre,
+                               slope=lane_model.line.slope)
+        # 最後一道：採進來的自己閃開他已經寫好的音符。只動採進來的那些，
+        # 所以「範圍外一顆都不動」是結構上保證的，不是碰巧成立。
+        nudged = ASC.settle(
+            made, [n for n in arranged if lo - 1000 <= n.start < hi + 1000],
+            total_lanes=TOTAL_GAME_KEYS, onset_ms=ML.ONSET_MS)
+
+        model.notes_tree = kept + made
+        model.notes_tree.sort(key=lambda n: (int(n.start), int(n.min_key)))
+        for index, note in enumerate(model.notes_tree):
+            note.idx = index
+        trimmed = model.trim_pedal_sustained_holds(only=made)
+        model.rebuild_display_cache()
+        model.dirty = True
+        self.view._update_unit_bounds()
+        self.view.selected = {note.idx for note in made}
+        self.view.update()
+        self.view.selection_changed.emit(len(made))
+        self.view.note_edited.emit()
+        self._rebuild_hit_times()
+        self._refresh_title()
+
+        first = model.get_measure_at_ms(lo) + 1
+        last = model.get_measure_at_ms(max(lo, hi - 1)) + 1
+        lines = ['從 %s 採了第 %d~%d 小節：' % (audio_name or '音檔', first, last), '']
+        lines.append('・放進 %d 顆音符%s。'
+                     % (len(made), ('，刪掉原本的 %d 顆' % removed) if removed
+                        else ('，原有的一顆都沒動' if not replace else '')))
+        if got.duplicate:
+            lines.append('・跳過 %d 顆你已經寫了的（同一刻、同音高）。' % got.duplicate)
+        if got.short:
+            lines.append('・跳過 %d 顆太短的（< %d ms，模型的碎音）。'
+                         % (got.short, int(ASC.MIN_MS)))
+        if got.clipped:
+            lines.append('・%d 顆的尾巴伸出範圍外，切在邊界上。' % got.clipped)
+        if trimmed:
+            lines.append('・%d 顆的長度照踏板殘響裁短了。' % trimmed)
+        lines.append('・鍵道%s；左右手%s。'
+                     % (('照這份譜面現有的排法擺了 %d 顆' % lanes) if by_example
+                        else '照音高平鋪',
+                        '自動分好了' if split else '全部標成無主音'))
+        if nudged:
+            lines.append('・%d 顆為了閃開你原本的音符挪了格（你的一顆都沒動）。'
+                         % nudged)
+        lines += ['', '採進來的都選起來了——不要的直接 Delete，整段不滿意按 Ctrl+Z。']
+        QMessageBox.information(self, self._SECTION_TITLE, chr(10).join(lines))
 
     def generate_pedal_dialog(self) -> None:
         """替沒有踏板的譜面依和聲生成一份。
@@ -6652,6 +7412,53 @@ class MainWindow(QMainWindow):
         except OSError:
             return False
 
+    def add_library_category(self) -> None:
+        """在曲庫裡建一個新的分類（選曲畫面的頁籤）。
+
+        以前只有「管理曲庫」和遊戲設定裡的曲庫面板能建，製譜器這邊沒有——可是
+        想到要分類的時機就是排完譜要匯出的時候（使用者：「qt_editor 也要能新增
+        分類」）。匯出對話框的分類欄旁邊也有同一顆按鈕。
+
+        實作走 `SongLibrary.add_category`，和另外兩條路同一套名稱規則與歷史
+        快照：三個地方寫出來的 library.json 必須是同一種東西。
+        """
+        from .song_library import INDEX_FILE, LibraryError, SongLibrary
+
+        root = self._game_library_root() or (settings.get('export_songs_root') or '')
+        if not root or not os.path.isfile(os.path.join(root, INDEX_FILE)):
+            # 沒有 library.json 的資料夾只是個資料夾，不是曲庫——讓人自己指。
+            root = QFileDialog.getExistingDirectory(self, '選擇曲庫資料夾', root or '')
+            if not root:
+                return
+            if not os.path.isfile(os.path.join(root, INDEX_FILE)):
+                QMessageBox.warning(self, '新增分類',
+                                    '這個資料夾裡沒有 library.json，不是曲庫。')
+                return
+        lib = SongLibrary(root)
+        try:
+            existing = lib.categories()
+        except Exception:                               # noqa: BLE001
+            existing = []
+        name, ok = QInputDialog.getText(
+            self, '新增分類',
+            '分類名稱：\n（%s 目前有：%s）'
+            % (os.path.basename(root) or root, '、'.join(existing) or '無'))
+        name = (name or '').strip()
+        if not ok or not name:
+            return
+        try:
+            lib.add_category(name)
+        except LibraryError as exc:
+            QMessageBox.warning(self, '新增分類', str(exc))
+            return
+        except Exception as exc:                        # noqa: BLE001
+            QMessageBox.critical(self, '新增分類', str(exc))
+            return
+        QMessageBox.information(
+            self, '新增分類',
+            '已新增分類「%s」。\n匯出曲目時就選得到了；遊戲的選曲畫面會多一個頁籤。'
+            % name)
+
     def _game_library_root(self) -> str:
         """遊戲的曲庫：製譜器放在遊戲資料夾裡就是旁邊的 UserSongs；否則上次管理的曲庫。
 
@@ -7839,6 +8646,10 @@ class MainWindow(QMainWindow):
                     stats.hold_corridor_conflicts,
                     stats.small_interval_restores,
                     stats.small_interval_unresolved,
+                    stats.melody_direction_repairs,
+                    stats.melody_direction_breaks,
+                    stats.melody_repeat_breaks,
+                    stats.melody_slope_breaks,
                 ),
             )
         except Exception as e:
@@ -7872,6 +8683,10 @@ class MainWindow(QMainWindow):
         ('shortcut_toggle_width', '選取音符：鍵寬 2 / 3 切換', '_shortcut_toggle_width'),
         ('shortcut_measures_bpm', '多小節 BPM / 拍號…', 'change_measures_bpm_dialog'),
         ('shortcut_events', '事件（速度／音效）…', 'edit_events_dialog'),
+        ('shortcut_next_melody_break', '跳到下一處冠音破線',
+         '_jump_next_melody_break'),
+        ('shortcut_next_overlap', '跳到下一處重疊', '_jump_next_overlap'),
+        ('shortcut_next_echo', '跳到下一處移調重複', '_jump_next_echo'),
     )
 
     # ── 快捷鍵：跳位置 ────────────────────────────────────────────────
@@ -8122,6 +8937,21 @@ class MainWindow(QMainWindow):
             sc.activated.connect(getattr(self, method))
             self._user_shortcuts.append(sc)
         self._refresh_shortcut_labels()
+
+    def _jump_next_melody_break(self) -> None:
+        """快捷鍵用：捲到下一處冠音方向破線並選起來。
+
+        配上方向鍵就是一個很短的迴圈：跳過去 → 按一下左右 → 再跳。
+        """
+        self.view.goto_next_melody_break()
+
+    def _jump_next_overlap(self) -> None:
+        """快捷鍵用：捲到下一處重疊，兩顆都選起來。"""
+        self.view.goto_next_overlap()
+
+    def _jump_next_echo(self) -> None:
+        """快捷鍵用：捲到下一處移調重複的樂句，整句選起來。"""
+        self.view.goto_next_echo()
 
     def _toggle_note_input_mode(self) -> None:
         """快捷鍵用：切換放置模式，並讓工具列按鈕跟著更新。"""

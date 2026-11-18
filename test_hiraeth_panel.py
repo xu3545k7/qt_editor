@@ -519,6 +519,17 @@ class ImporterPatchDetectionTests(unittest.TestCase):
     def test_an_empty_root_is_unknown(self):
         self.assertIsNone(T.importer_accepts_keysound(''))
 
+    def test_the_other_two_local_changes_are_recognised(self):
+        """顫音（64）和 REAL 半級也是本機修改。別人那台兩樣都沒有，
+        所以包預設要照原版的規則輸出（見 hiraeth_export.PackagePlan）。"""
+        self.write("if int(n.findtext('note_type')) not in [0,2,4]:raise ValueError('x')")
+        self.assertIs(T.importer_accepts_extras(self.root), False)
+        self.write("REAL_LEVELS={1:10,2:12}" + chr(10)
+                   + "if int(n.findtext('note_type')) not in [0,2,4,64]:pass")
+        self.assertIs(T.importer_accepts_extras(self.root), True)
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.assertIsNone(T.importer_accepts_extras(self.root), '讀不到要回 None')
+
 
 class KeysoundPatchTests(unittest.TestCase):
     """把按鍵音修補套上去——**V2 和 2.1.1 都要能套**。

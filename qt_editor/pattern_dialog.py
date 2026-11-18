@@ -1,10 +1,12 @@
 """
 pattern_dialog.py
 =================
-輔助組合音符：一次放下一組音階或琶音，音高照譜面目前的調性走。
+輔助組合音符：一次放下一組音階、琶音或顫音，音高照譜面目前的調性走。
 
-放置模式是一顆一顆點，音階、琶音這種「一串照規則走的音」點起來又慢又容易點錯
-音；這裡改成填參數一次生成。調性預設是從現有音符偵測出來的，不用自己算升降記號。
+放置模式是一顆一顆點，音階、琶音、顫音這種「一串照規則走的音」點起來又慢又容易
+點錯音；這裡改成填參數一次生成。調性預設是從現有音符偵測出來的，不用自己算升降
+記號。顫音有兩種輸出：「分開的」是一串交替的普通音符，「套上的」整段收成一顆遊戲
+顫音（note_type=64），省掉「放 12 顆、全選、右鍵打包」這一串。
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ from PyQt5.QtWidgets import (
 )
 
 from .music_theory import (
-    PATTERN_KINDS, PITCH_CLASS_NAMES, Key, build_pattern, pattern_key,
+    PATTERN_KINDS, PITCH_CLASS_NAMES, TRILL_KINDS, Key, build_pattern,
+    pattern_key,
 )
 from .models import midi_to_official_piano_index
 
@@ -52,7 +55,7 @@ class PatternDialog(QDialog):
                  hand: int = 0,
                  show_midi_pitch: bool = False) -> None:
         super().__init__(parent)
-        self.setWindowTitle('插入音階 / 琶音')
+        self.setWindowTitle('插入音階 / 琶音 / 顫音')
         self.setMinimumWidth(430)
         self._show_midi = bool(show_midi_pitch)
         root = QVBoxLayout(self)
@@ -198,4 +201,11 @@ class PatternDialog(QDialog):
         used = pattern_key(str(self._cb_kind.currentData()), self.key(),
                            int(self._sp_pitch.value()))
         text += '　　實際音階：%s' % used.name()
+        # 顫音的「方向」不是上行下行，是鄰音在上還是在下——不寫出來會以為選錯了
+        kind = str(self._cb_kind.currentData())
+        if kind in TRILL_KINDS:
+            text += ('\n方向＝鄰音在上（上行）／在下（下行）；「上行後下行」'
+                     '等於上行。')
+            if kind == 'trill_note':
+                text += '這一串會套成一顆 Trill 音符（要持續接觸才繼續響）。'
         self._preview.setText(text)

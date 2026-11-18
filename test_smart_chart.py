@@ -892,11 +892,21 @@ class HandReachTests(unittest.TestCase):
         好幾組累積下來的 last-hand 狀態，合成的例子兩種設定都不會翻——那種測試是
         空包彈。
         """
-        import qt_editor.smart_chart as module
+        # **不要寫 `import qt_editor.smart_chart as module` 再 patch 它。** 那個
+        # 寫法取的是套件 qt_editor 的屬性，而 test_core_is_portable（字母序在前，
+        # 全套跑時先跑）會把 qt_editor.* 從 sys.modules 清掉、在封鎖 Qt 的環境裡
+        # 重新 import 一遍，最後只還原 sys.modules —— 套件屬性留著那個替身模組。
+        # 於是 patch 打在替身上，而這裡呼叫的 arrange_midi_notes 綁的是原本那一
+        # 份，完全不受影響，測出來就是「函式沒被呼叫」：單獨跑綠、全套跑紅。
+        #
+        # 改成直接動函式自己的 __globals__，那就是它查名字用的那本字典，不管套件
+        # 屬性指向哪裡都對。（順帶一提，去修 test_core_is_portable 的 tearDown 讓它
+        # 一併還原套件屬性是行不通的：實測那樣會讓整套測試 segfault，4 輪 4 次。）
+        module_globals = arrange_midi_notes.__globals__
 
         calls = []
-        original = module._reduce_hand_leaps
-        module._reduce_hand_leaps = lambda groups, settings: calls.append(1) or 0
+        original = module_globals['_reduce_hand_leaps']
+        module_globals['_reduce_hand_leaps'] = lambda groups, settings: calls.append(1) or 0
         try:
             two_tracks = [
                 lane_note(0, 48, 4, hand=1, track=1, index=0),
@@ -912,7 +922,7 @@ class HandReachTests(unittest.TestCase):
             arrange_midi_notes(one_track, SmartChartSettings(beat_ms=500.0))
             self.assertEqual(len(calls), 1, "分手是猜的時候仍然要跑")
         finally:
-            module._reduce_hand_leaps = original
+            module_globals['_reduce_hand_leaps'] = original
 
     def test_single_track_still_gets_the_leap_rule(self):
         from qt_editor.smart_chart import _hands_came_from_tracks

@@ -7,9 +7,10 @@
 import unittest
 
 from qt_editor.music_theory import (
-    Key, PATTERN_KINDS, PITCH_CLASS_NAMES, SCALE_BY_KEY, SCALES, build_arpeggio,
-    build_pattern, build_scale, detect_key, pattern_key, pitch_at_scale_index,
-    scale_index_of, scale_of, snap_to_key,
+    Key, PATTERN_KINDS, PITCH_CLASS_NAMES, SCALE_BY_KEY, SCALES, SHAPE_KINDS,
+    TRILL_KINDS, build_arpeggio, build_pattern, build_scale, build_trill,
+    detect_key, pattern_key, pitch_at_scale_index, scale_index_of, scale_of,
+    snap_to_key,
 )
 
 C_MAJOR = Key(0, 'major')
@@ -232,6 +233,8 @@ class OtherScaleTests(unittest.TestCase):
         for _label, kind in PATTERN_KINDS:
             got = build_pattern(kind, C_MAJOR, 60, 7)
             self.assertEqual(len(got), 7, kind)
+            if kind in TRILL_KINDS:
+                continue            # 顫音是來回，本來就不是一路往上
             self.assertEqual(got, sorted(got), kind)
 
     def test_every_scale_kind_stays_inside_its_own_scale(self):
@@ -241,9 +244,67 @@ class OtherScaleTests(unittest.TestCase):
             self.assertTrue(all(used.contains(p) for p in got), s.key)
 
 
+class TrillTests(unittest.TestCase):
+    """顫音：兩個相鄰的音來回。"""
+
+    def test_it_alternates_between_two_pitches(self):
+        self.assertEqual(build_pattern('trill', C_MAJOR, 60, 8),
+                         [60, 62, 60, 62, 60, 62, 60, 62])
+
+    def test_the_neighbour_is_the_next_scale_degree_not_a_fixed_semitone(self):
+        # C 顫到 D 是全音、E 顫到 F 是半音——差別就在調內的下一級
+        self.assertEqual(build_pattern('trill', C_MAJOR, 60, 2), [60, 62])
+        self.assertEqual(build_pattern('trill', C_MAJOR, 64, 2), [64, 65])
+
+    def test_descending_takes_the_neighbour_below(self):
+        self.assertEqual(build_pattern('trill', C_MAJOR, 60, 4, -1),
+                         [60, 59, 60, 59])
+
+    def test_up_then_down_is_not_a_round_trip(self):
+        """「上行後下行」在顫音上沒有意義，不能走折返路徑。
+
+        折返會把最後一顆複製一次（…60, 62, 60 + 反過來的 62, 60），聽起來是
+        同一個鍵連按兩下，而且顆數也不再是拖出來的那個數。
+        """
+        got = build_pattern('trill', C_MAJOR, 60, 5, 0)
+        self.assertEqual(got, [60, 62, 60, 62, 60])
+        self.assertEqual(len(got), 5)
+
+    def test_an_odd_count_ends_on_the_main_note(self):
+        self.assertEqual(build_pattern('trill', C_MAJOR, 67, 3), [67, 69, 67])
+
+    def test_an_off_key_start_snaps_into_the_key_first(self):
+        # 和音階生成同一條規則：C# 在 C 大調裡沒有，先吸到 D 再顫
+        self.assertEqual(build_pattern('trill', C_MAJOR, 61, 2), [62, 64])
+
+    def test_it_works_in_minor(self):
+        self.assertEqual(build_pattern('trill', A_MINOR, 69, 4),
+                         [69, 71, 69, 71])
+
+    def test_both_trill_kinds_give_the_same_pitches(self):
+        """`trill` 和 `trill_note` 只差在產生幾顆音符，音高完全一樣。"""
+        for direction in (1, -1, 0):
+            self.assertEqual(build_pattern('trill', C_MAJOR, 60, 6, direction),
+                             build_pattern('trill_note', C_MAJOR, 60, 6, direction),
+                             direction)
+
+    def test_nothing_to_do(self):
+        self.assertEqual(build_trill(C_MAJOR, 60, 0), [])
+        self.assertEqual(build_pattern('trill', C_MAJOR, 60, 0), [])
+
+    def test_it_keeps_the_chart_key(self):
+        for kind in TRILL_KINDS:
+            self.assertEqual(pattern_key(kind, A_MINOR, 60), A_MINOR, kind)
+
+    def test_the_ui_lists_both(self):
+        kinds = {value for _label, value in PATTERN_KINDS}
+        for kind in TRILL_KINDS:
+            self.assertIn(kind, kinds, kind)
+
+
 class PatternKeyTests(unittest.TestCase):
     def test_shape_kinds_keep_the_chart_key(self):
-        for kind in ('scale', 'thirds', 'arpeggio', 'arpeggio7'):
+        for kind in SHAPE_KINDS:
             self.assertEqual(pattern_key(kind, A_MINOR, 60), A_MINOR)
 
     def test_a_keyed_scale_takes_the_chart_tonic(self):
